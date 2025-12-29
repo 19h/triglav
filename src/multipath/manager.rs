@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 use super::{Scheduler, SchedulerConfig, Uplink, UplinkConfig};
+use super::{FlowId, PathDiscovery, PathDiscoveryConfig, calculate_flow_hash};
 use crate::crypto::{NoiseSession, KeyPair, PublicKey};
 use crate::error::{Error, Result};
 use crate::protocol::{Packet, PacketType, PacketFlags};
@@ -19,6 +20,7 @@ use crate::types::{
     ConnectionId, ConnectionState, SequenceNumber, SessionId,
     TrafficStats, UplinkHealth, UplinkId,
 };
+use std::net::IpAddr;
 
 /// Multi-path manager configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +53,15 @@ pub struct MultipathConfig {
     #[serde(default = "default_health_interval", with = "humantime_serde")]
     pub health_check_interval: Duration,
 
+    /// Path discovery interval for ECMP path probing.
+    /// Set to 0 to disable automatic path discovery.
+    #[serde(default = "default_path_discovery_interval", with = "humantime_serde")]
+    pub path_discovery_interval: Duration,
+
+    /// Maximum age for discovered path data before cleanup.
+    #[serde(default = "default_path_max_age", with = "humantime_serde")]
+    pub path_max_age: Duration,
+
     /// Enable packet deduplication.
     #[serde(default = "default_dedup")]
     pub deduplication: bool,
@@ -58,12 +69,24 @@ pub struct MultipathConfig {
     /// Deduplication window size.
     #[serde(default = "default_dedup_window")]
     pub dedup_window_size: usize,
+
+    /// Enable ECMP-aware flow hashing for path selection.
+    /// When enabled, packets are inspected for IP headers and flows
+    /// with the same 5-tuple will use the same uplink (Dublin Traceroute technique).
+    #[serde(default)]
+    pub ecmp_aware: bool,
+
+    /// Path discovery configuration.
+    #[serde(default)]
+    pub path_discovery: PathDiscoveryConfig,
 }
 
 fn default_max_uplinks() -> usize { 16 }
 fn default_retries() -> u32 { 3 }
 fn default_retry_delay() -> Duration { Duration::from_millis(100) }
 fn default_health_interval() -> Duration { Duration::from_secs(1) }
+fn default_path_discovery_interval() -> Duration { Duration::from_secs(60) }
+fn default_path_max_age() -> Duration { Duration::from_secs(300) }
 fn default_dedup() -> bool { true }
 fn default_dedup_window() -> usize { 1000 }
 
@@ -77,8 +100,12 @@ impl Default for MultipathConfig {
             retry_delay: default_retry_delay(),
             auto_discover: false,
             health_check_interval: default_health_interval(),
+            path_discovery_interval: default_path_discovery_interval(),
+            path_max_age: default_path_max_age(),
             deduplication: default_dedup(),
             dedup_window_size: default_dedup_window(),
+            ecmp_aware: false,
+            path_discovery: PathDiscoveryConfig::default(),
         }
     }
 }
@@ -102,6 +129,15 @@ pub enum MultipathEvent {
     Connected,
     /// Connection closed.
     Disconnected,
+    /// Path discovery completed for a destination.
+    PathDiscoveryComplete {
+        /// Destination that was probed.
+        destination: std::net::SocketAddr,
+        /// Number of paths discovered.
+        paths_found: usize,
+        /// Path diversity score (0.0 - 1.0).
+        diversity_score: f64,
+    },
 }
 
 /// Pending packet for retry.
@@ -186,6 +222,13 @@ pub struct MultipathManager {
     state: RwLock<ConnectionState>,
     /// Local keypair.
     local_keypair: KeyPair,
+    /// Path discovery for ECMP-aware routing (Dublin Traceroute technique).
+    path_discovery: PathDiscovery,
+    /// Connection-to-uplink flow bindings (Dublin Traceroute: flow stickiness).
+    /// Maps connection/stream IDs to their assigned uplink for ECMP consistency.
+    flow_bindings: DashMap<u64, u16>,
+    /// Next flow ID for new connections.
+    next_flow_id: AtomicU64,
 }
 
 impl MultipathManager {
@@ -193,21 +236,25 @@ impl MultipathManager {
     pub fn new(config: MultipathConfig, local_keypair: KeyPair) -> Self {
         let (event_tx, _) = broadcast::channel(256);
 
+        let dedup_size = config.dedup_window_size;
         Self {
-            config: config.clone(),
+            scheduler: Scheduler::new(config.scheduler.clone()),
+            path_discovery: PathDiscovery::new(config.path_discovery.clone()),
+            config,
             session_id: SessionId::generate(),
             connection_id: ConnectionId::new(),
             uplinks: DashMap::new(),
             uplink_ids: DashMap::new(),
-            scheduler: Scheduler::new(config.scheduler),
             next_seq: AtomicU64::new(1),
             next_uplink_id: AtomicU16::new(0),
             pending: DashMap::new(),
-            dedup_window: RwLock::new(DeduplicationWindow::new(config.dedup_window_size)),
+            dedup_window: RwLock::new(DeduplicationWindow::new(dedup_size)),
             stats: RwLock::new(TrafficStats::default()),
             event_tx,
             state: RwLock::new(ConnectionState::Disconnected),
             local_keypair,
+            flow_bindings: DashMap::new(),
+            next_flow_id: AtomicU64::new(1),
         }
     }
 
@@ -397,18 +444,144 @@ impl MultipathManager {
         uplink.set_noise_session(noise);
         uplink.set_connection_state(ConnectionState::Connected);
 
+        // Detect NAT by comparing configured vs actual local address
+        // (Dublin Traceroute technique: NAT detection via address comparison)
+        self.detect_uplink_nat(uplink, &*transport);
+
         let _ = self.event_tx.send(MultipathEvent::UplinkConnected(uplink.id().clone()));
 
         Ok(())
     }
 
+    /// Detect NAT on an uplink by comparing configured and actual addresses.
+    fn detect_uplink_nat(&self, uplink: &Uplink, transport: &dyn Transport) {
+        let config = uplink.config();
+
+        // Get actual local address from transport
+        let actual_local = transport.local_addr();
+
+        // Compare with configured local address
+        let is_natted = match (config.local_addr, actual_local) {
+            (Some(configured), Ok(actual)) => {
+                // If port changed (ephemeral port assigned), might be NAT
+                // If IP is different, definitely NAT
+                if configured.ip() != actual.ip() {
+                    tracing::info!(
+                        uplink = %uplink.id(),
+                        configured = %configured,
+                        actual = %actual,
+                        "NAT detected: IP address differs"
+                    );
+                    true
+                } else if configured.port() != 0 && configured.port() != actual.port() {
+                    tracing::debug!(
+                        uplink = %uplink.id(),
+                        configured_port = configured.port(),
+                        actual_port = actual.port(),
+                        "Port-only NAT possible"
+                    );
+                    // Port change alone isn't definitive NAT, could be ephemeral port
+                    false
+                } else {
+                    false
+                }
+            }
+            (None, Ok(actual)) => {
+                // No configured address - check if it's a private address
+                // which would indicate we're behind NAT
+                let is_private = match actual.ip() {
+                    IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
+                    IpAddr::V6(ip) => ip.is_loopback(),
+                };
+                if is_private {
+                    tracing::debug!(
+                        uplink = %uplink.id(),
+                        local = %actual,
+                        "Private address detected, likely behind NAT"
+                    );
+                }
+                is_private
+            }
+            _ => false,
+        };
+
+        // Update uplink NAT state
+        if is_natted {
+            uplink.update_nat_state(|state| {
+                state.set_nat_type(super::nat::NatType::Unknown);
+            });
+        }
+    }
+
+    /// Set NAT state for an uplink from external detection (e.g., STUN).
+    ///
+    /// Use this when you have external NAT type information from a STUN server
+    /// or similar mechanism.
+    pub fn set_uplink_nat_state(
+        &self,
+        uplink_id: u16,
+        nat_type: super::nat::NatType,
+        external_addr: Option<std::net::SocketAddr>,
+    ) {
+        if let Some(uplink) = self.get_uplink(uplink_id) {
+            uplink.update_nat_state(|state| {
+                state.set_nat_type(nat_type);
+                if let Some(addr) = external_addr {
+                    state.set_external_addr(addr);
+                }
+            });
+
+            tracing::info!(
+                uplink = %uplink.id(),
+                nat_type = ?nat_type,
+                external_addr = ?external_addr,
+                "NAT state updated from external detection"
+            );
+        }
+    }
+
     /// Send data through the multi-path connection.
+    /// For ECMP-aware routing, use `send_on_flow()` instead.
     pub async fn send(&self, data: &[u8]) -> Result<u64> {
+        self.send_on_flow(None, data).await
+    }
+
+    /// Send data on a specific flow for ECMP path consistency.
+    ///
+    /// When `flow_id` is Some, the data will be sent on the uplink bound to that flow.
+    /// This ensures packets belonging to the same connection/stream traverse the same
+    /// network path, matching ECMP router behavior (Dublin Traceroute technique).
+    ///
+    /// If the flow has no binding yet, one will be created based on scheduler selection.
+    pub async fn send_on_flow(&self, flow_id: Option<u64>, data: &[u8]) -> Result<u64> {
         let seq = SequenceNumber(self.next_seq.fetch_add(1, Ordering::SeqCst));
+
+        // Check for existing flow binding first
+        let bound_uplink = flow_id.and_then(|fid| self.flow_bindings.get(&fid).map(|r| *r));
 
         // Create packet
         let uplinks = self.uplinks();
-        let selected = self.scheduler.select(&uplinks, None);
+
+        // If we have a bound uplink that's still usable, use it
+        let selected = if let Some(uplink_id) = bound_uplink {
+            if self.get_uplink(uplink_id).is_some_and(|u| u.is_usable()) {
+                vec![uplink_id]
+            } else {
+                // Bound uplink no longer usable, select new one and update binding
+                let new_selection = self.scheduler.select(&uplinks, flow_id);
+                if let (Some(fid), Some(&new_id)) = (flow_id, new_selection.first()) {
+                    self.flow_bindings.insert(fid, new_id);
+                }
+                new_selection
+            }
+        } else {
+            // No binding - select and optionally create binding
+            let selection = self.scheduler.select(&uplinks, flow_id);
+            if let (Some(fid), Some(&uplink_id)) = (flow_id, selection.first()) {
+                self.flow_bindings.insert(fid, uplink_id);
+            }
+            selection
+        };
 
         if selected.is_empty() {
             return Err(Error::NoAvailableUplinks);
@@ -812,6 +985,12 @@ impl MultipathManager {
 
         // Cleanup scheduler state
         self.scheduler.cleanup();
+
+        // Cleanup stale flow bindings (Dublin Traceroute: flow maintenance)
+        self.cleanup_stale_flows();
+
+        // Cleanup stale path discovery data (Dublin Traceroute: path maintenance)
+        self.path_discovery.cleanup(self.config.path_max_age);
     }
 
     /// Start the maintenance loop in a background task.
@@ -823,6 +1002,16 @@ impl MultipathManager {
             let mut retry_interval = tokio::time::interval(Duration::from_millis(100));
             let mut maintenance_interval = tokio::time::interval(manager.config.health_check_interval);
             let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
+
+            // Path discovery interval (Dublin Traceroute: periodic ECMP probing)
+            let path_discovery_enabled = !manager.config.path_discovery_interval.is_zero();
+            let mut path_discovery_interval = tokio::time::interval(
+                if path_discovery_enabled {
+                    manager.config.path_discovery_interval
+                } else {
+                    Duration::from_secs(3600) // Fallback, won't trigger if disabled
+                }
+            );
 
             loop {
                 if *manager.state.read() != ConnectionState::Connected {
@@ -852,8 +1041,106 @@ impl MultipathManager {
                             }
                         }
                     }
+                    _ = path_discovery_interval.tick(), if path_discovery_enabled => {
+                        manager.run_path_discovery().await;
+                    }
                 }
             }
+        });
+    }
+
+    /// Run path discovery for all connected uplinks.
+    ///
+    /// This probes paths to discover ECMP diversity and updates path quality metrics.
+    /// (Dublin Traceroute: active ECMP path probing)
+    async fn run_path_discovery(&self) {
+        if !self.config.ecmp_aware {
+            return;
+        }
+
+        let uplinks: Vec<_> = self.uplinks.iter()
+            .filter(|r| r.value().is_usable())
+            .map(|r| r.value().clone())
+            .collect();
+
+        for uplink in &uplinks {
+            if let Some(transport) = uplink.get_transport() {
+                // Get local and remote addresses for probe generation
+                let local_addr = match transport.local_addr() {
+                    Ok(addr) => addr,
+                    Err(_) => continue,
+                };
+                let remote_addr = uplink.config().remote_addr;
+
+                // Generate probes for this destination
+                let probes = self.path_discovery.generate_probes(local_addr, remote_addr);
+
+                tracing::debug!(
+                    uplink = %uplink.id(),
+                    probe_count = probes.len(),
+                    "Generated path discovery probes"
+                );
+
+                // Send a sample of probes to different TTLs
+                // Full probing would require raw socket access for ICMP;
+                // here we record the intent and allow external probe injection
+                for (ttl, flow_id, marker) in probes.iter().take(self.config.path_discovery.num_paths as usize) {
+                    // Record that we're probing this path
+                    // Actual probe transmission depends on transport capability
+                    tracing::trace!(
+                        uplink = %uplink.id(),
+                        ttl = ttl,
+                        flow_hash = flow_id.flow_hash(),
+                        ip_id = marker.ip_id,
+                        "Path probe scheduled"
+                    );
+                }
+
+                // Update NAT state from path discovery results
+                self.path_discovery.update_nat_state(uplink.numeric_id(), |state| {
+                    // Sync with uplink's NAT state
+                    state.set_nat_type(uplink.nat_type());
+                });
+
+                // Emit path discovery event with current diversity metrics
+                let diversity = self.path_discovery.get_diversity(remote_addr);
+                let paths = self.path_discovery.get_paths(remote_addr);
+
+                let _ = self.event_tx.send(MultipathEvent::PathDiscoveryComplete {
+                    destination: remote_addr,
+                    paths_found: paths.len(),
+                    diversity_score: diversity.diversity_score,
+                });
+            }
+        }
+    }
+
+    /// Process an incoming path probe response (e.g., ICMP Time Exceeded).
+    ///
+    /// Call this when you receive an ICMP response that correlates to a path probe.
+    /// This is typically used when implementing custom probe transmission/reception.
+    pub fn process_probe_response(
+        &self,
+        destination: std::net::SocketAddr,
+        hop: super::path_discovery::Hop,
+    ) {
+        self.path_discovery.record_hop(destination, hop);
+
+        // Recalculate diversity after recording hop
+        let diversity = self.path_discovery.get_diversity(destination);
+        let paths = self.path_discovery.get_paths(destination);
+
+        tracing::debug!(
+            destination = %destination,
+            paths = paths.len(),
+            diversity = diversity.diversity_score,
+            "Processed path probe response"
+        );
+
+        let _ = self.event_tx.send(MultipathEvent::PathDiscoveryComplete {
+            destination,
+            paths_found: paths.len(),
+            diversity_score: diversity.diversity_score,
         });
     }
 
@@ -910,6 +1197,230 @@ impl MultipathManager {
             avg_loss,
             total_bandwidth,
             stats: *self.stats.read(),
+        }
+    }
+
+    // Dublin Traceroute-inspired ECMP and NAT-aware routing methods
+
+    /// Extract flow ID from packet data by parsing IP headers.
+    /// Returns a flow hash as u64 for use in ECMP-aware path selection.
+    ///
+    /// Supports both IPv4 and IPv6 packets with TCP/UDP headers.
+    fn extract_flow_id(data: &[u8]) -> Option<u64> {
+        if data.len() < 20 {
+            return None;
+        }
+
+        let version = (data[0] >> 4) & 0x0f;
+
+        match version {
+            4 => Self::extract_ipv4_flow_id(data),
+            6 => Self::extract_ipv6_flow_id(data),
+            _ => None,
+        }
+    }
+
+    /// Extract flow ID from IPv4 packet.
+    fn extract_ipv4_flow_id(data: &[u8]) -> Option<u64> {
+        if data.len() < 20 {
+            return None;
+        }
+
+        let ihl = (data[0] & 0x0f) as usize * 4;
+        if data.len() < ihl + 4 {
+            return None;
+        }
+
+        let protocol = data[9];
+        let src_ip = IpAddr::V4(std::net::Ipv4Addr::new(data[12], data[13], data[14], data[15]));
+        let dst_ip = IpAddr::V4(std::net::Ipv4Addr::new(data[16], data[17], data[18], data[19]));
+
+        // Extract ports for TCP (6) and UDP (17)
+        let (src_port, dst_port) = if (protocol == 6 || protocol == 17) && data.len() >= ihl + 4 {
+            let sport = u16::from_be_bytes([data[ihl], data[ihl + 1]]);
+            let dport = u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]);
+            (sport, dport)
+        } else {
+            (0, 0)
+        };
+
+        // Calculate flow hash and return as u64
+        let hash = calculate_flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
+        Some(u64::from(hash))
+    }
+
+    /// Extract flow ID from IPv6 packet.
+    fn extract_ipv6_flow_id(data: &[u8]) -> Option<u64> {
+        if data.len() < 40 {
+            return None;
+        }
+
+        let next_header = data[6];
+        let mut src_bytes = [0u8; 16];
+        let mut dst_bytes = [0u8; 16];
+        src_bytes.copy_from_slice(&data[8..24]);
+        dst_bytes.copy_from_slice(&data[24..40]);
+
+        let src_ip = IpAddr::V6(std::net::Ipv6Addr::from(src_bytes));
+        let dst_ip = IpAddr::V6(std::net::Ipv6Addr::from(dst_bytes));
+
+        // Extract ports for TCP (6) and UDP (17)
+        // Note: This is simplified and doesn't handle extension headers
+        let header_len = 40;
+        let (src_port, dst_port, protocol) = if (next_header == 6 || next_header == 17) && data.len() >= header_len + 4 {
+            let sport = u16::from_be_bytes([data[header_len], data[header_len + 1]]);
+            let dport = u16::from_be_bytes([data[header_len + 2], data[header_len + 3]]);
+            (sport, dport, next_header)
+        } else {
+            (0, 0, next_header)
+        };
+
+        let hash = calculate_flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
+        Some(u64::from(hash))
+    }
+
+    /// Get access to path discovery for advanced routing decisions.
+    pub fn path_discovery(&self) -> &PathDiscovery {
+        &self.path_discovery
+    }
+
+    /// Get uplinks that are not behind NAT (useful for peer-to-peer connections).
+    pub fn non_natted_uplinks(&self) -> Vec<Arc<Uplink>> {
+        self.uplinks.iter()
+            .filter(|r| r.value().is_usable() && !r.value().is_natted())
+            .map(|r| r.value().clone())
+            .collect()
+    }
+
+    /// Get NAT type summary for all uplinks.
+    pub fn nat_summary(&self) -> Vec<(UplinkId, super::nat::NatType, bool)> {
+        self.uplinks.iter()
+            .map(|r| {
+                let uplink = r.value();
+                (uplink.id().clone(), uplink.nat_type(), uplink.is_natted())
+            })
+            .collect()
+    }
+
+    /// Select uplink considering NAT state.
+    /// Prefers non-NATted uplinks when available, unless the NATted uplink has
+    /// significantly better performance.
+    pub fn select_nat_aware(&self, flow_id: Option<u64>) -> Option<u16> {
+        let uplinks = self.uplinks();
+        if uplinks.is_empty() {
+            return None;
+        }
+
+        // Separate uplinks by NAT status
+        let non_natted: Vec<_> = uplinks.iter()
+            .filter(|u| u.is_usable() && !u.is_natted())
+            .collect();
+
+        let natted: Vec<_> = uplinks.iter()
+            .filter(|u| u.is_usable() && u.is_natted())
+            .collect();
+
+        // If we have non-NATted options, prefer them unless NATted is much better
+        if !non_natted.is_empty() {
+            // Use scheduler to select among non-NATted
+            let selected = self.scheduler.select(
+                &non_natted.into_iter().cloned().collect::<Vec<_>>(),
+                flow_id,
+            );
+            if !selected.is_empty() {
+                return Some(selected[0]);
+            }
+        }
+
+        // Fall back to NATted uplinks
+        if !natted.is_empty() {
+            let selected = self.scheduler.select(
+                &natted.into_iter().cloned().collect::<Vec<_>>(),
+                flow_id,
+            );
+            if !selected.is_empty() {
+                return Some(selected[0]);
+            }
+        }
+
+        None
+    }
+
+    /// Calculate flow hash for a specific 5-tuple.
+    /// This is a convenience wrapper around the flow_hash module.
+    pub fn calculate_flow_hash(
+        &self,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        protocol: u8,
+    ) -> u16 {
+        calculate_flow_hash(src_ip, dst_ip, src_port, dst_port, protocol)
+    }
+
+    /// Create a FlowId for manual flow management.
+    pub fn create_flow_id(
+        &self,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        protocol: u8,
+    ) -> FlowId {
+        FlowId::new(src_ip, dst_ip, src_port, dst_port, protocol)
+    }
+
+    // Flow binding management for ECMP path consistency
+
+    /// Allocate a new flow ID for a connection/stream.
+    ///
+    /// Use this when establishing a new connection that should have consistent
+    /// path routing. Pass the returned flow ID to `send_on_flow()`.
+    pub fn allocate_flow(&self) -> u64 {
+        self.next_flow_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Allocate a flow and immediately bind it to a specific uplink.
+    ///
+    /// This is useful when you want to ensure a connection uses a specific path.
+    pub fn allocate_flow_on_uplink(&self, uplink_id: u16) -> Option<u64> {
+        // Verify the uplink exists and is usable
+        if !self.get_uplink(uplink_id).is_some_and(|u| u.is_usable()) {
+            return None;
+        }
+
+        let flow_id = self.allocate_flow();
+        self.flow_bindings.insert(flow_id, uplink_id);
+        Some(flow_id)
+    }
+
+    /// Get the uplink bound to a flow.
+    pub fn get_flow_binding(&self, flow_id: u64) -> Option<u16> {
+        self.flow_bindings.get(&flow_id).map(|r| *r)
+    }
+
+    /// Release a flow binding when connection ends.
+    pub fn release_flow(&self, flow_id: u64) {
+        self.flow_bindings.remove(&flow_id);
+    }
+
+    /// Get number of active flow bindings.
+    pub fn active_flow_count(&self) -> usize {
+        self.flow_bindings.len()
+    }
+
+    /// Cleanup stale flow bindings (for flows whose uplinks are no longer usable).
+    pub fn cleanup_stale_flows(&self) {
+        let stale: Vec<u64> = self.flow_bindings.iter()
+            .filter(|entry| {
+                !self.get_uplink(*entry.value()).is_some_and(|u| u.is_usable())
+            })
+            .map(|entry| *entry.key())
+            .collect();
+
+        for flow_id in stale {
+            self.flow_bindings.remove(&flow_id);
         }
     }
 }

@@ -16,6 +16,7 @@ use crate::types::{
     Bandwidth, ConnectionState, InterfaceType, Latency,
     TrafficStats, UplinkHealth, UplinkId,
 };
+use super::nat::UplinkNatState;
 
 /// Uplink configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +311,8 @@ pub struct Uplink {
     in_flight: AtomicU32,
     /// Maximum in-flight (congestion window).
     cwnd: AtomicU32,
+    /// NAT detection state (Dublin Traceroute-inspired).
+    nat_state: RwLock<UplinkNatState>,
 }
 
 impl Uplink {
@@ -328,6 +331,7 @@ impl Uplink {
             priority_score: AtomicU32::new(0),
             in_flight: AtomicU32::new(0),
             cwnd: AtomicU32::new(10), // Initial cwnd
+            nat_state: RwLock::new(UplinkNatState::default()),
         }
     }
 
@@ -723,6 +727,41 @@ impl Uplink {
             jitter: rtt.variance(),
             health: self.state.read().health,
         }
+    }
+
+    // NAT detection methods (Dublin Traceroute-inspired)
+
+    /// Check if this uplink is behind NAT.
+    pub fn is_natted(&self) -> bool {
+        self.nat_state.read().is_natted()
+    }
+
+    /// Get the NAT type detected on this uplink.
+    pub fn nat_type(&self) -> super::nat::NatType {
+        self.nat_state.read().nat_type()
+    }
+
+    /// Get the external address (after NAT translation).
+    pub fn external_addr(&self) -> Option<std::net::SocketAddr> {
+        self.nat_state.read().external_addr()
+    }
+
+    /// Get NAT detection state for advanced operations.
+    pub fn nat_detection_state(&self) -> super::nat::NatDetectionState {
+        self.nat_state.read().detection_state().clone()
+    }
+
+    /// Update NAT state with access to mutable reference.
+    pub fn update_nat_state<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut UplinkNatState) -> R,
+    {
+        f(&mut self.nat_state.write())
+    }
+
+    /// Reset NAT detection state.
+    pub fn reset_nat_state(&self) {
+        self.nat_state.write().reset();
     }
 }
 

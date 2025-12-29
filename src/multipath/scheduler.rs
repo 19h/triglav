@@ -35,6 +35,9 @@ pub enum SchedulingStrategy {
     PrimaryBackup,
     /// Load balance based on available bandwidth.
     BandwidthProportional,
+    /// ECMP-aware selection using flow hash for path stickiness.
+    /// Packets with the same flow hash use the same uplink.
+    EcmpAware,
 }
 
 /// Scheduler configuration.
@@ -64,6 +67,11 @@ pub struct SchedulerConfig {
     #[serde(default = "default_bw_weight")]
     pub bandwidth_weight: f32,
 
+    /// Weight for NAT penalty in adaptive scoring (0-1).
+    /// Higher values penalize NATted uplinks more heavily.
+    #[serde(default = "default_nat_weight")]
+    pub nat_penalty_weight: f32,
+
     /// Enable path stickiness (prefer same path for related packets).
     #[serde(default = "default_sticky")]
     pub sticky_paths: bool,
@@ -83,9 +91,10 @@ pub struct SchedulerConfig {
 
 fn default_rtt_threshold() -> u32 { 10 }
 fn default_loss_threshold() -> f32 { 2.0 }
-fn default_rtt_weight() -> f32 { 0.4 }
-fn default_loss_weight() -> f32 { 0.4 }
+fn default_rtt_weight() -> f32 { 0.35 }
+fn default_loss_weight() -> f32 { 0.35 }
 fn default_bw_weight() -> f32 { 0.2 }
+fn default_nat_weight() -> f32 { 0.1 }
 fn default_sticky() -> bool { true }
 fn default_sticky_timeout() -> Duration { Duration::from_secs(5) }
 fn default_probe() -> bool { true }
@@ -100,6 +109,7 @@ impl Default for SchedulerConfig {
             rtt_weight: default_rtt_weight(),
             loss_weight: default_loss_weight(),
             bandwidth_weight: default_bw_weight(),
+            nat_penalty_weight: default_nat_weight(),
             sticky_paths: default_sticky(),
             sticky_timeout: default_sticky_timeout(),
             probe_backup_paths: default_probe(),
@@ -221,6 +231,10 @@ impl Scheduler {
             SchedulingStrategy::BandwidthProportional => {
                 self.select_bandwidth_proportional(&usable)
             }
+            SchedulingStrategy::EcmpAware => {
+                // Use flow_id for ECMP-aware selection
+                Self::select_ecmp_aware(&usable, flow_id)
+            }
         };
 
         // Update stickiness
@@ -300,11 +314,13 @@ impl Scheduler {
                 let rtt_score = Self::rtt_score(u);
                 let loss_score = Self::loss_score(u);
                 let bw_score = Self::bandwidth_score(u, uplinks);
+                let nat_score = Self::nat_score(u);
 
                 let total_score =
                     rtt_score * self.config.rtt_weight +
                     loss_score * self.config.loss_weight +
-                    bw_score * self.config.bandwidth_weight;
+                    bw_score * self.config.bandwidth_weight +
+                    nat_score * self.config.nat_penalty_weight;
 
                 (u.numeric_id(), total_score)
             })
@@ -369,6 +385,39 @@ impl Scheduler {
         uplinks.first().map(|u| vec![u.numeric_id()]).unwrap_or_default()
     }
 
+    /// ECMP-aware selection using flow hash for consistent path selection.
+    ///
+    /// This strategy uses the flow ID (which can be derived from a flow hash)
+    /// to consistently select the same uplink for packets belonging to the same flow.
+    /// This mimics ECMP router behavior where packets with the same 5-tuple hash
+    /// traverse the same path.
+    fn select_ecmp_aware(uplinks: &[&Arc<Uplink>], flow_id: Option<u64>) -> Vec<u16> {
+        let sendable: Vec<_> = uplinks.iter().filter(|u| u.can_send()).collect();
+
+        if sendable.is_empty() {
+            return vec![];
+        }
+
+        // Use flow_id to select uplink (consistent hashing)
+        if let Some(flow) = flow_id {
+            // Use the flow ID to select an uplink index
+            // This ensures packets with the same flow use the same uplink
+            let index = (flow as usize) % sendable.len();
+            return vec![sendable[index].numeric_id()];
+        }
+
+        // Fallback: select based on uplink with best combined score
+        sendable
+            .iter()
+            .max_by(|a, b| {
+                let score_a = a.priority_score();
+                let score_b = b.priority_score();
+                score_a.cmp(&score_b)
+            })
+            .map(|u| vec![u.numeric_id()])
+            .unwrap_or_default()
+    }
+
     /// Calculate RTT score (0-1, higher is better).
     fn rtt_score(uplink: &Uplink) -> f32 {
         let rtt = uplink.rtt().as_secs_f32() * 1000.0; // ms
@@ -394,6 +443,24 @@ impl Scheduler {
             0.5
         } else {
             (bw / max_bw) as f32
+        }
+    }
+
+    /// Calculate NAT score (0-1, higher is better = not NATted).
+    /// Non-NATted uplinks score 1.0, NATted uplinks score lower based on NAT type.
+    fn nat_score(uplink: &Uplink) -> f32 {
+        if !uplink.is_natted() {
+            return 1.0;
+        }
+
+        // Score based on NAT type (some NAT types are more problematic than others)
+        match uplink.nat_type() {
+            super::nat::NatType::None => 1.0,
+            super::nat::NatType::Unknown => 0.7,  // Unknown might not be NAT
+            super::nat::NatType::FullCone => 0.8,  // Most permissive NAT
+            super::nat::NatType::RestrictedCone => 0.6,
+            super::nat::NatType::PortRestrictedCone => 0.4,
+            super::nat::NatType::Symmetric => 0.2,  // Most restrictive NAT
         }
     }
 

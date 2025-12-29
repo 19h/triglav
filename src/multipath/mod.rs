@@ -6,14 +6,35 @@
 //! - Automatic failover and recovery
 //! - Bandwidth aggregation
 //! - Quality-based path selection
+//! - ECMP-aware flow hashing (Dublin Traceroute technique)
+//! - NAT detection and traversal support
+//! - Path discovery and diversity assessment
 
 mod uplink;
 mod scheduler;
 mod manager;
+mod flow_hash;
+mod nat;
+mod path_discovery;
 
 pub use uplink::{Uplink, UplinkConfig, UplinkState};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulingStrategy};
-pub use manager::{MultipathManager, MultipathConfig};
+pub use manager::{MultipathManager, MultipathConfig, MultipathEvent};
+
+// Dublin Traceroute-inspired modules
+pub use flow_hash::{
+    FlowId, FlowHashBucket, EcmpPathEnumerator,
+    calculate_flow_hash, flow_hash_from_addrs,
+};
+pub use nat::{
+    NatId, NatType, NatDetectionState, UplinkNatState,
+    IpIdMarker, NatProbe, NatProbeResponse, ProbeMatcher,
+    compute_udp_checksum,
+};
+pub use path_discovery::{
+    PathDiscovery, PathDiscoveryConfig, PathDiversity,
+    DiscoveredPath, Hop, EcmpFlowSelector,
+};
 
 use std::time::Duration;
 

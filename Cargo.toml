@@ -1,0 +1,145 @@
+[package]
+name = "triglav"
+version = "0.1.0"
+edition = "2021"
+authors = ["Triglav Contributors"]
+description = "High-performance multi-path networking tool with intelligent uplink management"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/triglav/triglav"
+keywords = ["networking", "multipath", "vpn", "tunnel", "encryption"]
+categories = ["network-programming", "command-line-utilities"]
+
+[features]
+default = ["cli", "metrics"]
+cli = ["clap", "colored", "indicatif", "dialoguer"]
+metrics = ["prometheus"]
+full = ["cli", "metrics"]
+
+[[bin]]
+name = "triglav"
+path = "src/main.rs"
+
+[[bin]]
+name = "triglav-server"
+path = "src/bin/server.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full", "tracing", "parking_lot"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+futures = "0.3"
+async-trait = "0.1"
+pin-project-lite = "0.2"
+
+# Networking
+socket2 = { version = "0.5", features = ["all"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+webpki-roots = "0.26"
+
+# Cryptography
+snow = "0.9"
+blake3 = "1.5"
+crc32fast = "1.3"
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core", "hazmat"] }
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+rand_chacha = "0.3"
+zeroize = { version = "1.7", features = ["derive"] }
+constant_time_eq = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+base64 = "0.22"
+hex = "0.4"
+
+# CLI
+clap = { version = "4.4", features = ["derive", "env", "unicode", "wrap_help", "cargo"], optional = true }
+clap_complete = "4.4"
+colored = { version = "2.1", optional = true }
+indicatif = { version = "0.17", features = ["tokio"], optional = true }
+dialoguer = { version = "0.11", optional = true }
+console = "0.15"
+comfy-table = "7.1"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot"] }
+tracing-appender = "0.2"
+
+# Metrics
+prometheus = { version = "0.13", optional = true }
+
+# Configuration
+toml = "0.8"
+directories = "5.0"
+shellexpand = "3.1"
+
+# Data structures
+dashmap = "5.5"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+bytes = "1.5"
+smallvec = { version = "1.13", features = ["serde"] }
+indexmap = { version = "2.1", features = ["serde"] }
+priority-queue = "2.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+humantime-serde = "1.1"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Utilities
+uuid = { version = "1.6", features = ["v4", "serde"] }
+url = { version = "2.5", features = ["serde"] }
+humantime = "2.1"
+byteorder = "1.5"
+num_cpus = "1.16"
+libc = "0.2"
+nix = { version = "0.28", features = ["net", "socket", "ioctl"] }
+
+# Statistics & ML for predictive analytics
+statrs = "0.16"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.6"
+core-foundation = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-route = "0.19"
+rtnetlink = "0.14"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+proptest = "1.4"
+tempfile = "3.9"
+mockall = "0.12"
+test-case = "3.3"
+tokio-test = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false
+
+[profile.bench]
+inherits = "release"
+debug = true

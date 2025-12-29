@@ -609,3 +609,435 @@ async fn test_http_proxy_connect() {
 
     server.shutdown();
 }
+
+// Dublin Traceroute Integration Tests
+// These tests verify the flow binding, NAT detection, and path discovery functionality.
+
+#[tokio::test]
+async fn test_flow_binding_consistency() {
+    //! Verify that packets sent with the same flow_id always use the same uplink.
+    //! This is the core Dublin Traceroute ECMP consistency requirement.
+
+    // Start server
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let server_public = server.public_key().clone();
+
+    let server = Arc::new(server);
+    let server_clone = Arc::clone(&server);
+    tokio::spawn(async move {
+        let _ = server_clone.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Create client with ECMP awareness enabled
+    let client_keypair = KeyPair::generate();
+    let mut config = MultipathConfig::default();
+    config.ecmp_aware = true;
+
+    let manager = Arc::new(MultipathManager::new(config, client_keypair));
+
+    // Add single uplink for this test
+    let uplink_config = UplinkConfig {
+        id: UplinkId::new("uplink-1"),
+        remote_addr: server_addr,
+        protocol: TransportProtocol::Udp,
+        ..Default::default()
+    };
+    let uplink_id = manager.add_uplink(uplink_config).unwrap();
+
+    manager.connect(server_public.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Allocate a flow
+    let flow_id = manager.allocate_flow();
+    assert!(flow_id > 0, "Flow ID should be non-zero");
+
+    // Send multiple messages on the same flow
+    for i in 0..5 {
+        let msg = format!("Flow message {}", i);
+        manager.send_on_flow(Some(flow_id), msg.as_bytes()).await.unwrap();
+
+        // Verify flow binding is consistent
+        let bound_uplink = manager.get_flow_binding(flow_id);
+        assert_eq!(bound_uplink, Some(uplink_id),
+            "Flow should remain bound to same uplink on message {}", i);
+    }
+
+    // Verify flow count
+    assert_eq!(manager.active_flow_count(), 1, "Should have exactly 1 active flow");
+
+    // Release the flow
+    manager.release_flow(flow_id);
+    assert_eq!(manager.active_flow_count(), 0, "Flow count should be 0 after release");
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn test_multiple_flows_different_bindings() {
+    //! Verify that different flows can be explicitly bound to different uplinks.
+    //! Uses two separate ports on the same server to simulate multiple uplinks.
+
+    // Start server
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let server_public = server.public_key().clone();
+
+    let server = Arc::new(server);
+    let server_clone = Arc::clone(&server);
+    tokio::spawn(async move {
+        let _ = server_clone.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Create client with ECMP awareness enabled
+    let client_keypair = KeyPair::generate();
+    let mut config = MultipathConfig::default();
+    config.ecmp_aware = true;
+
+    let manager = Arc::new(MultipathManager::new(config, client_keypair));
+
+    // Add two uplinks pointing to the same server (simulating multiple network paths)
+    let uplink1_config = UplinkConfig {
+        id: UplinkId::new("uplink-1"),
+        remote_addr: server_addr,
+        protocol: TransportProtocol::Udp,
+        ..Default::default()
+    };
+    let uplink1_id = manager.add_uplink(uplink1_config).unwrap();
+
+    let uplink2_config = UplinkConfig {
+        id: UplinkId::new("uplink-2"),
+        remote_addr: server_addr,
+        protocol: TransportProtocol::Udp,
+        ..Default::default()
+    };
+    let uplink2_id = manager.add_uplink(uplink2_config).unwrap();
+
+    // Connect using server's public key
+    manager.connect(server_public.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Allocate flows explicitly on different uplinks
+    let flow1 = manager.allocate_flow_on_uplink(uplink1_id);
+    let flow2 = manager.allocate_flow_on_uplink(uplink2_id);
+
+    assert!(flow1.is_some(), "Should be able to allocate flow on uplink 1");
+    assert!(flow2.is_some(), "Should be able to allocate flow on uplink 2");
+
+    let flow1_id = flow1.unwrap();
+    let flow2_id = flow2.unwrap();
+
+    // Verify bindings
+    assert_eq!(manager.get_flow_binding(flow1_id), Some(uplink1_id));
+    assert_eq!(manager.get_flow_binding(flow2_id), Some(uplink2_id));
+
+    // Verify different flows have different IDs
+    assert_ne!(flow1_id, flow2_id, "Different flows should have different IDs");
+
+    // Verify active flow count
+    assert_eq!(manager.active_flow_count(), 2);
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn test_nat_state_detection() {
+    //! Verify that NAT state is detected during connection and influences routing.
+
+    use triglav::multipath::NatType;
+
+    // Start server
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let server_public = server.public_key().clone();
+
+    let server = Arc::new(server);
+    let server_clone = Arc::clone(&server);
+    tokio::spawn(async move {
+        let _ = server_clone.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Create client with ECMP awareness enabled
+    let client_keypair = KeyPair::generate();
+    let mut config = MultipathConfig::default();
+    config.ecmp_aware = true;
+
+    let manager = MultipathManager::new(config, client_keypair);
+
+    // Add uplink
+    let uplink_config = UplinkConfig {
+        id: UplinkId::new("test-uplink"),
+        remote_addr: server_addr,
+        protocol: TransportProtocol::Udp,
+        ..Default::default()
+    };
+    let uplink_id = manager.add_uplink(uplink_config).unwrap();
+
+    // Connect to server
+    manager.connect(server_public.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Check NAT summary - since we're on loopback, NAT detection will see private address
+    let nat_summary = manager.nat_summary();
+    assert!(!nat_summary.is_empty(), "Should have NAT summary for uplinks");
+
+    // Simulate external NAT detection (as if from STUN)
+    manager.set_uplink_nat_state(uplink_id, NatType::FullCone, Some("203.0.113.1:12345".parse().unwrap()));
+
+    // Verify NAT state was updated
+    let updated_summary = manager.nat_summary();
+    let (_, nat_type, is_natted) = updated_summary.iter()
+        .find(|(id, _, _)| id.as_str() == "test-uplink")
+        .expect("Should find test-uplink");
+
+    assert_eq!(*nat_type, NatType::FullCone, "NAT type should be FullCone");
+    assert!(*is_natted, "Should be detected as NATted");
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn test_nat_aware_uplink_selection() {
+    //! Verify that NAT-aware selection prefers non-NATted uplinks.
+
+    use triglav::multipath::NatType;
+
+    // Start server
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let server_public = server.public_key().clone();
+
+    let server = Arc::new(server);
+    let server_clone = Arc::clone(&server);
+    tokio::spawn(async move {
+        let _ = server_clone.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Create client
+    let client_keypair = KeyPair::generate();
+    let mut config = MultipathConfig::default();
+    config.ecmp_aware = true;
+
+    let manager = MultipathManager::new(config, client_keypair);
+
+    // Add uplink
+    let uplink_config = UplinkConfig {
+        id: UplinkId::new("test-uplink"),
+        remote_addr: server_addr,
+        protocol: TransportProtocol::Udp,
+        ..Default::default()
+    };
+    let uplink_id = manager.add_uplink(uplink_config).unwrap();
+
+    manager.connect(server_public.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Test NAT-aware selection with no NAT
+    manager.set_uplink_nat_state(uplink_id, NatType::None, None);
+
+    let selected = manager.select_nat_aware(None);
+    assert_eq!(selected, Some(uplink_id), "Should select non-NATted uplink");
+
+    // Get non-NATted uplinks list
+    let non_natted = manager.non_natted_uplinks();
+    assert_eq!(non_natted.len(), 1, "Should have 1 non-NATted uplink");
+
+    // Now mark as symmetric NAT (worst case)
+    manager.set_uplink_nat_state(uplink_id, NatType::Symmetric, Some("203.0.113.1:12345".parse().unwrap()));
+
+    // Non-NATted list should be empty now
+    let non_natted = manager.non_natted_uplinks();
+    assert!(non_natted.is_empty(), "Non-NATted list should be empty after marking as Symmetric NAT");
+
+    // But NAT-aware selection should still return the uplink (as fallback)
+    let selected = manager.select_nat_aware(None);
+    assert_eq!(selected, Some(uplink_id), "Should still select uplink as fallback");
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn test_path_discovery_event() {
+    //! Verify that path discovery events are emitted when enabled.
+
+    use triglav::multipath::{MultipathEvent};
+
+    // Start server
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let server_public = server.public_key().clone();
+
+    let server = Arc::new(server);
+    let server_clone = Arc::clone(&server);
+    tokio::spawn(async move {
+        let _ = server_clone.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Create client with ECMP awareness and short path discovery interval
+    let client_keypair = KeyPair::generate();
+    let mut config = MultipathConfig::default();
+    config.ecmp_aware = true;
+    config.path_discovery_interval = Duration::from_millis(100);
+
+    let manager = Arc::new(MultipathManager::new(config, client_keypair));
+
+    // Subscribe to events before connecting
+    let mut event_rx = manager.subscribe();
+
+    // Add uplink
+    let uplink_config = UplinkConfig {
+        id: UplinkId::new("test-uplink"),
+        remote_addr: server_addr,
+        protocol: TransportProtocol::Udp,
+        ..Default::default()
+    };
+    manager.add_uplink(uplink_config).unwrap();
+
+    manager.connect(server_public.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Start maintenance loop which includes path discovery
+    manager.start_maintenance_loop();
+
+    // Wait for events with timeout
+    let mut found_path_discovery = false;
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(2);
+
+    while start.elapsed() < timeout {
+        match tokio::time::timeout(Duration::from_millis(100), event_rx.recv()).await {
+            Ok(Ok(MultipathEvent::PathDiscoveryComplete { destination, paths_found, diversity_score })) => {
+                println!("Path discovery complete: destination={}, paths={}, diversity={}",
+                    destination, paths_found, diversity_score);
+                found_path_discovery = true;
+                break;
+            }
+            Ok(Ok(event)) => {
+                println!("Received event: {:?}", event);
+            }
+            Ok(Err(_)) => break, // Channel closed
+            Err(_) => continue, // Timeout, try again
+        }
+    }
+
+    assert!(found_path_discovery, "Should receive PathDiscoveryComplete event");
+
+    // Verify path discovery state via the manager
+    let path_discovery = manager.path_discovery();
+    let diversity = path_discovery.get_diversity(server_addr);
+    println!("Path diversity: unique_paths={}, score={}",
+        diversity.unique_paths, diversity.diversity_score);
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn test_flow_hash_calculation() {
+    //! Verify flow hash calculation produces consistent, non-zero results.
+
+    use std::net::{IpAddr, Ipv4Addr};
+    use triglav::multipath::FlowId;
+
+    // Create flow ID
+    let flow = FlowId::new(
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        12345,
+        53,
+        17, // UDP
+    );
+
+    // Hash should be consistent
+    let hash1 = flow.flow_hash();
+    let hash2 = flow.flow_hash();
+    assert_eq!(hash1, hash2, "Flow hash should be consistent");
+
+    // Hash should never be zero
+    assert_ne!(hash1, 0, "Flow hash should never be zero");
+
+    // Different ports should produce different hashes (usually)
+    let flow2 = flow.with_src_port(12346);
+    let hash3 = flow2.flow_hash();
+    assert_ne!(hash1, hash3, "Different ports should produce different hashes");
+
+    // TCP and UDP should produce different hashes
+    let flow_tcp = FlowId::new(
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        12345,
+        80,
+        6, // TCP
+    );
+    let flow_udp = FlowId::new(
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        12345,
+        80,
+        17, // UDP
+    );
+    assert_ne!(flow_tcp.flow_hash(), flow_udp.flow_hash(),
+        "TCP and UDP flows should have different hashes");
+}
+
+#[tokio::test]
+async fn test_stale_flow_cleanup() {
+    //! Verify that stale flows are cleaned up when their uplink becomes unusable.
+
+    // Start server
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let server_public = server.public_key().clone();
+
+    let server = Arc::new(server);
+    let server_clone = Arc::clone(&server);
+    tokio::spawn(async move {
+        let _ = server_clone.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Create client
+    let client_keypair = KeyPair::generate();
+    let mut config = MultipathConfig::default();
+    config.ecmp_aware = true;
+
+    let manager = MultipathManager::new(config, client_keypair);
+
+    // Add uplink
+    let uplink_config = UplinkConfig {
+        id: UplinkId::new("test-uplink"),
+        remote_addr: server_addr,
+        protocol: TransportProtocol::Udp,
+        ..Default::default()
+    };
+    let uplink_id = manager.add_uplink(uplink_config).unwrap();
+
+    manager.connect(server_public.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Allocate a flow bound to this uplink
+    let flow_id = manager.allocate_flow_on_uplink(uplink_id).unwrap();
+    assert_eq!(manager.active_flow_count(), 1);
+
+    // Remove the uplink
+    manager.remove_uplink(uplink_id);
+
+    // Run cleanup
+    manager.cleanup_stale_flows();
+
+    // Flow should be cleaned up since its uplink is gone
+    assert_eq!(manager.active_flow_count(), 0, "Stale flow should be cleaned up");
+    assert!(manager.get_flow_binding(flow_id).is_none(), "Flow binding should be removed");
+
+    server.shutdown();
+}

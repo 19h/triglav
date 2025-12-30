@@ -172,7 +172,7 @@ pub struct KeygenArgs {
 }
 
 /// Status command arguments
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct StatusArgs {
     /// Show detailed statistics
     #[arg(short, long)]

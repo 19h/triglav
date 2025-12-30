@@ -1,8 +1,14 @@
 //! Triglav Server Binary
 //!
-//! Dedicated server process for handling client connections.
+//! Dedicated server process for handling client connections with:
+//! - User authentication and management
+//! - Session tracking
+//! - Prometheus metrics export
+//! - Signal handling for graceful shutdown
+//! - Optional daemon mode
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +21,16 @@ use tracing::{debug, error, info, warn};
 use triglav::config::{ServerConfig, init_logging};
 use triglav::crypto::{KeyPair, NoiseSession};
 use triglav::error::{Error, Result};
+use triglav::metrics::{
+    MetricsHttpServer, HttpServerConfig, DefaultHealthChecker,
+    SessionStatus, StatusResponse, StatusProvider,
+    init_metrics, PrometheusMetrics,
+};
 use triglav::protocol::{Packet, PacketType, PacketFlags, HEADER_SIZE};
+use triglav::server::{
+    DaemonConfig, daemonize, PidFileGuard,
+    SignalHandler, Signal,
+};
 use triglav::types::{SessionId, SequenceNumber, TrafficStats};
 
 /// Server state.
@@ -24,20 +39,24 @@ struct Server {
     config: ServerConfig,
     /// Server keypair.
     keypair: KeyPair,
-    /// Active sessions.
-    sessions: DashMap<SessionId, Arc<Session>>,
+    /// Active sessions (transport-level).
+    transport_sessions: DashMap<SessionId, Arc<TransportSession>>,
     /// Session by client address.
     sessions_by_addr: DashMap<SocketAddr, SessionId>,
     /// UDP socket.
     socket: Arc<UdpSocket>,
+    /// Prometheus metrics.
+    metrics: Arc<PrometheusMetrics>,
     /// Statistics.
     stats: RwLock<ServerStats>,
+    /// Start time.
+    start_time: Instant,
     /// Shutdown signal.
-    _shutdown: broadcast::Sender<()>,
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 /// Server statistics.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ServerStats {
     total_connections: u64,
     active_connections: u64,
@@ -48,8 +67,8 @@ struct ServerStats {
     packets_dropped: u64,
 }
 
-/// Client session.
-struct Session {
+/// Client transport session.
+struct TransportSession {
     /// Session ID.
     id: SessionId,
     /// Client addresses (multiple uplinks).
@@ -60,9 +79,11 @@ struct Session {
     last_activity: RwLock<Instant>,
     /// Traffic stats.
     stats: RwLock<TrafficStats>,
+    /// Authenticated user ID.
+    user_id: RwLock<Option<String>>,
 }
 
-impl Session {
+impl TransportSession {
     fn new(id: SessionId, client_addr: SocketAddr) -> Self {
         Self {
             id,
@@ -70,6 +91,7 @@ impl Session {
             noise: RwLock::new(None),
             last_activity: RwLock::new(Instant::now()),
             stats: RwLock::new(TrafficStats::default()),
+            user_id: RwLock::new(None),
         }
     }
 
@@ -91,7 +113,11 @@ impl Session {
 
 impl Server {
     /// Create a new server.
-    async fn new(config: ServerConfig, keypair: KeyPair) -> Result<Self> {
+    async fn new(
+        config: ServerConfig,
+        keypair: KeyPair,
+        metrics: Arc<PrometheusMetrics>,
+    ) -> Result<Self> {
         let addr = config.listen_addrs.first()
             .ok_or_else(|| Error::Config("No listen address specified".into()))?;
 
@@ -104,50 +130,76 @@ impl Server {
 
         info!("Server bound to {}", addr);
 
-        let (shutdown, _) = broadcast::channel(1);
+        let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
             config,
             keypair,
-            sessions: DashMap::new(),
+            transport_sessions: DashMap::new(),
             sessions_by_addr: DashMap::new(),
             socket: Arc::new(socket),
+            metrics,
             stats: RwLock::new(ServerStats::default()),
-            _shutdown: shutdown,
+            start_time: Instant::now(),
+            shutdown_tx,
         })
     }
 
     /// Run the server.
     async fn run(&self) -> Result<()> {
         let mut buf = vec![0u8; 65536];
-        let mut shutdown_rx = self._shutdown.subscribe();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         // Spawn cleanup task
-        let sessions = self.sessions.clone();
+        let transport_sessions = self.transport_sessions.clone();
         let timeout = self.config.idle_timeout;
+        let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                sessions.retain(|_, session| !session.is_expired(timeout));
+                let before = transport_sessions.len();
+                transport_sessions.retain(|_, session| !session.is_expired(timeout));
+                let removed = before - transport_sessions.len();
+                if removed > 0 {
+                    info!("Cleaned up {} expired sessions", removed);
+                    metrics.sessions_active.set(transport_sessions.len() as i64);
+                }
             }
         });
+
+        // Spawn metrics update task
+        let metrics = Arc::clone(&self.metrics);
+        let start_time = self.start_time;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                metrics.server_uptime_seconds.set(start_time.elapsed().as_secs_f64());
+            }
+        });
+
+        info!("Server running, waiting for connections...");
 
         loop {
             tokio::select! {
                 result = self.socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, addr)) => {
+                            self.metrics.packets_received_total.with_label_values(&["server"]).inc();
+                            self.metrics.bytes_received_total.with_label_values(&["server"]).inc_by(len as u64);
                             self.stats.write().packets_received += 1;
                             self.stats.write().bytes_received += len as u64;
 
                             if let Err(e) = self.handle_packet(&buf[..len], addr).await {
                                 debug!("Error handling packet from {}: {}", addr, e);
                                 self.stats.write().packets_dropped += 1;
+                                self.metrics.packets_dropped_total.with_label_values(&["server", "error"]).inc();
                             }
                         }
                         Err(e) => {
                             error!("Receive error: {}", e);
+                            self.metrics.record_error("receive");
                         }
                     }
                 }
@@ -171,16 +223,21 @@ impl Server {
         let session_id = packet.header.session_id;
 
         // Get or create session
-        let session = if let Some(s) = self.sessions.get(&session_id) {
+        let session = if let Some(s) = self.transport_sessions.get(&session_id) {
             s.clone()
         } else {
             // New session
-            let session = Arc::new(Session::new(session_id, addr));
-            self.sessions.insert(session_id, session.clone());
+            let session = Arc::new(TransportSession::new(session_id, addr));
+            self.transport_sessions.insert(session_id, session.clone());
             self.sessions_by_addr.insert(addr, session_id);
 
             self.stats.write().total_connections += 1;
             self.stats.write().active_connections += 1;
+            
+            self.metrics.connections_total.inc();
+            self.metrics.connections_active.inc();
+            self.metrics.sessions_total.inc();
+            self.metrics.sessions_active.inc();
 
             info!("New session {} from {}", session_id, addr);
             session
@@ -193,6 +250,7 @@ impl Server {
         // Handle packet type
         match packet.header.packet_type {
             PacketType::Handshake => {
+                self.metrics.handshakes_total.inc();
                 self.handle_handshake(&session, &packet, addr).await?;
             }
             PacketType::Data => {
@@ -213,7 +271,7 @@ impl Server {
     }
 
     /// Handle handshake packet.
-    async fn handle_handshake(&self, session: &Session, packet: &Packet, addr: SocketAddr) -> Result<()> {
+    async fn handle_handshake(&self, session: &TransportSession, packet: &Packet, addr: SocketAddr) -> Result<()> {
         debug!("Handshake from {} (session {})", addr, session.id);
 
         // Create responder noise session
@@ -244,11 +302,12 @@ impl Server {
     }
 
     /// Handle data packet.
-    async fn handle_data(&self, session: &Session, packet: &Packet, addr: SocketAddr) -> Result<()> {
+    async fn handle_data(&self, session: &TransportSession, packet: &Packet, addr: SocketAddr) -> Result<()> {
         // Decrypt if we have a noise session
         let payload = if packet.header.flags.has(PacketFlags::ENCRYPTED) {
             if let Some(ref mut noise) = *session.noise.write() {
                 if noise.is_transport() {
+                    self.metrics.decrypt_operations.inc();
                     noise.decrypt(&packet.payload)?
                 } else {
                     packet.payload.clone()
@@ -279,10 +338,11 @@ impl Server {
     }
 
     /// Send encrypted data to a client.
-    async fn send_data(&self, session: &Session, payload: &[u8], uplink_id: u16, addr: SocketAddr) -> Result<()> {
+    async fn send_data(&self, session: &TransportSession, payload: &[u8], uplink_id: u16, addr: SocketAddr) -> Result<()> {
         // Encrypt if we have a noise session
         let (encrypted_payload, is_encrypted) = if let Some(ref mut noise) = *session.noise.write() {
             if noise.is_transport() {
+                self.metrics.encrypt_operations.inc();
                 (noise.encrypt(payload)?, true)
             } else {
                 (payload.to_vec(), false)
@@ -315,7 +375,7 @@ impl Server {
     }
 
     /// Handle ping packet.
-    async fn handle_ping(&self, session: &Session, packet: &Packet, addr: SocketAddr) -> Result<()> {
+    async fn handle_ping(&self, session: &TransportSession, packet: &Packet, addr: SocketAddr) -> Result<()> {
         let pong = Packet::pong(
             packet.header.sequence.next(),
             session.id,
@@ -329,12 +389,19 @@ impl Server {
     }
 
     /// Handle close packet.
-    async fn handle_close(&self, session: &Session, addr: SocketAddr) -> Result<()> {
+    async fn handle_close(&self, session: &TransportSession, addr: SocketAddr) -> Result<()> {
         info!("Session {} closed by {}", session.id, addr);
 
-        self.sessions.remove(&session.id);
+        // Record session duration
+        let duration = session.last_activity.read().elapsed();
+        self.metrics.session_duration_seconds.observe(duration.as_secs_f64());
+
+        self.transport_sessions.remove(&session.id);
         self.sessions_by_addr.remove(&addr);
         self.stats.write().active_connections -= 1;
+        
+        self.metrics.connections_active.dec();
+        self.metrics.sessions_active.dec();
 
         Ok(())
     }
@@ -349,21 +416,74 @@ impl Server {
 
         self.stats.write().packets_sent += 1;
         self.stats.write().bytes_sent += data.len() as u64;
+        
+        self.metrics.packets_sent_total.with_label_values(&["server"]).inc();
+        self.metrics.bytes_sent_total.with_label_values(&["server"]).inc_by(data.len() as u64);
 
         Ok(())
     }
+    
+    /// Trigger shutdown.
+    fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
+    }
+}
 
+/// Status provider implementation for the server.
+struct ServerStatusProvider {
+    start_time: Instant,
+    transport_sessions: DashMap<SessionId, Arc<TransportSession>>,
+    stats: Arc<RwLock<ServerStats>>,
+}
+
+impl StatusProvider for ServerStatusProvider {
+    fn get_status(&self) -> StatusResponse {
+        let stats = self.stats.read();
+        
+        let sessions: Vec<SessionStatus> = self.transport_sessions.iter()
+            .take(100)
+            .map(|entry| {
+                let session = entry.value();
+                let addrs = session.client_addrs.read();
+                let session_stats = session.stats.read();
+                
+                SessionStatus {
+                    id: session.id.to_string(),
+                    user_id: session.user_id.read().clone(),
+                    remote_addrs: addrs.iter().map(|a| a.to_string()).collect(),
+                    connected_at: "".to_string(),
+                    bytes_sent: session_stats.bytes_sent,
+                    bytes_received: session_stats.bytes_received,
+                    uplinks_used: vec![],
+                }
+            })
+            .collect();
+        
+        StatusResponse {
+            version: triglav::VERSION.to_string(),
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+            state: "running".to_string(),
+            uplinks: vec![],
+            sessions,
+            total_bytes_sent: stats.bytes_sent,
+            total_bytes_received: stats.bytes_received,
+            total_connections: stats.total_connections,
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Parse command line args using the same CLI as main binary
+    // Parse command line args
     let args: Vec<String> = std::env::args().collect();
 
     // Simple argument parsing for standalone server
     let mut listen_addr: SocketAddr = "0.0.0.0:7443".parse().unwrap();
-    let mut key_path: Option<std::path::PathBuf> = None;
+    let mut metrics_addr: SocketAddr = "0.0.0.0:9090".parse().unwrap();
+    let mut key_path: Option<PathBuf> = None;
     let mut generate_key = false;
+    let mut daemon_mode = false;
+    let mut pid_file: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -374,14 +494,29 @@ async fn main() -> Result<()> {
                     i += 1;
                 }
             }
+            "-m" | "--metrics" => {
+                if i + 1 < args.len() {
+                    metrics_addr = args[i + 1].parse().unwrap();
+                    i += 1;
+                }
+            }
             "-k" | "--key" => {
                 if i + 1 < args.len() {
-                    key_path = Some(std::path::PathBuf::from(&args[i + 1]));
+                    key_path = Some(PathBuf::from(&args[i + 1]));
                     i += 1;
                 }
             }
             "--generate-key" => {
                 generate_key = true;
+            }
+            "-d" | "--daemon" => {
+                daemon_mode = true;
+            }
+            "--pid-file" => {
+                if i + 1 < args.len() {
+                    pid_file = Some(PathBuf::from(&args[i + 1]));
+                    i += 1;
+                }
             }
             "-h" | "--help" => {
                 println!("Triglav Server");
@@ -390,14 +525,35 @@ async fn main() -> Result<()> {
                 println!();
                 println!("Options:");
                 println!("  -l, --listen <ADDR>    Listen address (default: 0.0.0.0:7443)");
+                println!("  -m, --metrics <ADDR>   Metrics HTTP address (default: 0.0.0.0:9090)");
                 println!("  -k, --key <PATH>       Path to key file");
                 println!("      --generate-key     Generate new key if not exists");
+                println!("  -d, --daemon           Run as daemon");
+                println!("      --pid-file <PATH>  PID file path (for daemon mode)");
                 println!("  -h, --help             Show this help");
                 return Ok(());
             }
             _ => {}
         }
         i += 1;
+    }
+
+    // Daemonize if requested
+    let _pid_guard: Option<PidFileGuard>;
+    if daemon_mode {
+        let daemon_config = DaemonConfig {
+            pid_file: pid_file.clone(),
+            work_dir: PathBuf::from("/"),
+            user: None,
+            group: None,
+            umask: Some(0o027),
+            close_fds: true,
+        };
+        
+        daemonize(&daemon_config)?;
+        _pid_guard = pid_file.map(|p| PidFileGuard::new(p).expect("Failed to create PID file"));
+    } else {
+        _pid_guard = None;
     }
 
     // Initialize logging
@@ -426,6 +582,9 @@ async fn main() -> Result<()> {
         return Err(Error::Config("No key specified".into()));
     };
 
+    // Initialize Prometheus metrics
+    let metrics = init_metrics();
+
     // Create server config
     let config = ServerConfig {
         enabled: true,
@@ -435,26 +594,107 @@ async fn main() -> Result<()> {
 
     // Print connection key
     let auth_key = triglav::types::AuthKey::new(*keypair.public.as_bytes(), vec![listen_addr]);
-    println!();
-    println!("=== Triglav Server ===");
-    println!();
-    println!("Listening on: {}", listen_addr);
-    println!();
-    println!("Client Connection Key:");
-    println!("{}", auth_key);
-    println!();
+    if !daemon_mode {
+        println!();
+        println!("╔══════════════════════════════════════════╗");
+        println!("║     TRIGLAV SERVER                       ║");
+        println!("║     Version {}                         ║", triglav::VERSION);
+        println!("╚══════════════════════════════════════════╝");
+        println!();
+        println!("Listening on: {}", listen_addr);
+        println!("Metrics at:   http://{}", metrics_addr);
+        println!();
+        println!("Client Connection Key:");
+        println!("{}", auth_key);
+        println!();
+    }
+    
+    info!("Triglav server starting");
+    info!("Listen: {}, Metrics: {}", listen_addr, metrics_addr);
 
-    // Create and run server
-    let server = Server::new(config, keypair).await?;
-
-    // Handle Ctrl+C
-    let _server_ref = &server;
+    // Create server
+    let server = Arc::new(
+        Server::new(config, keypair, Arc::clone(&metrics)).await?
+    );
+    
+    // Create a shared stats reference for the status provider
+    let shared_stats: Arc<RwLock<ServerStats>> = Arc::new(RwLock::new(ServerStats::default()));
+    
+    // Create status provider that shares data with server
+    let status_provider = Arc::new(ServerStatusProvider {
+        start_time: server.start_time,
+        transport_sessions: server.transport_sessions.clone(),
+        stats: shared_stats,
+    });
+    
+    // Create health checker
+    let health_checker = Arc::new(DefaultHealthChecker::new());
+    health_checker.set_ready(true);
+    
+    // Start metrics HTTP server
+    let http_config = HttpServerConfig {
+        bind_addr: metrics_addr,
+        enable_cors: true,
+        shutdown_timeout: Duration::from_secs(5),
+    };
+    let http_server = MetricsHttpServer::new(
+        http_config,
+        metrics,
+        status_provider,
+        health_checker,
+    );
+    
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("Shutting down...");
+        if let Err(e) = http_server.start().await {
+            error!("Metrics HTTP server error: {}", e);
+        }
     });
 
+    // Setup signal handler
+    let signal_handler = SignalHandler::new();
+    signal_handler.set_reload_callback(|| {
+        info!("Received reload signal - reloading configuration");
+        // TODO: Implement config reload
+    });
+    
+    let mut signal_rx = signal_handler.subscribe();
+    let server_for_shutdown = Arc::clone(&server);
+    
+    tokio::spawn(async move {
+        while let Ok(signal) = signal_rx.recv().await {
+            match signal {
+                Signal::Terminate | Signal::Interrupt => {
+                    info!("Received shutdown signal");
+                    server_for_shutdown.shutdown();
+                    break;
+                }
+                Signal::Hangup => {
+                    info!("Received HUP signal");
+                }
+                Signal::User1 => {
+                    info!("Received USR1 - dumping stats");
+                    let stats = server_for_shutdown.stats.read();
+                    info!("Stats: {:?}", *stats);
+                }
+                Signal::User2 => {
+                    info!("Received USR2");
+                }
+                Signal::Child => {
+                    // Child process exited
+                }
+            }
+        }
+    });
+    
+    // Start signal handler
+    tokio::spawn(async move {
+        signal_handler.listen().await;
+    });
+
+    // Run server
     server.run().await?;
+    
+    info!("Triglav server stopped");
 
     Ok(())
 }

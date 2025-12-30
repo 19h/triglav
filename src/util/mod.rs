@@ -2,104 +2,78 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-/// Get all network interfaces with their addresses.
-#[cfg(target_os = "linux")]
-pub fn get_network_interfaces() -> Vec<NetworkInterface> {
-    // Use netlink on Linux
-    vec![] // TODO: Implement with rtnetlink
-}
+use crate::types::InterfaceType;
 
-#[cfg(target_os = "macos")]
-pub fn get_network_interfaces() -> Vec<NetworkInterface> {
-    use std::ffi::CStr;
+// Re-export submodules
+mod interface;
+mod netwatch;
+mod connectivity;
 
-    let mut interfaces = Vec::new();
-
-    unsafe {
-        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(std::ptr::addr_of_mut!(ifaddrs)) != 0 {
-            return interfaces;
-        }
-
-        let mut current = ifaddrs;
-        while !current.is_null() {
-            let ifa = &*current;
-
-            if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
-                let name = CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned();
-                let family = i32::from((*ifa.ifa_addr).sa_family);
-
-                // Pointer casts are necessary for socket address type matching
-                #[allow(clippy::cast_ptr_alignment)]
-                let addr = match family {
-                    libc::AF_INET => {
-                        let sockaddr = ifa.ifa_addr.cast::<libc::sockaddr_in>();
-                        let ip = std::net::Ipv4Addr::from(u32::from_be((*sockaddr).sin_addr.s_addr));
-                        Some(IpAddr::V4(ip))
-                    }
-                    libc::AF_INET6 => {
-                        let sockaddr = ifa.ifa_addr.cast::<libc::sockaddr_in6>();
-                        let ip = std::net::Ipv6Addr::from((*sockaddr).sin6_addr.s6_addr);
-                        Some(IpAddr::V6(ip))
-                    }
-                    _ => None,
-                };
-
-                if let Some(ip) = addr {
-                    let is_up = (ifa.ifa_flags as i32 & libc::IFF_UP) != 0;
-                    let is_loopback = (ifa.ifa_flags as i32 & libc::IFF_LOOPBACK) != 0;
-
-                    interfaces.push(NetworkInterface {
-                        name: name.clone(),
-                        address: ip,
-                        is_up,
-                        is_loopback,
-                        interface_type: guess_interface_type(&name),
-                    });
-                }
-            }
-
-            current = ifa.ifa_next;
-        }
-
-        libc::freeifaddrs(ifaddrs);
-    }
-
-    interfaces
-}
+pub use interface::*;
+pub use netwatch::*;
+pub use connectivity::*;
 
 /// Network interface information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkInterface {
     pub name: String,
+    pub index: u32,
     pub address: IpAddr,
+    pub netmask: Option<IpAddr>,
+    pub broadcast: Option<IpAddr>,
     pub is_up: bool,
+    pub is_running: bool,
     pub is_loopback: bool,
-    pub interface_type: crate::types::InterfaceType,
+    pub mtu: u32,
+    pub interface_type: InterfaceType,
+    pub mac_address: Option<[u8; 6]>,
+}
+
+impl NetworkInterface {
+    /// Check if this interface has a default gateway.
+    pub fn has_gateway(&self) -> bool {
+        // Will be set by gateway detection
+        false
+    }
+    
+    /// Get a string representation of the MAC address.
+    pub fn mac_string(&self) -> Option<String> {
+        self.mac_address.map(|mac| {
+            format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            )
+        })
+    }
 }
 
 /// Guess interface type from name.
-pub fn guess_interface_type(name: &str) -> crate::types::InterfaceType {
-    use crate::types::InterfaceType;
-
+pub fn guess_interface_type(name: &str) -> InterfaceType {
     let name = name.to_lowercase();
 
     if name.starts_with("lo") {
         InterfaceType::Loopback
-    } else if name.starts_with("en") || name.starts_with("eth") {
-        // Could be ethernet or wifi on macOS
-        if name.contains("wifi") || name == "en0" {
-            InterfaceType::Wifi
-        } else {
-            InterfaceType::Ethernet
-        }
-    } else if name.starts_with("wlan") || name.starts_with("wl") {
+    } else if name.starts_with("eth") || name.starts_with("enp") || name.starts_with("eno") {
+        InterfaceType::Ethernet
+    } else if name.starts_with("en") {
+        // macOS: en0 is usually WiFi on laptops, Ethernet on desktops
+        // We'll guess WiFi as it's more common for multipath scenarios
         InterfaceType::Wifi
-    } else if name.starts_with("cell") || name.starts_with("pdp") || name.starts_with("rmnet") {
+    } else if name.starts_with("wlan") || name.starts_with("wl") || name.starts_with("wlp") {
+        InterfaceType::Wifi
+    } else if name.starts_with("cell") || name.starts_with("pdp") 
+        || name.starts_with("rmnet") || name.starts_with("wwan") 
+        || name.starts_with("usb") {
         InterfaceType::Cellular
-    } else if name.starts_with("tun") || name.starts_with("tap") || name.starts_with("utun") {
+    } else if name.starts_with("tun") || name.starts_with("tap") 
+        || name.starts_with("utun") || name.starts_with("wg") {
         InterfaceType::Tunnel
-    } else if name.starts_with("bridge") || name.starts_with("br") {
+    } else if name.starts_with("bridge") || name.starts_with("br") 
+        || name.starts_with("virbr") || name.starts_with("docker") {
+        InterfaceType::Ethernet
+    } else if name.starts_with("veth") || name.starts_with("vnet") {
+        InterfaceType::Tunnel
+    } else if name.starts_with("bond") || name.starts_with("team") {
         InterfaceType::Ethernet
     } else {
         InterfaceType::Unknown
@@ -144,7 +118,16 @@ pub fn format_duration(duration: std::time::Duration) -> String {
 
 /// Parse socket address with optional port.
 pub fn parse_addr_with_default_port(s: &str, default_port: u16) -> Result<SocketAddr, std::net::AddrParseError> {
-    if s.contains(':') {
+    if s.contains(':') && !s.starts_with('[') {
+        // IPv4 with port or just IPv4
+        if s.matches(':').count() == 1 {
+            s.parse()
+        } else {
+            // Multiple colons - might be IPv6
+            format!("[{s}]:{default_port}").parse()
+        }
+    } else if s.starts_with('[') {
+        // IPv6 with port
         s.parse()
     } else {
         format!("{s}:{default_port}").parse()
@@ -166,11 +149,49 @@ pub fn is_root() -> bool {
 pub fn hostname() -> Option<String> {
     let mut buf = [0u8; 256];
     unsafe {
-        if libc::gethostname(buf.as_mut_ptr().cast::<i8>(), buf.len()) == 0 {
+        if libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) == 0 {
             let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
             String::from_utf8(buf[..len].to_vec()).ok()
         } else {
             None
         }
     }
+}
+
+/// Get interface index by name.
+#[cfg(unix)]
+pub fn if_nametoindex(name: &str) -> Option<u32> {
+    use std::ffi::CString;
+    let cname = CString::new(name).ok()?;
+    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    if idx == 0 {
+        None
+    } else {
+        Some(idx)
+    }
+}
+
+#[cfg(not(unix))]
+pub fn if_nametoindex(_name: &str) -> Option<u32> {
+    None
+}
+
+/// Get interface name by index.
+#[cfg(unix)]
+pub fn if_indextoname(index: u32) -> Option<String> {
+    let mut buf = [0u8; libc::IF_NAMESIZE];
+    let result = unsafe {
+        libc::if_indextoname(index, buf.as_mut_ptr().cast::<libc::c_char>())
+    };
+    if result.is_null() {
+        None
+    } else {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8(buf[..len].to_vec()).ok()
+    }
+}
+
+#[cfg(not(unix))]
+pub fn if_indextoname(_index: u32) -> Option<String> {
+    None
 }

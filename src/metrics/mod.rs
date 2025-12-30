@@ -1,16 +1,26 @@
-//! Quality metrics and predictive analytics.
+//! Quality metrics, predictive analytics, and Prometheus export.
 //!
 //! This module provides:
 //! - Real-time quality measurement
 //! - Historical data tracking
 //! - Predictive quality estimation
 //! - Anomaly detection
+//! - Prometheus metrics export
+//! - HTTP health endpoints
 
 mod quality;
 mod predictor;
+#[cfg(feature = "metrics")]
+mod prometheus_export;
+#[cfg(feature = "metrics")]
+mod http_server;
 
 pub use quality::QualityMetrics;
 pub use predictor::{QualityPredictor, Prediction};
+#[cfg(feature = "metrics")]
+pub use prometheus_export::*;
+#[cfg(feature = "metrics")]
+pub use http_server::*;
 
 use std::time::Duration;
 
@@ -39,6 +49,18 @@ pub struct MetricsConfig {
     /// Prediction horizon.
     #[serde(default = "default_prediction_horizon", with = "humantime_serde")]
     pub prediction_horizon: Duration,
+
+    /// Enable Prometheus metrics export.
+    #[serde(default = "default_prometheus")]
+    pub prometheus_enabled: bool,
+
+    /// HTTP server bind address for metrics/health.
+    #[serde(default = "default_http_bind")]
+    pub http_bind: String,
+
+    /// Enable per-user metrics.
+    #[serde(default)]
+    pub per_user_metrics: bool,
 }
 
 fn default_sample_window() -> Duration { Duration::from_secs(10) }
@@ -46,6 +68,8 @@ fn default_history_retention() -> Duration { Duration::from_secs(3600) }
 fn default_anomaly_threshold() -> f64 { 3.0 }
 fn default_prediction() -> bool { true }
 fn default_prediction_horizon() -> Duration { Duration::from_secs(60) }
+fn default_prometheus() -> bool { true }
+fn default_http_bind() -> String { "0.0.0.0:9090".to_string() }
 
 impl Default for MetricsConfig {
     fn default() -> Self {
@@ -55,6 +79,9 @@ impl Default for MetricsConfig {
             anomaly_threshold: default_anomaly_threshold(),
             prediction_enabled: default_prediction(),
             prediction_horizon: default_prediction_horizon(),
+            prometheus_enabled: default_prometheus(),
+            http_bind: default_http_bind(),
+            per_user_metrics: false,
         }
     }
 }

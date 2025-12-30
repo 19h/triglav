@@ -1206,6 +1206,7 @@ impl MultipathManager {
     /// Returns a flow hash as u64 for use in ECMP-aware path selection.
     ///
     /// Supports both IPv4 and IPv6 packets with TCP/UDP headers.
+    #[allow(dead_code)]
     fn extract_flow_id(data: &[u8]) -> Option<u64> {
         if data.len() < 20 {
             return None;
@@ -1221,6 +1222,7 @@ impl MultipathManager {
     }
 
     /// Extract flow ID from IPv4 packet.
+    #[allow(dead_code)]
     fn extract_ipv4_flow_id(data: &[u8]) -> Option<u64> {
         if data.len() < 20 {
             return None;
@@ -1250,6 +1252,7 @@ impl MultipathManager {
     }
 
     /// Extract flow ID from IPv6 packet.
+    #[allow(dead_code)]
     fn extract_ipv6_flow_id(data: &[u8]) -> Option<u64> {
         if data.len() < 40 {
             return None;

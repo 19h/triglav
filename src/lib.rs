@@ -59,6 +59,7 @@ pub mod metrics;
 pub mod multipath;
 pub mod protocol;
 pub mod proxy;
+pub mod server;
 pub mod transport;
 pub mod types;
 pub mod util;

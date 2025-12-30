@@ -370,10 +370,176 @@ fn run_keygen(args: KeygenArgs) -> Result<()> {
 }
 
 /// Show status
-async fn run_status(_args: StatusArgs) -> Result<()> {
-    println!("{}", "Status: Not connected".yellow());
-    println!();
-    println!("Use '{}' to connect to a server.", "triglav connect <key>".cyan());
+async fn run_status(args: StatusArgs) -> Result<()> {
+    // Try to connect to local metrics endpoint
+    let metrics_url = "http://127.0.0.1:9090";
+    
+    // Try status endpoint first
+    let status_url = format!("{}/status", metrics_url);
+    
+    match reqwest::get(&status_url).await {
+        Ok(response) if response.status().is_success() => {
+            let status: serde_json::Value = response.json().await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+                return Ok(());
+            }
+            
+            println!("{}", "╔══════════════════════════════════════════╗".bright_cyan());
+            println!("{}", "║     TRIGLAV STATUS                       ║".bright_cyan());
+            println!("{}", "╚══════════════════════════════════════════╝".bright_cyan());
+            println!();
+            
+            // Version and uptime
+            if let Some(version) = status.get("version").and_then(|v| v.as_str()) {
+                println!("  {} {}", "Version:".bright_white(), version);
+            }
+            if let Some(uptime) = status.get("uptime_seconds").and_then(|v| v.as_u64()) {
+                println!("  {} {}", "Uptime:".bright_white(), util::format_duration(Duration::from_secs(uptime)));
+            }
+            if let Some(state) = status.get("state").and_then(|v| v.as_str()) {
+                let state_colored = match state {
+                    "running" => state.green(),
+                    "starting" => state.yellow(),
+                    _ => state.red(),
+                };
+                println!("  {} {}", "State:".bright_white(), state_colored);
+            }
+            println!();
+            
+            // Uplinks
+            if let Some(uplinks) = status.get("uplinks").and_then(|v| v.as_array()) {
+                println!("{}", "Uplinks:".bright_white().bold());
+                if uplinks.is_empty() {
+                    println!("  {} No uplinks configured", "○".dimmed());
+                } else {
+                    for uplink in uplinks {
+                        let id = uplink.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let state = uplink.get("state").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let rtt = uplink.get("rtt_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let loss = uplink.get("loss_percent").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        
+                        let status_icon = match state {
+                            "connected" => "●".green(),
+                            "connecting" => "◐".yellow(),
+                            _ => "○".red(),
+                        };
+                        
+                        println!(
+                            "  {} {} - {} | RTT: {:.1}ms | Loss: {:.1}%",
+                            status_icon, id.bright_white(), state, rtt, loss
+                        );
+                    }
+                }
+                println!();
+            }
+            
+            // Sessions
+            if let Some(sessions) = status.get("sessions").and_then(|v| v.as_array()) {
+                println!("{}", "Sessions:".bright_white().bold());
+                if sessions.is_empty() {
+                    println!("  {} No active sessions", "○".dimmed());
+                } else {
+                    println!("  {} active sessions", sessions.len().to_string().green());
+                }
+                println!();
+            }
+            
+            // Traffic
+            if let (Some(tx), Some(rx)) = (
+                status.get("total_bytes_sent").and_then(|v| v.as_u64()),
+                status.get("total_bytes_received").and_then(|v| v.as_u64())
+            ) {
+                println!("{}", "Traffic:".bright_white().bold());
+                println!("  {} TX: {}", "↑".cyan(), util::format_bytes(tx));
+                println!("  {} RX: {}", "↓".cyan(), util::format_bytes(rx));
+                println!();
+            }
+            
+            // Detailed stats
+            if args.detailed {
+                // Fetch metrics
+                let metrics_endpoint = format!("{}/metrics", metrics_url);
+                if let Ok(metrics_response) = reqwest::get(&metrics_endpoint).await {
+                    if let Ok(metrics_text) = metrics_response.text().await {
+                        println!("{}", "Metrics:".bright_white().bold());
+                        // Show a few key metrics
+                        for line in metrics_text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).take(20) {
+                            println!("  {}", line.dimmed());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(response) => {
+            println!("{} Server returned: {}", "✗".red(), response.status());
+            println!();
+            println!("Make sure a Triglav server/client is running with metrics enabled.");
+        }
+        Err(_) => {
+            // No server running, show offline status
+            println!("{}", "╔══════════════════════════════════════════╗".bright_cyan());
+            println!("{}", "║     TRIGLAV STATUS                       ║".bright_cyan());
+            println!("{}", "╚══════════════════════════════════════════╝".bright_cyan());
+            println!();
+            println!("  {} {}", "Status:".bright_white(), "Not connected".yellow());
+            println!();
+            println!("No Triglav instance detected on {}.", metrics_url.cyan());
+            println!();
+            println!("To start:");
+            println!("  Server: {} {}", "triglav server --generate-key".cyan(), "");
+            println!("  Client: {} {}", "triglav connect <key>".cyan(), "");
+            
+            // Show available network interfaces
+            println!();
+            println!("{}", "Available Interfaces:".bright_white().bold());
+            let interfaces = util::get_network_interfaces();
+            let usable: Vec<_> = interfaces.iter()
+                .filter(|i| i.is_up && !i.is_loopback)
+                .collect();
+            
+            if usable.is_empty() {
+                println!("  {} No usable network interfaces found", "⚠".yellow());
+            } else {
+                for iface in usable.iter().take(5) {
+                    let type_str = format!("{:?}", iface.interface_type).dimmed();
+                    println!(
+                        "  {} {} ({}) - {}",
+                        "●".green(),
+                        iface.name.bright_white(),
+                        iface.address,
+                        type_str
+                    );
+                }
+                if usable.len() > 5 {
+                    println!("  {} ... and {} more", "".dimmed(), usable.len() - 5);
+                }
+            }
+        }
+    }
+    
+    // Watch mode
+    if args.watch {
+        println!();
+        println!("{}", "Watching for updates... (Ctrl+C to stop)".dimmed());
+        
+        let mut interval = tokio::time::interval(Duration::from_secs(args.interval));
+        loop {
+            interval.tick().await;
+            
+            // Clear screen and re-run
+            print!("\x1B[2J\x1B[1;1H");
+            
+            // Recursive call without watch to avoid infinite loop
+            let mut no_watch_args = args.clone();
+            no_watch_args.watch = false;
+            if let Err(e) = Box::pin(run_status(no_watch_args)).await {
+                println!("Error: {}", e);
+            }
+        }
+    }
 
     Ok(())
 }

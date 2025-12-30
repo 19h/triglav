@@ -1,0 +1,48 @@
+# Triglav Server Container
+FROM rustlang/rust:nightly-bookworm as builder
+
+WORKDIR /build
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy source
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# Build release binary
+RUN cargo build --release --bin triglav-server
+
+# Runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    iproute2 \
+    iputils-ping \
+    curl \
+    dnsutils \
+    tcpdump \
+    iperf3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy binary
+COPY --from=builder /build/target/release/triglav-server /usr/local/bin/
+
+# Create data directory
+RUN mkdir -p /data
+
+# Generate server key on first run
+COPY docker/testnet/scripts/start-server.sh /start-server.sh
+RUN chmod +x /start-server.sh
+
+EXPOSE 7443/udp
+EXPOSE 7443/tcp
+EXPOSE 9090/tcp
+
+ENTRYPOINT ["/start-server.sh"]

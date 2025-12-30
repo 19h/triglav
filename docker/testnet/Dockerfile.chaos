@@ -1,0 +1,15 @@
+# Chaos Agent - Dynamic Network Impairment
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    iproute2 \
+    docker.io \
+    curl \
+    jq \
+    procps \
+    bc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+CMD ["tail", "-f", "/dev/null"]

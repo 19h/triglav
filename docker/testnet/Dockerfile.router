@@ -1,0 +1,18 @@
+# Network Router/Impairment Container
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    iproute2 \
+    iptables \
+    iputils-ping \
+    tcpdump \
+    net-tools \
+    procps \
+    curl \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Default: just route packets
+CMD ["sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward && tail -f /dev/null"]

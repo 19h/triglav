@@ -1,0 +1,47 @@
+# Triglav Client Container (Multi-homed)
+FROM rustlang/rust:nightly-bookworm as builder
+
+WORKDIR /build
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy source
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# Build release binary
+RUN cargo build --release --bin triglav
+
+# Runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    iproute2 \
+    iputils-ping \
+    curl \
+    dnsutils \
+    tcpdump \
+    iperf3 \
+    netcat-openbsd \
+    jq \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy binary
+COPY --from=builder /build/target/release/triglav /usr/local/bin/
+
+# Create data directory
+RUN mkdir -p /data
+
+# Client startup script
+COPY docker/testnet/scripts/start-client.sh /start-client.sh
+RUN chmod +x /start-client.sh
+
+ENTRYPOINT ["/start-client.sh"]

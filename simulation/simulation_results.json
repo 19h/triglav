@@ -1,0 +1,674 @@
+{
+  "algorithm_stats": {
+    "ensemble_hybrid": {
+      "algorithm_id": "ensemble_hybrid",
+      "continuity_mean": 0.8756508333333325,
+      "failed_failover_rate": 0.0,
+      "failover_count_mean": 0.235,
+      "failover_count_std": 0.5173098799461132,
+      "jitter_mean": 10.433383863308077,
+      "jitter_std": 8.552606012502057,
+      "latency_mean": 38.5005059463505,
+      "latency_p50": 30.96511295820349,
+      "latency_p95": 65.43333554932092,
+      "latency_p99": 71.73089146097347,
+      "latency_std": 16.1387636736074,
+      "loss_rate_mean": 0.12434916666666677,
+      "loss_rate_std": 0.27367215616615276,
+      "outage_time_max_ms": 50190.0,
+      "outage_time_mean_ms": 7460.95,
+      "quality_score_mean": 0.8321704628985291,
+      "quality_score_std": 0.15768167886419512,
+      "reaction_time_estimate_ms": 5463.32375,
+      "sample_count": 800,
+      "stability_score": 0.5811256032824994
+    },
+    "ewma_standard": {
+      "algorithm_id": "ewma_standard",
+      "continuity_mean": 0.878993541666666,
+      "failed_failover_rate": 0.0,
+      "failover_count_mean": 0.07,
+      "failover_count_std": 0.26492967872311934,
+      "jitter_mean": 18.057893384476515,
+      "jitter_std": 21.649983355550525,
+      "latency_mean": 46.80885891197149,
+      "latency_p50": 35.22689801745575,
+      "latency_p95": 99.98683927737753,
+      "latency_p99": 101.2682634324515,
+      "latency_std": 24.97754107990436,
+      "loss_rate_mean": 0.12100645833333344,
+      "loss_rate_std": 0.2746703701864024,
+      "outage_time_max_ms": 50190.0,
+      "outage_time_mean_ms": 7260.3875,
+      "quality_score_mean": 0.8243563971339661,
+      "quality_score_std": 0.16061458841959977,
+      "reaction_time_estimate_ms": 5549.597916666667,
+      "sample_count": 800,
+      "stability_score": 0.7524021694176455
+    },
+    "kalman_predictive": {
+      "algorithm_id": "kalman_predictive",
+      "continuity_mean": 0.8789737499999996,
+      "failed_failover_rate": 0.0,
+      "failover_count_mean": 0.0,
+      "failover_count_std": 0.0,
+      "jitter_mean": 18.05831053147882,
+      "jitter_std": 21.650045537358643,
+      "latency_mean": 46.809049478258615,
+      "latency_p50": 35.22689801745575,
+      "latency_p95": 99.98683927737753,
+      "latency_p99": 101.2682634324515,
+      "latency_std": 24.977673339024395,
+      "loss_rate_mean": 0.12102625000000015,
+      "loss_rate_std": 0.27472184932856164,
+      "outage_time_max_ms": 50190.0,
+      "outage_time_mean_ms": 7261.575,
+      "quality_score_mean": 0.823826717796986,
+      "quality_score_std": 0.16173103530156704,
+      "reaction_time_estimate_ms": 7261.575,
+      "sample_count": 800,
+      "stability_score": 1.0
+    },
+    "paranoid_milspec": {
+      "algorithm_id": "paranoid_milspec",
+      "continuity_mean": 0.8762760416666657,
+      "failed_failover_rate": 0.0,
+      "failover_count_mean": 0.875,
+      "failover_count_std": 1.9721147394819862,
+      "jitter_mean": 16.19713724731573,
+      "jitter_std": 19.22963445074037,
+      "latency_mean": 45.080680555573196,
+      "latency_p50": 31.032311271463445,
+      "latency_p95": 99.43500581107362,
+      "latency_p99": 100.79428338237567,
+      "latency_std": 23.425767002215373,
+      "loss_rate_mean": 0.12372395833333347,
+      "loss_rate_std": 0.2755644262979356,
+      "outage_time_max_ms": 53740.0,
+      "outage_time_mean_ms": 7423.4375,
+      "quality_score_mean": 0.8272452038512401,
+      "quality_score_std": 0.1594179823871281,
+      "reaction_time_estimate_ms": 4612.011740476268,
+      "sample_count": 800,
+      "stability_score": -0.05179452772372595
+    },
+    "proactive_pattern": {
+      "algorithm_id": "proactive_pattern",
+      "continuity_mean": 0.862704374999999,
+      "failed_failover_rate": 0.0,
+      "failover_count_mean": 0.5025,
+      "failover_count_std": 0.6841628816010888,
+      "jitter_mean": 10.759012585176627,
+      "jitter_std": 7.681894369930668,
+      "latency_mean": 39.21214064036846,
+      "latency_p50": 30.927907283702844,
+      "latency_p95": 65.85104098066921,
+      "latency_p99": 70.72804608238572,
+      "latency_std": 16.86078927602822,
+      "loss_rate_mean": 0.13729562500000017,
+      "loss_rate_std": 0.28226565331644987,
+      "outage_time_max_ms": 57480.0,
+      "outage_time_mean_ms": 8237.7375,
+      "quality_score_mean": 0.8236712858020497,
+      "quality_score_std": 0.15816573227773245,
+      "reaction_time_estimate_ms": 4547.817708333334,
+      "sample_count": 800,
+      "stability_score": 0.5446503283852986
+    },
+    "qlearning_rl": {
+      "algorithm_id": "qlearning_rl",
+      "continuity_mean": 0.8772449999999994,
+      "failed_failover_rate": 0.0,
+      "failover_count_mean": 271.31875,
+      "failover_count_std": 312.15711144585333,
+      "jitter_mean": 16.520165439269046,
+      "jitter_std": 17.225041500197708,
+      "latency_mean": 44.39118372683356,
+      "latency_p50": 35.935427851606036,
+      "latency_p95": 79.70952840721691,
+      "latency_p99": 89.59641771797041,
+      "latency_std": 19.886014934115956,
+      "loss_rate_mean": 0.1227550000000001,
+      "loss_rate_std": 0.274032708446071,
+      "outage_time_max_ms": 50190.0,
+      "outage_time_mean_ms": 7365.3,
+      "quality_score_mean": 0.7382549308110127,
+      "quality_score_std": 0.16586169351647728,
+      "reaction_time_estimate_ms": 807.6320223054619,
+      "sample_count": 800,
+      "stability_score": -0.14629312688110274
+    },
+    "threshold_simple": {
+      "algorithm_id": "threshold_simple",
+      "continuity_mean": 0.8769756249999994,
+      "failed_failover_rate": 0.0,
+      "failover_count_mean": 1.16125,
+      "failover_count_std": 3.0959214055247903,
+      "jitter_mean": 14.37363821963007,
+      "jitter_std": 13.034904375315365,
+      "latency_mean": 42.78330687779675,
+      "latency_p50": 35.22689801745575,
+      "latency_p95": 66.3042921116845,
+      "latency_p99": 82.57370691359105,
+      "latency_std": 17.886531247030657,
+      "loss_rate_mean": 0.12302437500000016,
+      "loss_rate_std": 0.2740924532354387,
+      "outage_time_max_ms": 50190.0,
+      "outage_time_mean_ms": 7381.4625,
+      "quality_score_mean": 0.82662478506499,
+      "quality_score_std": 0.16054675682198508,
+      "reaction_time_estimate_ms": 6419.376988636363,
+      "sample_count": 800,
+      "stability_score": -0.432467972481106
+    },
+    "ucb1_bandit": {
+      "algorithm_id": "ucb1_bandit",
+      "continuity_mean": 0.8747327083333323,
+      "failed_failover_rate": 0.0,
+      "failover_count_mean": 2717.5475,
+      "failover_count_std": 2137.2670471380584,
+      "jitter_mean": 19.050923536671338,
+      "jitter_std": 15.522143535116546,
+      "latency_mean": 44.36178803199414,
+      "latency_p50": 31.119441832038863,
+      "latency_p95": 65.43955829693654,
+      "latency_p99": 67.73265042223322,
+      "latency_std": 17.367186141235717,
+      "loss_rate_mean": 0.12526729166666684,
+      "loss_rate_std": 0.27306747486239963,
+      "outage_time_max_ms": 50220.0,
+      "outage_time_mean_ms": 7516.0375,
+      "quality_score_mean": 0.7296012415123292,
+      "quality_score_std": 0.16279672002146625,
+      "reaction_time_estimate_ms": 84.94065938669857,
+      "sample_count": 800,
+      "stability_score": 0.21382023042155474
+    },
+    "wma_adaptive": {
+      "algorithm_id": "wma_adaptive",
+      "continuity_mean": 0.8789737499999996,
+      "failed_failover_rate": 0.0,
+      "failover_count_mean": 0.0,
+      "failover_count_std": 0.0,
+      "jitter_mean": 18.058312315615833,
+      "jitter_std": 21.650044641306852,
+      "latency_mean": 46.809050692563375,
+      "latency_p50": 35.22689801745575,
+      "latency_p95": 99.98683927737753,
+      "latency_p99": 101.2682634324515,
+      "latency_std": 24.977674529322325,
+      "loss_rate_mean": 0.12102625000000015,
+      "loss_rate_std": 0.27472184932856164,
+      "outage_time_max_ms": 50190.0,
+      "outage_time_mean_ms": 7261.575,
+      "quality_score_mean": 0.8238267145136281,
+      "quality_score_std": 0.16173104208528605,
+      "reaction_time_estimate_ms": 7261.575,
+      "sample_count": 800,
+      "stability_score": 1.0
+    },
+    "zscore_outlier": {
+      "algorithm_id": "zscore_outlier",
+      "continuity_mean": 0.8752554166666653,
+      "failed_failover_rate": 0.0,
+      "failover_count_mean": 14.49875,
+      "failover_count_std": 11.424234760469904,
+      "jitter_mean": 15.186048672784374,
+      "jitter_std": 12.449304952272419,
+      "latency_mean": 44.31141184735962,
+      "latency_p50": 39.94398068768617,
+      "latency_p95": 66.88158322788837,
+      "latency_p99": 86.09223178331986,
+      "latency_std": 17.911657960432436,
+      "loss_rate_mean": 0.12474458333333349,
+      "loss_rate_std": 0.2733101125928103,
+      "outage_time_max_ms": 50200.0,
+      "outage_time_mean_ms": 7484.675,
+      "quality_score_mean": 0.7707387002338101,
+      "quality_score_std": 0.131136647614702,
+      "reaction_time_estimate_ms": 2256.152717835851,
+      "sample_count": 800,
+      "stability_score": 0.2628931519980705
+    }
+  },
+  "confidence_intervals": {
+    "latency_ms": {
+      "lower_95": 43.44829083600354,
+      "lower_99": 43.3041886878911,
+      "mean": 43.906797670906734,
+      "metric": "",
+      "upper_95": 44.36530450580993,
+      "upper_99": 44.50940665392237
+    },
+    "loss_rate": {
+      "lower_95": 0.11839774703707427,
+      "lower_99": 0.11650444312967839,
+      "mean": 0.12442189583333389,
+      "metric": "",
+      "upper_95": 0.1304460446295935,
+      "upper_99": 0.1323393485369894
+    },
+    "quality_score": {
+      "lower_95": 0.7984679697463986,
+      "lower_99": 0.7973479578501111,
+      "mean": 0.8020316439618588,
+      "metric": "",
+      "upper_95": 0.805595318177319,
+      "upper_99": 0.8067153300736064
+    }
+  },
+  "config": {
+    "monte_carlo_iterations": 100,
+    "simulation_duration_s": 60,
+    "time_resolution_ms": 10
+  },
+  "optimal_parameters": {
+    "consecutive_failures": 3,
+    "consecutive_failures_rationale": "Balance between reaction speed and stability",
+    "ewma_alpha": 0.125,
+    "ewma_alpha_rationale": "Weighted average from high-performing algorithms, optimizing for 0.125",
+    "heartbeat_interval_ms": 100,
+    "hysteresis_ms": 5000,
+    "hysteresis_rationale": "Prevents oscillation during transient conditions",
+    "loss_threshold_confidence": 0.8,
+    "loss_threshold_percent": 5.0,
+    "max_silent_period_ms": 500,
+    "path_diversity": 2,
+    "preemptive_switching_enabled": true,
+    "preemptive_threshold_trend": 5.0,
+    "recommended_algorithm": "ensemble_hybrid",
+    "recommended_algorithm_rationale": "Best composite score across all scenarios with balanced latency/loss/stability trade-off",
+    "rtt_threshold_confidence": 0.85,
+    "rtt_threshold_ms": 200.0
+  },
+  "parameter_correlations": [
+    {
+      "correlation": -0.5788181876044152,
+      "metric_name": "quality_score",
+      "p_value": 0.0,
+      "parameter_name": "q_table_size",
+      "significant": true
+    },
+    {
+      "correlation": -0.17753555098729823,
+      "metric_name": "quality_score",
+      "p_value": 5.53113110868253e-13,
+      "parameter_name": "window_size",
+      "significant": true
+    },
+    {
+      "correlation": -1.8464272697057446e-15,
+      "metric_name": "quality_score",
+      "p_value": 0.9999999999999585,
+      "parameter_name": "discount_factor",
+      "significant": false
+    },
+    {
+      "correlation": 1.6778494667994692e-15,
+      "metric_name": "quality_score",
+      "p_value": 0.9999999999999623,
+      "parameter_name": "epsilon",
+      "significant": false
+    },
+    {
+      "correlation": -1.6159821515097921e-15,
+      "metric_name": "quality_score",
+      "p_value": 0.9999999999999636,
+      "parameter_name": "measurement_noise",
+      "significant": false
+    },
+    {
+      "correlation": 1.608021016802014e-15,
+      "metric_name": "quality_score",
+      "p_value": 0.9999999999999638,
+      "parameter_name": "learning_rate",
+      "significant": false
+    },
+    {
+      "correlation": -1.423149673289483e-15,
+      "metric_name": "quality_score",
+      "p_value": 0.999999999999968,
+      "parameter_name": "process_noise",
+      "significant": false
+    },
+    {
+      "correlation": -1.0265769890767026e-15,
+      "metric_name": "quality_score",
+      "p_value": 0.9999999999999769,
+      "parameter_name": "confidence_threshold",
+      "significant": false
+    },
+    {
+      "correlation": -5.673331579153947e-16,
+      "metric_name": "quality_score",
+      "p_value": 0.9999999999999871,
+      "parameter_name": "reward_decay",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "alpha_rtt",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "exploration_factor",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "rtt_threshold_factor",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "component_count",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "consecutive_failures",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "heartbeat_interval_ms",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "hysteresis_ms",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "prediction_horizon_ms",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "loss_threshold_percent",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "prediction_horizon_s",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "return_delay_ms",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "pattern_window_s",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "max_silent_period_ms",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "path_diversity_required",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "alpha_variance",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "z_threshold",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "threshold_multiplier",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "outlier_streak_threshold",
+      "significant": false
+    },
+    {
+      "correlation": 0.0,
+      "metric_name": "quality_score",
+      "p_value": 1.0,
+      "parameter_name": "rtt_threshold_ms",
+      "significant": false
+    }
+  ],
+  "rankings": [
+    {
+      "algorithm_id": "ensemble_hybrid",
+      "composite_score": 0.8321704628985291,
+      "continuity_rank": 7,
+      "latency_rank": 1,
+      "loss_rank": 7,
+      "rank": 1,
+      "stability_rank": 4
+    },
+    {
+      "algorithm_id": "paranoid_milspec",
+      "composite_score": 0.8272452038512401,
+      "continuity_rank": 6,
+      "latency_rank": 7,
+      "loss_rank": 6,
+      "rank": 2,
+      "stability_rank": 8
+    },
+    {
+      "algorithm_id": "threshold_simple",
+      "composite_score": 0.82662478506499,
+      "continuity_rank": 5,
+      "latency_rank": 3,
+      "loss_rank": 5,
+      "rank": 3,
+      "stability_rank": 10
+    },
+    {
+      "algorithm_id": "ewma_standard",
+      "composite_score": 0.8243563971339661,
+      "continuity_rank": 1,
+      "latency_rank": 8,
+      "loss_rank": 1,
+      "rank": 4,
+      "stability_rank": 3
+    },
+    {
+      "algorithm_id": "kalman_predictive",
+      "composite_score": 0.823826717796986,
+      "continuity_rank": 2,
+      "latency_rank": 9,
+      "loss_rank": 2,
+      "rank": 5,
+      "stability_rank": 1
+    },
+    {
+      "algorithm_id": "wma_adaptive",
+      "composite_score": 0.8238267145136281,
+      "continuity_rank": 3,
+      "latency_rank": 10,
+      "loss_rank": 3,
+      "rank": 6,
+      "stability_rank": 2
+    },
+    {
+      "algorithm_id": "proactive_pattern",
+      "composite_score": 0.8236712858020497,
+      "continuity_rank": 10,
+      "latency_rank": 2,
+      "loss_rank": 10,
+      "rank": 7,
+      "stability_rank": 5
+    },
+    {
+      "algorithm_id": "zscore_outlier",
+      "composite_score": 0.7707387002338101,
+      "continuity_rank": 8,
+      "latency_rank": 4,
+      "loss_rank": 8,
+      "rank": 8,
+      "stability_rank": 6
+    },
+    {
+      "algorithm_id": "qlearning_rl",
+      "composite_score": 0.7382549308110127,
+      "continuity_rank": 4,
+      "latency_rank": 6,
+      "loss_rank": 4,
+      "rank": 9,
+      "stability_rank": 9
+    },
+    {
+      "algorithm_id": "ucb1_bandit",
+      "composite_score": 0.7296012415123292,
+      "continuity_rank": 9,
+      "latency_rank": 5,
+      "loss_rank": 9,
+      "rank": 10,
+      "stability_rank": 7
+    }
+  ],
+  "scenario_stats": {
+    "best_case_stable": {
+      "best_latency_achieved": 22.6510504621506,
+      "best_loss_rate_achieved": 0.0,
+      "coverage_gap_count_mean": 0.0,
+      "event_count_mean": 0.0,
+      "handover_count_mean": 0.0,
+      "sample_count": 1000,
+      "scenario_id": "best_case_stable",
+      "worst_latency_observed": 22.985892063088205,
+      "worst_loss_rate_observed": 0.0005
+    },
+    "home_5g_wifi": {
+      "best_latency_achieved": 29.172909243614225,
+      "best_loss_rate_achieved": 0.0003333333333333333,
+      "coverage_gap_count_mean": 0.0,
+      "event_count_mean": 0.75,
+      "handover_count_mean": 0.0,
+      "sample_count": 1000,
+      "scenario_id": "home_5g_wifi",
+      "worst_latency_observed": 73.86630936691058,
+      "worst_loss_rate_observed": 0.037
+    },
+    "home_dual_5g": {
+      "best_latency_achieved": 30.73061397395158,
+      "best_loss_rate_achieved": 0.00016666666666666666,
+      "coverage_gap_count_mean": 0.0,
+      "event_count_mean": 0.0,
+      "handover_count_mean": 0.0,
+      "sample_count": 1000,
+      "scenario_id": "home_dual_5g",
+      "worst_latency_observed": 31.141900909809,
+      "worst_loss_rate_observed": 0.010166666666666666
+    },
+    "ix_failure_decix": {
+      "best_latency_achieved": 35.19826210901278,
+      "best_loss_rate_achieved": 0.0003333333333333333,
+      "coverage_gap_count_mean": 0.0,
+      "event_count_mean": 0.0,
+      "handover_count_mean": 0.0,
+      "sample_count": 1000,
+      "scenario_id": "ix_failure_decix",
+      "worst_latency_observed": 77.48625935388219,
+      "worst_loss_rate_observed": 0.0225
+    },
+    "szczecin_berlin_drive": {
+      "best_latency_achieved": 61.49543075171669,
+      "best_loss_rate_achieved": 0.0565,
+      "coverage_gap_count_mean": 0.1,
+      "event_count_mean": 0.15,
+      "handover_count_mean": 0.0,
+      "sample_count": 1000,
+      "scenario_id": "szczecin_berlin_drive",
+      "worst_latency_observed": 62.81617490484765,
+      "worst_loss_rate_observed": 0.631
+    },
+    "train_berlin_munich": {
+      "best_latency_achieved": 26.69994458567219,
+      "best_loss_rate_achieved": 0.0195,
+      "coverage_gap_count_mean": 0.156,
+      "event_count_mean": 0.158,
+      "handover_count_mean": 0.0,
+      "sample_count": 1000,
+      "scenario_id": "train_berlin_munich",
+      "worst_latency_observed": 102.15389965908658,
+      "worst_loss_rate_observed": 0.958
+    },
+    "urban_walk_berlin": {
+      "best_latency_achieved": 26.693469336139913,
+      "best_loss_rate_achieved": 0.00016666666666666666,
+      "coverage_gap_count_mean": 0.0,
+      "event_count_mean": 0.44,
+      "handover_count_mean": 0.0,
+      "sample_count": 1000,
+      "scenario_id": "urban_walk_berlin",
+      "worst_latency_observed": 26.992787689937373,
+      "worst_loss_rate_observed": 0.0018333333333333333
+    },
+    "worst_case_cascade": {
+      "best_latency_achieved": 63.46036921985519,
+      "best_loss_rate_achieved": 0.833,
+      "coverage_gap_count_mean": 0.0,
+      "event_count_mean": 18.468,
+      "handover_count_mean": 0.0,
+      "sample_count": 1000,
+      "scenario_id": "worst_case_cascade",
+      "worst_latency_observed": 66.59415858310362,
+      "worst_loss_rate_observed": 0.837
+    }
+  },
+  "scenario_winners": {
+    "best_case_stable": "paranoid_milspec",
+    "home_5g_wifi": "threshold_simple",
+    "home_dual_5g": "ensemble_hybrid",
+    "ix_failure_decix": "threshold_simple",
+    "szczecin_berlin_drive": "ucb1_bandit",
+    "train_berlin_munich": "ensemble_hybrid",
+    "urban_walk_berlin": "ucb1_bandit",
+    "worst_case_cascade": "zscore_outlier"
+  }
+}

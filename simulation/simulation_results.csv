@@ -1,0 +1,11 @@
+algorithm_id,rank,composite_score,latency_mean,latency_std,loss_rate_mean,continuity_mean,failover_count_mean,stability_score
+ensemble_hybrid,1,0.8322,38.50,16.14,0.124349,0.8757,0.23,0.5811
+paranoid_milspec,2,0.8272,45.08,23.43,0.123724,0.8763,0.88,-0.0518
+threshold_simple,3,0.8266,42.78,17.89,0.123024,0.8770,1.16,-0.4325
+ewma_standard,4,0.8244,46.81,24.98,0.121006,0.8790,0.07,0.7524
+kalman_predictive,5,0.8238,46.81,24.98,0.121026,0.8790,0.00,1.0000
+wma_adaptive,6,0.8238,46.81,24.98,0.121026,0.8790,0.00,1.0000
+proactive_pattern,7,0.8237,39.21,16.86,0.137296,0.8627,0.50,0.5447
+zscore_outlier,8,0.7707,44.31,17.91,0.124745,0.8753,14.50,0.2629
+qlearning_rl,9,0.7383,44.39,19.89,0.122755,0.8772,271.32,-0.1463
+ucb1_bandit,10,0.7296,44.36,17.37,0.125267,0.8747,2717.55,0.2138

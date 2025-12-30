@@ -1,0 +1,78 @@
+[package]
+name = "triglav-simulation"
+version = "0.2.0"
+edition = "2021"
+description = "Military-grade multipath network simulation with neural networks and advanced ML"
+
+[dependencies]
+# Random number generation and distributions
+rand = "0.8"
+rand_chacha = "0.3"
+rand_distr = "0.4"
+
+# Statistical analysis
+statrs = "0.16"
+nalgebra = "0.32"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Parallel computation
+rayon = "1.8"
+crossbeam = "0.8"
+parking_lot = "0.12"
+
+# Progress and output
+indicatif = "0.17"
+comfy-table = "7.1"
+colored = "2.1"
+
+# System info
+num_cpus = "1.16"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Configuration
+toml = "0.8"
+
+# Plotting data export
+csv = "1.3"
+
+# Advanced numerical computing
+ndarray = { version = "0.15", features = ["rayon", "serde"] }
+ndarray-rand = "0.14"
+ndarray-stats = "0.5"
+
+# Graph algorithms (for network topology)
+petgraph = "0.6"
+
+# FFT for spectral analysis
+rustfft = "6.2"
+
+# UUID for unique identifiers
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Ordered floats for hash maps
+ordered-float = { version = "4.2", features = ["serde"] }
+
+# Hash maps
+hashbrown = { version = "0.14", features = ["serde", "rayon"] }
+
+# Itertools
+itertools = "0.12"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16

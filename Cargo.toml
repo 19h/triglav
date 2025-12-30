@@ -10,10 +10,11 @@ keywords = ["networking", "multipath", "vpn", "tunnel", "encryption"]
 categories = ["network-programming", "command-line-utilities"]
 
 [features]
-default = ["cli", "metrics"]
+default = ["cli", "metrics", "server"]
 cli = ["clap", "colored", "indicatif", "dialoguer"]
-metrics = ["prometheus"]
-full = ["cli", "metrics"]
+metrics = ["prometheus", "hyper", "hyper-util", "http-body-util"]
+server = ["axum", "tower", "tower-http"]
+full = ["cli", "metrics", "server"]
 
 [[bin]]
 name = "triglav"
@@ -74,8 +75,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot"] }
 tracing-appender = "0.2"
 
-# Metrics
+# Metrics & HTTP server
 prometheus = { version = "0.13", optional = true }
+hyper = { version = "1.4", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+axum = { version = "0.7", optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
 
 # Configuration
 toml = "0.8"
@@ -107,16 +114,25 @@ humantime = "2.1"
 byteorder = "1.5"
 num_cpus = "1.16"
 libc = "0.2"
-nix = { version = "0.28", features = ["net", "socket", "ioctl"] }
+nix = { version = "0.28", features = ["net", "socket", "ioctl", "signal", "fs", "user"] }
+daemonize = "0.5"
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+argon2 = "0.5"
 
 # Statistics & ML for predictive analytics
 statrs = "0.16"
+
+# HTTP client for status command
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 system-configuration = "0.6"
 core-foundation = "0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = "0.7"
 netlink-packet-route = "0.19"
 rtnetlink = "0.14"
 

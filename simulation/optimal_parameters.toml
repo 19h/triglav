@@ -1,0 +1,30 @@
+# Triglav Optimal Failover Parameters
+# Generated from 100 Monte Carlo iterations
+# Simulation duration: 60s per scenario
+
+[failover]
+# Recommended algorithm: ensemble_hybrid
+algorithm = "ensemble_hybrid"
+
+# Detection thresholds
+rtt_threshold_ms = 200
+loss_threshold_percent = 5.0
+consecutive_failures = 3
+
+# Timing parameters
+hysteresis_ms = 5000
+ewma_alpha = 0.125
+
+[probing]
+heartbeat_interval_ms = 100
+max_silent_period_ms = 500
+path_diversity = 2
+
+[preemptive]
+enabled = true
+trend_threshold_ms_per_s = 5.0
+
+# Confidence metrics
+[confidence]
+rtt_threshold = 0.85
+loss_threshold = 0.80

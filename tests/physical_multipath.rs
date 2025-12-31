@@ -293,13 +293,15 @@ async fn test_multi_interface_connectivity() {
         return;
     }
 
-    // Start test server
+    // Start test server - bind to 0.0.0.0 to accept from any interface
     let server = PhysicalTestServer::new("0.0.0.0:0".parse().unwrap())
         .await
         .expect("Failed to create server");
 
-    let server_addr = server.addr();
-    println!("Test server listening on: {}", server_addr);
+    // Use 127.0.0.1 as destination (server accepts on all interfaces)
+    let server_port = server.addr().port();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
+    println!("Test server listening on port {}", server_port);
 
     // Run server in background
     let server_arc = Arc::new(server);
@@ -392,7 +394,8 @@ async fn test_multipath_manager_real_interfaces() {
         .await
         .expect("Failed to create server");
 
-    let server_addr = server.addr();
+    let server_port = server.addr().port();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
     let server_pubkey = server.public_key().clone();
     println!("Server: {} (pubkey: {:?})", server_addr, server_pubkey);
 
@@ -459,7 +462,8 @@ async fn test_bandwidth_measurement() {
         .await
         .expect("Failed to create server");
 
-    let server_addr = server.addr();
+    let server_port = server.addr().port();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
     let server_arc = Arc::new(server);
     let server_clone = Arc::clone(&server_arc);
     tokio::spawn(async move {
@@ -531,7 +535,8 @@ async fn test_manual_failover() {
         .await
         .expect("Failed to create server");
 
-    let server_addr = server.addr();
+    let server_port = server.addr().port();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
     let server_arc = Arc::new(server);
     let server_clone = Arc::clone(&server_arc);
     tokio::spawn(async move {
@@ -631,7 +636,8 @@ async fn test_latency_distribution() {
         .await
         .expect("Failed to create server");
 
-    let server_addr = server.addr();
+    let server_port = server.addr().port();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
     let server_arc = Arc::new(server);
     let server_clone = Arc::clone(&server_arc);
     tokio::spawn(async move {
@@ -711,7 +717,8 @@ async fn test_concurrent_traffic() {
         .await
         .expect("Failed to create server");
 
-    let server_addr = server.addr();
+    let server_port = server.addr().port();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
     let server_arc = Arc::new(server);
     let server_clone = Arc::clone(&server_arc);
     tokio::spawn(async move {

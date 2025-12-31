@@ -221,7 +221,9 @@ impl ConnectionParams {
         }
         
         let transfer_secs = bytes as f64 / self.effective_throughput.bytes_per_sec;
-        Duration::from_secs_f64(transfer_secs + self.rtt.as_secs_f64())
+        // Cap at 1 hour to avoid Duration overflow
+        let total_secs = (transfer_secs + self.rtt.as_secs_f64()).min(3600.0);
+        Duration::from_secs_f64(total_secs)
     }
     
     /// Check if this uplink can complete a transfer faster than another.
@@ -879,9 +881,10 @@ impl Uplink {
         
         // Estimate time to transfer 1MB
         let time_for_1mb = if effective_throughput > 0.0 {
-            Duration::from_secs_f64((1024.0 * 1024.0) / effective_throughput + smoothed_rtt.as_secs_f64())
+            let secs = ((1024.0 * 1024.0) / effective_throughput + smoothed_rtt.as_secs_f64()).min(3600.0);
+            Duration::from_secs_f64(secs)
         } else {
-            Duration::MAX
+            Duration::from_secs(3600) // 1 hour max
         };
         
         // Calculate goodput (actual useful throughput)

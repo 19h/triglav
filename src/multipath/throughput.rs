@@ -758,10 +758,11 @@ impl EffectiveThroughput {
         let transfer_time = if effective_bandwidth > 0.0 {
             bytes_1mb / effective_bandwidth
         } else {
-            f64::MAX
+            // Use a large but valid duration (1 hour in seconds)
+            3600.0
         };
-        // Add RTT for connection overhead
-        let total_transfer_time = transfer_time + rtt_secs;
+        // Add RTT for connection overhead, cap at reasonable max (1 hour)
+        let total_transfer_time = (transfer_time + rtt_secs).min(3600.0);
 
         // Combined score (higher is better)
         // Normalizes bandwidth to 0-1 range (assuming max 1Gbps)
@@ -798,7 +799,9 @@ impl EffectiveThroughput {
         let loss_factor = 1.0 / (1.0 - self.loss_ratio).max(0.01);
         let bandwidth = self.bandwidth_bps.max(1.0);
         let transfer_secs = (bytes as f64 * loss_factor) / bandwidth;
-        Duration::from_secs_f64(transfer_secs + self.rtt.as_secs_f64())
+        // Cap at 1 hour to avoid Duration overflow
+        let total_secs = (transfer_secs + self.rtt.as_secs_f64()).min(3600.0);
+        Duration::from_secs_f64(total_secs)
     }
 }
 

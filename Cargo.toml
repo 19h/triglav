@@ -2,10 +2,10 @@
 name = "triglav"
 version = "0.1.0"
 edition = "2021"
-authors = ["Triglav Contributors"]
+authors = ["Kenan Sulayman <triglav@int.mov"]
 description = "High-performance multi-path networking tool with intelligent uplink management"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/triglav/triglav"
+license = "MIT"
+repository = "https://github.com/19h/triglav"
 keywords = ["networking", "multipath", "vpn", "tunnel", "encryption"]
 categories = ["network-programming", "command-line-utilities"]
 

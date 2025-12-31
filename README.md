@@ -11,10 +11,12 @@ Triglav uses all available connections simultaneously. When WiFi signal drops, t
 ## Key Features
 
 - **True VPN**: Virtual TUN interface captures all IP traffic transparently
-- **Multi-path**: Aggregate bandwidth across WiFi, cellular, ethernet simultaneously
+- **Bandwidth Aggregation**: Stripe packets across ALL uplinks for combined throughput (not just load balancing)
+- **Multi-path**: Use WiFi, cellular, ethernet simultaneously with automatic failover
 - **ECMP-aware**: Flow-based routing maintains TCP connection consistency
 - **Encrypted**: Noise NK protocol with per-uplink cryptographic sessions
 - **NAT traversal**: Works behind NATs with Dublin Traceroute-style probing
+- **Reorder Buffer**: Handles out-of-order packets from asymmetric paths
 - **Cross-platform**: Linux, macOS (Windows in progress)
 - **Zero config**: Auto-discovers network interfaces
 - **Split tunneling**: Route specific networks through tunnel, bypass others
@@ -96,16 +98,47 @@ Triglav performs NAT between your local network and the tunnel:
 
 This allows proper routing of return traffic and supports multiple simultaneous connections with port translation.
 
+### Bandwidth Aggregation
+
+Unlike traditional VPNs that use one path at a time, Triglav can stripe packets across ALL available uplinks to achieve combined bandwidth:
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │           Single TCP Download           │
+                    └─────────────────────────────────────────┘
+                                        │
+                    ┌───────────────────┼───────────────────┐
+                    ▼                   ▼                   ▼
+              ┌──────────┐       ┌──────────┐       ┌──────────┐
+              │  WiFi    │       │   LTE    │       │ Ethernet │
+              │ 100 Mbps │       │ 50 Mbps  │       │ 100 Mbps │
+              └──────────┘       └──────────┘       └──────────┘
+                    │                   │                   │
+                    └───────────────────┴───────────────────┘
+                                        │
+                              Combined: ~250 Mbps
+```
+
+**Aggregation Modes:**
+
+| Mode | Behavior |
+|------|----------|
+| `none` | Flow-sticky load balancing (each flow uses one uplink) |
+| `full` | Stripe ALL packets across ALL uplinks (maximum throughput) |
+| `adaptive` | Aggregate only when path latencies are within 100ms of each other |
+
+The receiver uses a **reorder buffer** to reassemble packets that arrive out of order due to different path latencies.
+
 ### Flow-Based Routing
 
-To maintain TCP connection consistency, Triglav hashes the 5-tuple (src IP, dst IP, src port, dst port, protocol) and binds each flow to a specific uplink:
+For applications sensitive to packet ordering (like TCP), Triglav can hash the 5-tuple (src IP, dst IP, src port, dst port, protocol) and bind each flow to a specific uplink:
 
 ```rust
 let flow_id = hash(src_ip, dst_ip, src_port, dst_port, protocol);
 // Packets with same flow_id always use the same uplink (unless it fails)
 ```
 
-This prevents packet reordering that would confuse TCP congestion control.
+This prevents packet reordering that would confuse TCP congestion control. Use `aggregation_mode = "none"` for this behavior.
 
 ### Uplink Management
 
@@ -312,6 +345,12 @@ port_range_end = 61000
 max_uplinks = 16
 retry_delay = "100ms"
 max_retries = 3
+aggregation_mode = "full"  # none, full, or adaptive
+
+[multipath.aggregator]
+enabled = true
+reorder_buffer_size = 1024
+reorder_timeout = "500ms"
 
 [multipath.scheduler]
 strategy = "adaptive"
@@ -416,16 +455,56 @@ Maximum payload: 65,475 bytes (can be fragmented). Default MTU: 1,500 bytes (1,4
 
 Packets may arrive on multiple uplinks (especially with `redundant` strategy). A sliding window deduplicator (O(1) lookup via HashSet, O(1) eviction via VecDeque) tracks the last 1,000 sequence numbers.
 
+### Reorder Buffer
+
+When aggregating across paths with different latencies, packets arrive out of order. The reorder buffer handles this:
+
+```
+Receive order:  [3] [1] [5] [2] [4]  (due to path latency differences)
+After buffer:   [1] [2] [3] [4] [5]  (delivered in sequence)
+```
+
+- **Buffer size**: Configurable (default 1024 packets)
+- **Timeout**: Packets delivered after timeout even if gaps exist (default 500ms)
+- **Memory**: O(n) where n = buffer size
+- **Lookup**: O(log n) using BTreeMap for ordered storage
+
 ## Testing & Simulation
 
 ### Unit and Integration Tests
 
 ```bash
-cargo test                           # All tests
-cargo test --test integration        # Integration tests only
+cargo test                              # All tests (~300 tests)
+cargo test --lib                        # Unit tests only (119 tests)
+cargo test --test e2e_multipath         # End-to-end multipath tests
+cargo test --test aggregation_impairment # Bandwidth aggregation with network simulation
 cargo test --test scheduler_strategies
 cargo test --test security_edge_cases
 cargo test --test stress_tests
+```
+
+### Physical Interface Tests
+
+Tests using real network interfaces (requires multiple NICs):
+
+```bash
+# Run all physical tests
+cargo test --test physical_multipath -- --ignored --nocapture
+
+# Individual tests
+cargo test --test physical_multipath test_interface_discovery -- --ignored --nocapture
+cargo test --test physical_multipath test_bandwidth_measurement -- --ignored --nocapture
+cargo test --test physical_multipath test_latency_distribution -- --ignored --nocapture
+```
+
+### TUN Device Tests
+
+Tests requiring root privileges:
+
+```bash
+sudo cargo test --test tun_test -- --nocapture
+# or
+sudo ./target/debug/tun_test
 ```
 
 ### Network Impairment Simulation
@@ -503,15 +582,18 @@ DEFAULT_TUNNEL_IPV4: "10.0.85.1"
 
 ## Comparison
 
-| Feature | Triglav | WireGuard | OpenVPN | Tailscale |
-|---------|---------|-----------|---------|-----------|
-| Multi-path | Yes | No | No | No |
-| Bandwidth aggregation | Yes | No | No | No |
-| Seamless failover | Yes | Manual | Manual | Partial |
-| TUN interface | Yes | Yes | Yes | Yes |
-| Proxy mode | Yes (fallback) | No | No | No |
-| Per-uplink encryption | Yes | No | No | No |
-| ECMP-aware routing | Yes | No | No | No |
+| Feature | Triglav | WireGuard | OpenVPN | Tailscale | MPTCP |
+|---------|---------|-----------|---------|-----------|-------|
+| Multi-path | Yes | No | No | No | Yes |
+| True bandwidth aggregation | Yes | No | No | No | Partial* |
+| Seamless failover | <1ms | Manual | Manual | Partial | Yes |
+| TUN interface | Yes | Yes | Yes | Yes | Kernel |
+| Works with UDP | Yes | Yes | Yes | Yes | No |
+| Per-uplink encryption | Yes | No | No | No | No |
+| Reorder buffer | Yes | N/A | N/A | N/A | Yes |
+| User-space | Yes | Kernel | User | User | Kernel |
+
+*MPTCP only aggregates TCP connections and requires kernel support on both ends.
 
 ## License
 

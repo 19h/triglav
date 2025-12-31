@@ -464,21 +464,21 @@ mod tests {
     }
 
     #[test]
-    fn test_user_session_limit() {
+    fn test_key_session_limit() {
         let manager = SessionManager::new(SessionConfig::default());
         
-        let user = User::new("testuser", super::super::UserRole::User)
+        let key = super::AuthorizedKey::new("test_key_base64")
             .with_max_connections(2);
         
         // Create sessions up to limit
-        let s1 = manager.create_session_for_user(&user);
+        let s1 = manager.create_session_for_key(&key);
         assert!(s1.is_some());
         
-        let s2 = manager.create_session_for_user(&user);
+        let s2 = manager.create_session_for_key(&key);
         assert!(s2.is_some());
         
         // Should fail - at limit
-        let s3 = manager.create_session_for_user(&user);
+        let s3 = manager.create_session_for_key(&key);
         assert!(s3.is_none());
     }
 }

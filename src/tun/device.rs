@@ -333,10 +333,12 @@ impl TunDevice {
         }
 
         // Try to get the requested utun unit or let system assign
-        let unit = if config.name.starts_with("utun") {
-            config.name[4..].parse::<u32>().unwrap_or(0)
+        // sc_unit = 0 means auto-assign, non-zero requests specific unit (1-indexed)
+        let sc_unit = if config.name.starts_with("utun") && config.name.len() > 4 {
+            // User specified a number like "utun5" -> sc_unit = 6 (1-indexed)
+            config.name[4..].parse::<u32>().map(|n| n + 1).unwrap_or(0)
         } else {
-            0 // Let system assign
+            0 // Auto-assign next available
         };
 
         let mut addr: SockaddrCtl = unsafe { std::mem::zeroed() };
@@ -344,7 +346,7 @@ impl TunDevice {
         addr.sc_family = 32; // AF_SYSTEM
         addr.ss_sysaddr = 2; // AF_SYS_CONTROL
         addr.sc_id = info.ctl_id;
-        addr.sc_unit = unit + 1; // utun unit is 1-indexed
+        addr.sc_unit = sc_unit;
 
         let ret = unsafe {
             libc::connect(
@@ -374,10 +376,11 @@ impl TunDevice {
             )
         };
 
-        let actual_name = if ret >= 0 {
+        let actual_name = if ret >= 0 && name_len > 1 {
             String::from_utf8_lossy(&name_buf[..name_len as usize - 1]).into_owned()
         } else {
-            format!("utun{}", unit)
+            // Fallback - shouldn't happen if connect succeeded
+            "utun?".to_string()
         };
 
         // Set non-blocking
@@ -631,6 +634,14 @@ impl LinuxTunHandle {
 #[derive(Debug)]
 struct MacOsTunHandle {
     fd: std::os::unix::io::RawFd,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacOsTunHandle {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+        tracing::debug!(fd = self.fd, "Closed macOS utun socket");
+    }
 }
 
 #[cfg(target_os = "macos")]

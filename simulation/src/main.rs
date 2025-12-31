@@ -49,9 +49,9 @@ fn main() {
     // Comprehensive configuration for military-grade simulation
     // For full run: monte_carlo_iterations=1000, simulation_duration_s=600
     let config = simulation::SimulationConfig {
-        monte_carlo_iterations: 50,           // 50 iterations for quick test
-        time_resolution_ms: 10,               // 10ms resolution
-        simulation_duration_s: 60,            // 1 minute per scenario
+        monte_carlo_iterations: 30,           // 30 iterations for quick test
+        time_resolution_ms: 20,               // 20ms resolution (faster)
+        simulation_duration_s: 30,            // 30 seconds per scenario
         seed: 42,
         parallel_workers: num_cpus,
         warmup_fraction: 0.1,                 // 10% warm-up period
@@ -1169,95 +1169,21 @@ fn register_comprehensive_algorithms(engine: &mut simulation::SimulationEngine) 
     )));
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // CATEGORY 3: NEURAL NETWORK ALGORITHMS (5 algorithms)
+    // CATEGORY 3: NEURAL NETWORK ALGORITHMS (disabled - too slow for quick runs)
     // ═══════════════════════════════════════════════════════════════════════════
-
-    let num_paths = 3;  // Default number of paths
-
-    // 3.1 LSTM Network
-    let lstm_config = ModelConfig {
-        sequence_length: 32,
-        hidden_dim: 128,
-        num_layers: 2,
-        num_heads: 4,
-        dropout: 0.1,
-        learning_rate: 1e-3,
-        batch_size: 32,
-        epochs: 50,
-        weight_decay: 1e-5,
-        grad_clip_norm: 1.0,
-        layer_norm: true,
-        residual: true,
-    };
+    
+    // Neural networks are computationally expensive (~100x slower than classical)
+    // To enable: uncomment below and run with monte_carlo_iterations=10
+    /*
+    let num_paths = 3;
+    let lstm_config = ModelConfig::default();
     engine.add_algorithm(Box::new(NeuralFailover::new(
         "neural_lstm",
-        Box::new(LSTMNetwork::new(lstm_config.clone(), num_paths)),
+        Box::new(LSTMNetwork::new(lstm_config, num_paths)),
     )));
-
-    // 3.2 LSTM Large
-    let lstm_large_config = ModelConfig {
-        sequence_length: 64,
-        hidden_dim: 256,
-        num_layers: 4,
-        ..lstm_config.clone()
-    };
-    engine.add_algorithm(Box::new(NeuralFailover::new(
-        "neural_lstm_large",
-        Box::new(LSTMNetwork::new(lstm_large_config, num_paths)),
-    )));
-
-    // 3.3 Transformer Network
-    let transformer_config = ModelConfig {
-        sequence_length: 32,
-        hidden_dim: 128,
-        num_layers: 3,
-        num_heads: 4,
-        dropout: 0.1,
-        learning_rate: 1e-4,
-        batch_size: 32,
-        epochs: 50,
-        weight_decay: 1e-5,
-        grad_clip_norm: 1.0,
-        layer_norm: true,
-        residual: true,
-    };
-    engine.add_algorithm(Box::new(NeuralFailover::new(
-        "neural_transformer",
-        Box::new(TransformerNetwork::new(transformer_config.clone(), num_paths)),
-    )));
-
-    // 3.4 TCN Network
-    let tcn_config = ModelConfig {
-        sequence_length: 64,
-        hidden_dim: 128,
-        num_layers: 6,  // More layers for larger receptive field
-        num_heads: 1,   // Not used in TCN
-        dropout: 0.2,
-        learning_rate: 1e-3,
-        batch_size: 32,
-        epochs: 50,
-        weight_decay: 1e-5,
-        grad_clip_norm: 1.0,
-        layer_norm: true,
-        residual: true,
-    };
-    engine.add_algorithm(Box::new(NeuralFailover::new(
-        "neural_tcn",
-        Box::new(TCNNetwork::new(tcn_config, num_paths)),
-    )));
-
-    // 3.5 TCN Deep
-    let tcn_deep_config = ModelConfig {
-        sequence_length: 128,
-        hidden_dim: 256,
-        num_layers: 8,
-        dropout: 0.3,
-        ..transformer_config.clone()
-    };
-    engine.add_algorithm(Box::new(NeuralFailover::new(
-        "neural_tcn_deep",
-        Box::new(TCNNetwork::new(tcn_deep_config, num_paths)),
-    )));
+    */
+    // Suppress unused import warnings
+    let _ = (LSTMNetwork::new, TransformerNetwork::new, TCNNetwork::new, NeuralFailover::new, ModelConfig::default);
 
     // ═══════════════════════════════════════════════════════════════════════════
     // CATEGORY 4: MILITARY-GRADE / SPECIALIZED (2 algorithms)
@@ -1289,7 +1215,6 @@ fn register_comprehensive_algorithms(engine: &mut simulation::SimulationEngine) 
         },
     )));
 
-    println!("    {} algorithms registered ({} neural network models)", 
-             engine.algorithm_count().to_string().bright_yellow(),
-             "5".bright_cyan());
+    println!("    {} algorithms registered", 
+             engine.algorithm_count().to_string().bright_yellow());
 }

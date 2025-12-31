@@ -8,18 +8,26 @@
 //! - Detailed per-timestep metrics collection
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use parking_lot::Mutex;
-use rayon::prelude::*;
-use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::scenarios::{Scenario, EventType};
 use crate::algorithms::{FailoverAlgorithm, FailoverDecision};
 use crate::network::PathMetrics;
+
+/// Format seconds as human readable duration
+fn format_duration(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{:.0}s", secs)
+    } else if secs < 3600.0 {
+        format!("{}m {}s", (secs / 60.0) as u64, (secs % 60.0) as u64)
+    } else {
+        format!("{}h {}m", (secs / 3600.0) as u64, ((secs % 3600.0) / 60.0) as u64)
+    }
+}
 
 // ============================================================================
 // Configuration
@@ -335,45 +343,21 @@ impl SimulationEngine {
             * self.algorithms.len() 
             * self.config.monte_carlo_iterations;
         
-        // Create progress bar
-        let pb = ProgressBar::new(total_runs as u64);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:50.cyan/blue}] {pos}/{len} ({percent}%) | ETA: {eta} | {msg}")
-            .unwrap()
-            .progress_chars("█▓▒░  "));
-        pb.enable_steady_tick(Duration::from_millis(100));
-        
         let results = Arc::new(Mutex::new(Vec::with_capacity(total_runs)));
         let config = self.config.clone();
         let start_time = Instant::now();
         
         let num_scenarios = self.scenarios.len();
         let num_algorithms = self.algorithms.len();
+        let mut completed: usize = 0;
+        let mut last_print = Instant::now();
         
         // Process scenario/algorithm combinations
         for (scenario_idx, scenario) in self.scenarios.iter_mut().enumerate() {
             let scenario_id = scenario.id().to_string();
-            let scenario_short = if scenario_id.len() > 20 {
-                format!("{}...", &scenario_id[..17])
-            } else {
-                scenario_id.clone()
-            };
             
             for (algorithm_idx, algorithm) in self.algorithms.iter_mut().enumerate() {
                 let algorithm_id = algorithm.id().to_string();
-                let algorithm_short = if algorithm_id.len() > 15 {
-                    format!("{}...", &algorithm_id[..12])
-                } else {
-                    algorithm_id.clone()
-                };
-                
-                // Update progress message
-                pb.set_message(format!(
-                    "S:{}/{} A:{}/{} | {} × {}",
-                    scenario_idx + 1, num_scenarios,
-                    algorithm_idx + 1, num_algorithms,
-                    scenario_short, algorithm_short
-                ));
                 
                 // Run Monte Carlo iterations
                 for iteration in 0..config.monte_carlo_iterations {
@@ -404,11 +388,34 @@ impl SimulationEngine {
                         seed,
                     });
                     
-                    pb.inc(1);
+                    completed += 1;
                     
                     // Reset state
                     scenario.reset();
                     algorithm.reset();
+                }
+                
+                // Print progress after each algorithm completes (every 50 iterations)
+                if last_print.elapsed() >= Duration::from_secs(2) || 
+                   (algorithm_idx + 1 == num_algorithms && (scenario_idx + 1) % 5 == 0) {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let pct = (completed as f64 / total_runs as f64) * 100.0;
+                    let rate = completed as f64 / elapsed;
+                    let remaining = (total_runs - completed) as f64 / rate;
+                    
+                    eprintln!(
+                        "\r  [{:>6.2}%] {}/{} | S:{}/{} A:{}/{} | {:.0}/s | ETA: {}",
+                        pct,
+                        completed,
+                        total_runs,
+                        scenario_idx + 1,
+                        num_scenarios,
+                        algorithm_idx + 1,
+                        num_algorithms,
+                        rate,
+                        format_duration(remaining)
+                    );
+                    last_print = Instant::now();
                 }
             }
         }
@@ -416,11 +423,12 @@ impl SimulationEngine {
         let elapsed = start_time.elapsed();
         let throughput = total_runs as f64 / elapsed.as_secs_f64();
         
-        pb.finish_with_message(format!(
-            "Complete! {:.1} runs/sec", throughput
-        ));
-        
-        println!();
+        eprintln!(
+            "\n  Done! {} runs in {:.1}s ({:.1} runs/sec)\n",
+            total_runs,
+            elapsed.as_secs_f64(),
+            throughput
+        );
         
         Arc::try_unwrap(results).ok().unwrap().into_inner()
     }

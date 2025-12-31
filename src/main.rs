@@ -19,6 +19,7 @@ use triglav::error::Result;
 use triglav::multipath::{MultipathConfig, MultipathManager, UplinkConfig};
 use triglav::proxy::{Socks5Server, Socks5Config, HttpProxyServer, HttpProxyConfig};
 use triglav::transport::TransportProtocol;
+use triglav::tun::{TunnelRunner, TunnelConfig, TunConfig, NatConfig, RouteConfig};
 use triglav::types::AuthKey;
 use triglav::util;
 use triglav::VERSION;
@@ -47,6 +48,7 @@ async fn main() -> Result<()> {
     // Dispatch command
     match cli.command {
         Commands::Server(args) => run_server(args, config).await,
+        Commands::Tun(args) => run_tun(args, config).await,
         Commands::Connect(args) => run_connect(args, config).await,
         Commands::Keygen(args) => run_keygen(args),
         Commands::Status(args) => run_status(args).await,
@@ -132,7 +134,169 @@ async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
     Ok(())
 }
 
-/// Connect to a server
+/// Start TUN tunnel (true VPN mode)
+async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
+    println!("{}", "╔══════════════════════════════════════════╗".bright_cyan());
+    println!("{}", "║     TRIGLAV TUN TUNNEL                   ║".bright_cyan());
+    println!("{}", format!("║     Version {}                         ║", VERSION).bright_cyan());
+    println!("{}", "╚══════════════════════════════════════════╝".bright_cyan());
+    println!();
+
+    // Check privileges
+    if !triglav::tun::check_privileges()? {
+        println!("{} TUN devices require elevated privileges.", "⚠".yellow());
+        println!("  Please run with {} or use:", "sudo".bright_white());
+        println!("    Linux:  sudo setcap cap_net_admin+ep $(which triglav)");
+        println!("    macOS:  sudo triglav tun ...");
+        println!();
+    }
+
+    // Parse auth key
+    let auth_key = AuthKey::parse(&args.key)?;
+    let server_addrs = auth_key.server_addrs();
+
+    println!("{} Server:", "→".cyan());
+    for addr in server_addrs {
+        println!("  {} {}", "●".dimmed(), addr);
+    }
+    println!();
+
+    // Discover interfaces
+    let interfaces = if args.auto_discover {
+        util::get_network_interfaces()
+            .into_iter()
+            .filter(|i| i.is_up && !i.is_loopback)
+            .map(|i| i.name)
+            .collect::<Vec<_>>()
+    } else if !args.interface.is_empty() {
+        args.interface.clone()
+    } else {
+        util::get_network_interfaces()
+            .into_iter()
+            .filter(|i| i.is_up && !i.is_loopback)
+            .take(2)
+            .map(|i| i.name)
+            .collect::<Vec<_>>()
+    };
+
+    if interfaces.is_empty() {
+        return Err(triglav::Error::NoAvailableUplinks);
+    }
+
+    println!("{} Interfaces:", "→".cyan());
+    for iface in &interfaces {
+        println!("  {} {}", "●".green(), iface);
+    }
+    println!();
+
+    // Parse IPv4 address
+    let ipv4: std::net::Ipv4Addr = args.ipv4.parse()
+        .map_err(|_| triglav::Error::Config(format!("Invalid IPv4 address: {}", args.ipv4)))?;
+
+    // Build tunnel configuration
+    let mut tun_config = TunConfig::default();
+    tun_config.name = args.tun_name.clone();
+    tun_config.ipv4_addr = Some(ipv4);
+
+    let mut nat_config = NatConfig::default();
+    nat_config.tunnel_ipv4 = ipv4;
+
+    let mut route_config = RouteConfig::default();
+    route_config.full_tunnel = args.full_tunnel;
+    route_config.include_routes = args.route.clone();
+    route_config.exclude_routes = args.exclude.clone();
+
+    // Exclude server addresses from tunnel
+    for addr in server_addrs {
+        route_config.exclude_routes.push(format!("{}/32", addr.ip()));
+    }
+
+    let tunnel_config = TunnelConfig {
+        tun: tun_config,
+        nat: nat_config,
+        routing: route_config,
+        ..Default::default()
+    };
+
+    // Create tunnel runner
+    let mut runner = TunnelRunner::new(tunnel_config)?;
+
+    println!("{} TUN device: {}", "→".cyan(), runner.tun_name().bright_white());
+    println!("  IPv4:     {}", ipv4);
+    if args.full_tunnel {
+        println!("  Mode:     {} (all traffic)", "Full Tunnel".bright_green());
+    } else if !args.route.is_empty() {
+        println!("  Mode:     {} ({} routes)", "Split Tunnel".yellow(), args.route.len());
+    } else {
+        println!("  Mode:     {} (manual routes)", "Manual".dimmed());
+    }
+    println!();
+
+    // Add uplinks
+    for iface in &interfaces {
+        let uplink_cfg = UplinkConfig {
+            id: iface.clone().into(),
+            interface: Some(iface.clone()),
+            remote_addr: server_addrs[0],
+            protocol: TransportProtocol::Udp,
+            weight: 100,
+            enabled: true,
+            ..Default::default()
+        };
+        runner.add_uplink(uplink_cfg)?;
+    }
+
+    // Connect
+    println!("{} Connecting...", "→".cyan());
+    let remote_public = triglav::crypto::PublicKey::from_bytes(auth_key.server_pubkey());
+    match runner.connect(remote_public).await {
+        Ok(_) => {
+            println!("{} Connected!", "✓".green());
+        }
+        Err(e) => {
+            println!("{} Connection failed: {}", "✗".red(), e);
+            return Err(e);
+        }
+    }
+
+    println!();
+    println!("{}", "Tunnel Status:".bright_white().bold());
+    println!("  Device:   {}", runner.tun_name());
+    println!("  Uplinks:  {} active", runner.manager().uplink_count());
+    println!("  Strategy: {:?}", args.strategy);
+    println!();
+    println!("{} Tunnel running. Press Ctrl+C to stop.", "●".green());
+    println!();
+
+    // Setup shutdown handler
+    let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
+
+    tokio::spawn(async move {
+        let _ = signal::ctrl_c().await;
+        let _ = shutdown_tx.send(());
+    });
+
+    // Run tunnel
+    tokio::select! {
+        result = runner.run() => {
+            if let Err(e) = result {
+                println!("{} Tunnel error: {}", "✗".red(), e);
+            }
+        }
+        _ = shutdown_rx.recv() => {
+            println!();
+            println!("{} Shutting down...", "→".yellow());
+        }
+    }
+
+    runner.stop();
+
+    println!("{} Tunnel stopped.", "●".yellow());
+
+    Ok(())
+}
+
+/// Connect to a server (legacy proxy mode)
 async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
     println!("{}", "╔══════════════════════════════════════════╗".bright_cyan());
     println!("{}", "║     TRIGLAV CLIENT                       ║".bright_cyan());

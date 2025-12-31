@@ -145,6 +145,9 @@ pub enum ProtocolError {
     #[error("malformed header")]
     MalformedHeader,
 
+    #[error("malformed packet: {0}")]
+    MalformedPacket(String),
+
     #[error("checksum mismatch")]
     ChecksumMismatch,
 

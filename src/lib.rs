@@ -1,29 +1,51 @@
 //! # Triglav
 //!
-//! High-performance multi-path networking tool with intelligent uplink management.
+//! High-performance multi-path VPN with intelligent uplink management.
 //!
-//! Triglav provides encrypted, redundant connections across multiple network interfaces,
-//! with predictive quality assessment, automatic failover, and bandwidth aggregation.
+//! Triglav provides a true virtual network interface (TUN) that transparently
+//! tunnels all IP traffic across multiple network paths with encryption,
+//! intelligent scheduling, automatic failover, and bandwidth aggregation.
 //!
 //! ## Architecture
 //!
+//! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │                        Application Layer                        │
+//! │                    Applications (Any Protocol)                   │
+//! │              (TCP, UDP, ICMP, DNS, etc. - All traffic)          │
 //! ├─────────────────────────────────────────────────────────────────┤
-//! │                     Multiplexer / Demultiplexer                 │
+//! │                      Kernel TCP/IP Stack                         │
 //! ├─────────────────────────────────────────────────────────────────┤
-//! │                   Multi-Path Connection Manager                 │
+//! │                    TUN Virtual Interface                         │
+//! │                 (utun/tun0 - Layer 3 IP packets)                 │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                        TunnelRunner                              │
+//! │  ┌──────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
+//! │  │  IP Parser   │──│    NAT      │──│  MultipathManager       │ │
+//! │  │  (5-tuple)   │  │ Translation │  │  (encryption, routing)  │ │
+//! │  └──────────────┘  └─────────────┘  └─────────────────────────┘ │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                   Multi-Path Connection Manager                  │
 //! │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐         │
 //! │  │ Uplink 1 │  │ Uplink 2 │  │ Uplink 3 │  │ Uplink N │         │
 //! │  │  (WiFi)  │  │(Cellular)│  │(Ethernet)│  │   ...    │         │
 //! │  └──────────┘  └──────────┘  └──────────┘  └──────────┘         │
 //! ├─────────────────────────────────────────────────────────────────┤
-//! │              Quality Metrics & Prediction Engine                │
+//! │              Quality Metrics & Prediction Engine                 │
 //! ├─────────────────────────────────────────────────────────────────┤
-//! │                    Noise NK Encryption Layer                    │
+//! │                    Noise NK Encryption Layer                     │
 //! ├─────────────────────────────────────────────────────────────────┤
-//! │               Transport (UDP Fast Path / TCP Fallback)          │
+//! │               Transport (UDP Fast Path / TCP Fallback)           │
 //! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Key Features
+//!
+//! - **True VPN**: Virtual TUN interface captures all IP traffic transparently
+//! - **Multi-path**: Aggregate bandwidth across WiFi, cellular, ethernet
+//! - **ECMP-aware**: Flow-based routing maintains TCP connection consistency
+//! - **Encrypted**: Noise NK protocol with per-uplink sessions
+//! - **NAT traversal**: Works behind NATs with Dublin Traceroute-style probing
+//! - **Cross-platform**: Linux, macOS, Windows support
 
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 // Allow stylistic lints that don't affect correctness
@@ -61,6 +83,7 @@ pub mod protocol;
 pub mod proxy;
 pub mod server;
 pub mod transport;
+pub mod tun;
 pub mod types;
 pub mod util;
 
@@ -97,5 +120,6 @@ pub mod prelude {
     pub use crate::protocol::{Message, Packet};
     pub use crate::proxy::{Socks5Server, Socks5Config, HttpProxyServer, HttpProxyConfig};
     pub use crate::transport::{Transport, TransportConfig};
+    pub use crate::tun::{TunnelRunner, TunnelConfig, TunDevice, TunConfig};
     pub use crate::types::*;
 }

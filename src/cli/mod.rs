@@ -5,24 +5,26 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, Args, ValueEnum};
 
-/// Triglav - High-performance multi-path networking
+/// Triglav - High-performance multi-path VPN
 #[derive(Parser, Debug)]
 #[command(
     name = "triglav",
     author,
     version,
-    about = "High-performance multi-path networking with intelligent uplink management",
+    about = "High-performance multi-path VPN with intelligent uplink management",
     long_about = r#"
-Triglav is a sophisticated multi-path networking tool that provides:
+Triglav is a sophisticated multi-path VPN that provides:
 
+  - True virtual network interface (TUN) for transparent tunneling
   - Encrypted, redundant connections across multiple network interfaces
   - Intelligent uplink selection based on real-time quality metrics
   - Automatic failover and bandwidth aggregation
-  - Predictive quality assessment and proactive path switching
+  - ECMP-aware flow routing for connection consistency
 
 QUICK START:
   Server:  triglav server --generate-key
-  Client:  triglav connect <key>
+  Client:  triglav tun <key> --full-tunnel
+  Legacy:  triglav connect <key> --socks 1080
 
 For more information, visit https://github.com/triglav/triglav
 "#
@@ -55,7 +57,10 @@ pub enum Commands {
     /// Start the Triglav server
     Server(ServerArgs),
 
-    /// Connect to a Triglav server
+    /// Start TUN tunnel (recommended - true VPN mode)
+    Tun(TunArgs),
+
+    /// Connect to a Triglav server (legacy proxy mode)
     Connect(ConnectArgs),
 
     /// Generate a new key pair
@@ -116,7 +121,66 @@ pub struct ServerArgs {
     pub pid_file: Option<PathBuf>,
 }
 
-/// Connect command arguments
+/// TUN tunnel command arguments (recommended mode)
+#[derive(Args, Debug)]
+pub struct TunArgs {
+    /// Server key (tg1_...)
+    pub key: String,
+
+    /// Network interfaces to use (can be specified multiple times)
+    #[arg(short, long)]
+    pub interface: Vec<String>,
+
+    /// Auto-discover network interfaces
+    #[arg(long, default_value = "true")]
+    pub auto_discover: bool,
+
+    /// TUN device name (e.g., tun0, utun3)
+    #[arg(long, default_value = "tg0")]
+    pub tun_name: String,
+
+    /// Tunnel IPv4 address
+    #[arg(long, default_value = "10.0.85.1")]
+    pub ipv4: String,
+
+    /// Tunnel IPv6 address (optional)
+    #[arg(long)]
+    pub ipv6: Option<String>,
+
+    /// Route all traffic through tunnel (full VPN mode)
+    #[arg(long)]
+    pub full_tunnel: bool,
+
+    /// Specific routes to tunnel (can be specified multiple times)
+    #[arg(long)]
+    pub route: Vec<String>,
+
+    /// Exclude routes from tunnel (can be specified multiple times)
+    #[arg(long)]
+    pub exclude: Vec<String>,
+
+    /// Use tunnel for DNS queries
+    #[arg(long)]
+    pub dns: bool,
+
+    /// Upstream DNS servers (used with --dns)
+    #[arg(long, default_value = "1.1.1.1:53")]
+    pub dns_server: Vec<String>,
+
+    /// Scheduling strategy
+    #[arg(long, default_value = "adaptive")]
+    pub strategy: SchedulingStrategy,
+
+    /// Enable verbose output
+    #[arg(short, long)]
+    pub verbose: bool,
+
+    /// Stay in foreground (don't daemonize)
+    #[arg(short, long)]
+    pub foreground: bool,
+}
+
+/// Connect command arguments (legacy proxy mode)
 #[derive(Args, Debug)]
 pub struct ConnectArgs {
     /// Server key (tg1_...)

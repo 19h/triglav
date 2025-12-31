@@ -6,6 +6,8 @@
 //! - Lowest loss first
 //! - Adaptive (combines multiple signals)
 //! - Redundant (send on multiple paths)
+//! - EffectiveThroughput (optimized for maximum throughput)
+//! - LatencyAware (prevents high-latency blocking)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,6 +16,7 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use super::throughput::{EffectiveThroughput, ThroughputConfig};
 use super::Uplink;
 
 /// Scheduling strategy.
@@ -38,6 +41,15 @@ pub enum SchedulingStrategy {
     /// ECMP-aware selection using flow hash for path stickiness.
     /// Packets with the same flow hash use the same uplink.
     EcmpAware,
+    /// Effective throughput: combines bandwidth, latency, and loss for true throughput.
+    /// Best for maximizing actual data transfer speed.
+    EffectiveThroughput,
+    /// Latency-aware: prevents high-latency paths from blocking transfers.
+    /// Considers transfer size to pick the fastest path for that specific transfer.
+    LatencyAware,
+    /// Size-based: automatically chooses strategy based on transfer size.
+    /// Small transfers prefer low latency, large transfers prefer high bandwidth.
+    SizeBased,
 }
 
 /// Scheduler configuration.
@@ -87,18 +99,90 @@ pub struct SchedulerConfig {
     /// Probe interval for backup paths.
     #[serde(default = "default_probe_interval", with = "humantime_serde")]
     pub probe_interval: Duration,
+
+    /// Throughput optimization configuration.
+    #[serde(default)]
+    pub throughput: ThroughputConfig,
+
+    /// Maximum acceptable latency before heavy penalty (ms).
+    /// Used by LatencyAware and EffectiveThroughput strategies.
+    #[serde(default = "default_max_latency")]
+    pub max_acceptable_latency_ms: u32,
+
+    /// Threshold size for size-based strategy (bytes).
+    /// Transfers smaller than this prefer latency; larger prefer bandwidth.
+    #[serde(default = "default_size_threshold")]
+    pub size_threshold_bytes: u64,
+
+    /// Enable effective throughput scoring for all strategies.
+    /// When true, even Adaptive strategy uses throughput-aware scoring.
+    #[serde(default = "default_throughput_aware")]
+    pub throughput_aware: bool,
+
+    /// Weight for effective throughput in scoring (0-1).
+    /// Higher values prioritize throughput over raw metrics.
+    #[serde(default = "default_effective_throughput_weight")]
+    pub effective_throughput_weight: f32,
+
+    /// Enable latency-blocking prevention.
+    /// Prevents high-latency paths from being selected when faster paths exist.
+    #[serde(default = "default_prevent_latency_blocking")]
+    pub prevent_latency_blocking: bool,
+
+    /// Latency blocking threshold ratio.
+    /// If an uplink's latency exceeds best_latency * ratio, it's blocked.
+    #[serde(default = "default_latency_blocking_ratio")]
+    pub latency_blocking_ratio: f32,
 }
 
-fn default_rtt_threshold() -> u32 { 10 }
-fn default_loss_threshold() -> f32 { 2.0 }
-fn default_rtt_weight() -> f32 { 0.35 }
-fn default_loss_weight() -> f32 { 0.35 }
-fn default_bw_weight() -> f32 { 0.2 }
-fn default_nat_weight() -> f32 { 0.1 }
-fn default_sticky() -> bool { true }
-fn default_sticky_timeout() -> Duration { Duration::from_secs(5) }
-fn default_probe() -> bool { true }
-fn default_probe_interval() -> Duration { Duration::from_secs(1) }
+fn default_rtt_threshold() -> u32 {
+    10
+}
+fn default_loss_threshold() -> f32 {
+    2.0
+}
+fn default_rtt_weight() -> f32 {
+    0.25
+}
+fn default_loss_weight() -> f32 {
+    0.25
+}
+fn default_bw_weight() -> f32 {
+    0.35
+}
+fn default_nat_weight() -> f32 {
+    0.05
+}
+fn default_sticky() -> bool {
+    true
+}
+fn default_sticky_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+fn default_probe() -> bool {
+    true
+}
+fn default_probe_interval() -> Duration {
+    Duration::from_secs(1)
+}
+fn default_max_latency() -> u32 {
+    500
+}
+fn default_size_threshold() -> u64 {
+    64 * 1024
+} // 64 KB
+fn default_throughput_aware() -> bool {
+    true
+}
+fn default_effective_throughput_weight() -> f32 {
+    0.10
+}
+fn default_prevent_latency_blocking() -> bool {
+    true
+}
+fn default_latency_blocking_ratio() -> f32 {
+    10.0
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -114,6 +198,13 @@ impl Default for SchedulerConfig {
             sticky_timeout: default_sticky_timeout(),
             probe_backup_paths: default_probe(),
             probe_interval: default_probe_interval(),
+            throughput: ThroughputConfig::default(),
+            max_acceptable_latency_ms: default_max_latency(),
+            size_threshold_bytes: default_size_threshold(),
+            throughput_aware: default_throughput_aware(),
+            effective_throughput_weight: default_effective_throughput_weight(),
+            prevent_latency_blocking: default_prevent_latency_blocking(),
+            latency_blocking_ratio: default_latency_blocking_ratio(),
         }
     }
 }
@@ -164,6 +255,10 @@ pub struct Scheduler {
     wrr_state: RwLock<WrrState>,
     stickiness: RwLock<PathStickiness>,
     last_probe: RwLock<HashMap<u16, Instant>>,
+    /// Cached effective throughput scores.
+    throughput_cache: RwLock<HashMap<u16, (Instant, EffectiveThroughput)>>,
+    /// Cache TTL.
+    cache_ttl: Duration,
 }
 
 impl Scheduler {
@@ -174,6 +269,8 @@ impl Scheduler {
             wrr_state: RwLock::new(WrrState::default()),
             stickiness: RwLock::new(PathStickiness::new()),
             last_probe: RwLock::new(HashMap::new()),
+            throughput_cache: RwLock::new(HashMap::new()),
+            cache_ttl: Duration::from_millis(100),
         }
     }
 
@@ -188,10 +285,23 @@ impl Scheduler {
     /// For most strategies, this returns a single uplink.
     /// For Redundant strategy, returns multiple uplinks.
     pub fn select(&self, uplinks: &[Arc<Uplink>], flow_id: Option<u64>) -> Vec<u16> {
-        // Filter to usable uplinks
-        let usable: Vec<_> = uplinks.iter()
-            .filter(|u| u.is_usable())
-            .collect();
+        self.select_for_size(uplinks, flow_id, None)
+    }
+
+    /// Select uplink(s) for a packet of known size.
+    /// This enables size-aware scheduling to optimize for actual transfer time.
+    pub fn select_for_size(
+        &self,
+        uplinks: &[Arc<Uplink>],
+        flow_id: Option<u64>,
+        size_bytes: Option<u64>,
+    ) -> Vec<u16> {
+        // Filter to usable uplinks, applying latency blocking prevention if enabled
+        let usable: Vec<_> = if self.config.prevent_latency_blocking {
+            self.filter_latency_blocked(uplinks)
+        } else {
+            uplinks.iter().filter(|u| u.is_usable()).collect()
+        };
 
         if usable.is_empty() {
             return vec![];
@@ -210,31 +320,19 @@ impl Scheduler {
         }
 
         let selected = match self.config.strategy {
-            SchedulingStrategy::WeightedRoundRobin => {
-                self.select_wrr(&usable)
-            }
-            SchedulingStrategy::LowestLatency => {
-                Self::select_lowest_latency(&usable)
-            }
-            SchedulingStrategy::LowestLoss => {
-                Self::select_lowest_loss(&usable)
-            }
-            SchedulingStrategy::Adaptive => {
-                self.select_adaptive(&usable)
-            }
-            SchedulingStrategy::Redundant => {
-                Self::select_redundant(&usable)
-            }
-            SchedulingStrategy::PrimaryBackup => {
-                Self::select_primary_backup(&usable)
-            }
+            SchedulingStrategy::WeightedRoundRobin => self.select_wrr(&usable),
+            SchedulingStrategy::LowestLatency => Self::select_lowest_latency(&usable),
+            SchedulingStrategy::LowestLoss => Self::select_lowest_loss(&usable),
+            SchedulingStrategy::Adaptive => self.select_adaptive(&usable),
+            SchedulingStrategy::Redundant => Self::select_redundant(&usable),
+            SchedulingStrategy::PrimaryBackup => Self::select_primary_backup(&usable),
             SchedulingStrategy::BandwidthProportional => {
                 self.select_bandwidth_proportional(&usable)
             }
-            SchedulingStrategy::EcmpAware => {
-                // Use flow_id for ECMP-aware selection
-                Self::select_ecmp_aware(&usable, flow_id)
-            }
+            SchedulingStrategy::EcmpAware => Self::select_ecmp_aware(&usable, flow_id),
+            SchedulingStrategy::EffectiveThroughput => self.select_effective_throughput(&usable),
+            SchedulingStrategy::LatencyAware => self.select_latency_aware(&usable, size_bytes),
+            SchedulingStrategy::SizeBased => self.select_size_based(&usable, size_bytes),
         };
 
         // Update stickiness
@@ -245,6 +343,36 @@ impl Scheduler {
         }
 
         selected
+    }
+
+    /// Filter out uplinks that would cause latency blocking.
+    /// An uplink is blocked if its RTT exceeds best_rtt * blocking_ratio.
+    fn filter_latency_blocked<'a>(&self, uplinks: &'a [Arc<Uplink>]) -> Vec<&'a Arc<Uplink>> {
+        let usable: Vec<_> = uplinks.iter().filter(|u| u.is_usable()).collect();
+
+        if usable.is_empty() {
+            return usable;
+        }
+
+        // Find minimum RTT
+        let min_rtt = usable
+            .iter()
+            .map(|u| u.rtt())
+            .min()
+            .unwrap_or(Duration::ZERO);
+
+        if min_rtt == Duration::ZERO {
+            return usable;
+        }
+
+        let threshold = Duration::from_secs_f64(
+            min_rtt.as_secs_f64() * self.config.latency_blocking_ratio as f64,
+        );
+
+        usable
+            .into_iter()
+            .filter(|u| u.rtt() <= threshold)
+            .collect()
     }
 
     /// Weighted round-robin selection.
@@ -281,12 +409,16 @@ impl Scheduler {
         }
 
         // Fallback to first usable
-        uplinks.first().map(|u| vec![u.numeric_id()]).unwrap_or_default()
+        uplinks
+            .first()
+            .map(|u| vec![u.numeric_id()])
+            .unwrap_or_default()
     }
 
     /// Select lowest latency uplink.
     fn select_lowest_latency(uplinks: &[&Arc<Uplink>]) -> Vec<u16> {
-        uplinks.iter()
+        uplinks
+            .iter()
             .filter(|u| u.can_send())
             .min_by_key(|u| u.rtt())
             .map(|u| vec![u.numeric_id()])
@@ -295,10 +427,12 @@ impl Scheduler {
 
     /// Select lowest loss uplink.
     fn select_lowest_loss(uplinks: &[&Arc<Uplink>]) -> Vec<u16> {
-        uplinks.iter()
+        uplinks
+            .iter()
             .filter(|u| u.can_send())
             .min_by(|a, b| {
-                a.loss_ratio().partial_cmp(&b.loss_ratio())
+                a.loss_ratio()
+                    .partial_cmp(&b.loss_ratio())
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|u| vec![u.numeric_id()])
@@ -306,9 +440,11 @@ impl Scheduler {
     }
 
     /// Adaptive selection based on multiple factors.
+    /// When throughput_aware is enabled, also includes effective throughput scoring.
     fn select_adaptive(&self, uplinks: &[&Arc<Uplink>]) -> Vec<u16> {
         // Calculate scores for each uplink
-        let mut scored: Vec<_> = uplinks.iter()
+        let mut scored: Vec<_> = uplinks
+            .iter()
             .filter(|u| u.can_send())
             .map(|u| {
                 let rtt_score = Self::rtt_score(u);
@@ -316,11 +452,17 @@ impl Scheduler {
                 let bw_score = Self::bandwidth_score(u, uplinks);
                 let nat_score = Self::nat_score(u);
 
-                let total_score =
-                    rtt_score * self.config.rtt_weight +
-                    loss_score * self.config.loss_weight +
-                    bw_score * self.config.bandwidth_weight +
-                    nat_score * self.config.nat_penalty_weight;
+                let mut total_score = rtt_score * self.config.rtt_weight
+                    + loss_score * self.config.loss_weight
+                    + bw_score * self.config.bandwidth_weight
+                    + nat_score * self.config.nat_penalty_weight;
+
+                // Add effective throughput component if enabled
+                if self.config.throughput_aware {
+                    let eff_throughput = self.calculate_effective_throughput(u);
+                    total_score +=
+                        eff_throughput.score as f32 * self.config.effective_throughput_weight;
+                }
 
                 (u.numeric_id(), total_score)
             })
@@ -332,9 +474,92 @@ impl Scheduler {
         scored.into_iter().map(|(id, _)| id).take(1).collect()
     }
 
+    /// Select based on effective throughput (combines bandwidth, latency, loss).
+    fn select_effective_throughput(&self, uplinks: &[&Arc<Uplink>]) -> Vec<u16> {
+        let mut scored: Vec<_> = uplinks
+            .iter()
+            .filter(|u| u.can_send())
+            .map(|u| {
+                let throughput = self.calculate_effective_throughput(u);
+                (u.numeric_id(), throughput.score)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        scored.into_iter().map(|(id, _)| id).take(1).collect()
+    }
+
+    /// Select with latency awareness - considers transfer size to pick fastest path.
+    fn select_latency_aware(&self, uplinks: &[&Arc<Uplink>], size_bytes: Option<u64>) -> Vec<u16> {
+        let size = size_bytes.unwrap_or(self.config.size_threshold_bytes);
+
+        let mut scored: Vec<_> = uplinks
+            .iter()
+            .filter(|u| u.can_send())
+            .map(|u| {
+                let throughput = self.calculate_effective_throughput(u);
+                let transfer_time = throughput.transfer_time(size);
+                (u.numeric_id(), transfer_time)
+            })
+            .collect();
+
+        // Sort by transfer time (lowest first)
+        scored.sort_by(|a, b| a.1.cmp(&b.1));
+
+        scored.into_iter().map(|(id, _)| id).take(1).collect()
+    }
+
+    /// Size-based strategy: small transfers prefer latency, large prefer bandwidth.
+    fn select_size_based(&self, uplinks: &[&Arc<Uplink>], size_bytes: Option<u64>) -> Vec<u16> {
+        let size = size_bytes.unwrap_or(self.config.size_threshold_bytes);
+
+        if size < self.config.size_threshold_bytes {
+            // Small transfer: prefer lowest latency
+            Self::select_lowest_latency(uplinks)
+        } else {
+            // Large transfer: use effective throughput
+            self.select_effective_throughput(uplinks)
+        }
+    }
+
+    /// Calculate effective throughput for an uplink.
+    fn calculate_effective_throughput(&self, uplink: &Uplink) -> EffectiveThroughput {
+        let uplink_id = uplink.numeric_id();
+
+        // Check cache first
+        {
+            let cache = self.throughput_cache.read();
+            if let Some((cached_at, throughput)) = cache.get(&uplink_id) {
+                if cached_at.elapsed() < self.cache_ttl {
+                    return *throughput;
+                }
+            }
+        }
+
+        // Calculate fresh
+        let metrics = uplink.quality_metrics();
+        let throughput = EffectiveThroughput::calculate(
+            uplink.bandwidth().bytes_per_sec,
+            uplink.rtt(),
+            uplink.loss_ratio(),
+            metrics.jitter,
+            &self.config.throughput,
+        );
+
+        // Update cache
+        {
+            let mut cache = self.throughput_cache.write();
+            cache.insert(uplink_id, (Instant::now(), throughput));
+        }
+
+        throughput
+    }
+
     /// Redundant selection (all usable uplinks).
     fn select_redundant(uplinks: &[&Arc<Uplink>]) -> Vec<u16> {
-        uplinks.iter()
+        uplinks
+            .iter()
             .filter(|u| u.can_send())
             .map(|u| u.numeric_id())
             .collect()
@@ -362,7 +587,8 @@ impl Scheduler {
     /// Bandwidth-proportional selection.
     fn select_bandwidth_proportional(&self, uplinks: &[&Arc<Uplink>]) -> Vec<u16> {
         // Select based on available bandwidth ratio
-        let total_bw: f64 = uplinks.iter()
+        let total_bw: f64 = uplinks
+            .iter()
             .filter(|u| u.can_send())
             .map(|u| u.bandwidth().bytes_per_sec)
             .sum();
@@ -382,7 +608,10 @@ impl Scheduler {
             }
         }
 
-        uplinks.first().map(|u| vec![u.numeric_id()]).unwrap_or_default()
+        uplinks
+            .first()
+            .map(|u| vec![u.numeric_id()])
+            .unwrap_or_default()
     }
 
     /// ECMP-aware selection using flow hash for consistent path selection.
@@ -421,7 +650,7 @@ impl Scheduler {
     /// Calculate RTT score (0-1, higher is better).
     fn rtt_score(uplink: &Uplink) -> f32 {
         let rtt = uplink.rtt().as_secs_f32() * 1000.0; // ms
-        // Score decreases with RTT
+                                                       // Score decreases with RTT
         1.0 / (1.0 + rtt / 50.0)
     }
 
@@ -434,7 +663,8 @@ impl Scheduler {
     /// Calculate bandwidth score (0-1, higher is better).
     fn bandwidth_score(uplink: &Uplink, all: &[&Arc<Uplink>]) -> f32 {
         let bw = uplink.bandwidth().bytes_per_sec;
-        let max_bw: f64 = all.iter()
+        let max_bw: f64 = all
+            .iter()
             .map(|u| u.bandwidth().bytes_per_sec)
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or(1.0);
@@ -456,11 +686,11 @@ impl Scheduler {
         // Score based on NAT type (some NAT types are more problematic than others)
         match uplink.nat_type() {
             super::nat::NatType::None => 1.0,
-            super::nat::NatType::Unknown => 0.7,  // Unknown might not be NAT
-            super::nat::NatType::FullCone => 0.8,  // Most permissive NAT
+            super::nat::NatType::Unknown => 0.7, // Unknown might not be NAT
+            super::nat::NatType::FullCone => 0.8, // Most permissive NAT
             super::nat::NatType::RestrictedCone => 0.6,
             super::nat::NatType::PortRestrictedCone => 0.4,
-            super::nat::NatType::Symmetric => 0.2,  // Most restrictive NAT
+            super::nat::NatType::Symmetric => 0.2, // Most restrictive NAT
         }
     }
 
@@ -488,12 +718,20 @@ impl Scheduler {
 
         // Cleanup old probe records
         let timeout = self.config.probe_interval * 10;
-        self.last_probe.write().retain(|_, last| last.elapsed() < timeout);
+        self.last_probe
+            .write()
+            .retain(|_, last| last.elapsed() < timeout);
+
+        // Cleanup throughput cache
+        self.throughput_cache
+            .write()
+            .retain(|_, (cached_at, _)| cached_at.elapsed() < self.cache_ttl * 10);
     }
 
     /// Get uplinks that should be probed.
     pub fn uplinks_to_probe(&self, uplinks: &[Arc<Uplink>]) -> Vec<u16> {
-        uplinks.iter()
+        uplinks
+            .iter()
             .filter(|u| u.is_usable() && self.needs_probe(u))
             .map(|u| u.numeric_id())
             .collect()

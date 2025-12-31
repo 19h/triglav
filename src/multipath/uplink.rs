@@ -105,6 +105,131 @@ impl Default for UplinkState {
     }
 }
 
+/// Comprehensive connection parameters for throughput optimization.
+/// Contains all metrics needed to make intelligent routing and scheduling decisions.
+#[derive(Debug, Clone)]
+pub struct ConnectionParams {
+    // Identity
+    /// Numeric uplink ID.
+    pub uplink_id: u16,
+    /// Network interface type.
+    pub interface_type: InterfaceType,
+    /// Transport protocol.
+    pub protocol: TransportProtocol,
+    
+    // Timing
+    /// Smoothed round-trip time.
+    pub rtt: Duration,
+    /// RTT variance.
+    pub rtt_variance: Duration,
+    /// Minimum observed RTT.
+    pub rtt_min: Duration,
+    /// Jitter (variance in delay).
+    pub jitter: Duration,
+    
+    // Bandwidth
+    /// Upload bandwidth estimate.
+    pub bandwidth_up: Bandwidth,
+    /// Download bandwidth estimate.
+    pub bandwidth_down: Bandwidth,
+    /// Effective throughput (considering loss).
+    pub effective_throughput: Bandwidth,
+    /// Goodput (useful throughput after retransmissions).
+    pub goodput: Bandwidth,
+    /// Maximum bandwidth limit (0 = unlimited).
+    pub max_bandwidth_mbps: u32,
+    
+    // Capacity
+    /// Bandwidth-delay product in bytes.
+    pub bdp: u64,
+    /// Congestion window in packets.
+    pub cwnd: u32,
+    /// Packets in flight.
+    pub in_flight: u32,
+    
+    // Loss
+    /// Packet loss ratio (0.0-1.0).
+    pub packet_loss: f64,
+    /// Retransmission rate (0.0-1.0).
+    pub retransmission_rate: f64,
+    
+    // Health
+    /// Health status.
+    pub health: UplinkHealth,
+    /// Consecutive failures.
+    pub consecutive_failures: u32,
+    /// Whether uplink is usable.
+    pub is_usable: bool,
+    
+    // NAT
+    /// Whether behind NAT.
+    pub is_natted: bool,
+    /// NAT type.
+    pub nat_type: super::nat::NatType,
+    
+    // Transfer estimates
+    /// Estimated time to transfer 1MB.
+    pub time_for_1mb: Duration,
+    /// Computed priority score.
+    pub priority_score: u32,
+    
+    // Statistics
+    /// Total bytes sent.
+    pub bytes_sent: u64,
+    /// Total bytes received.
+    pub bytes_received: u64,
+    /// Total packets sent.
+    pub packets_sent: u64,
+    /// Total packets received.
+    pub packets_received: u64,
+    /// Packets dropped.
+    pub packets_dropped: u64,
+    /// Packets retransmitted.
+    pub packets_retransmitted: u64,
+}
+
+impl ConnectionParams {
+    /// Check if this uplink is suitable for latency-sensitive traffic.
+    pub fn is_low_latency(&self) -> bool {
+        self.rtt < Duration::from_millis(50) && self.jitter < Duration::from_millis(10)
+    }
+    
+    /// Check if this uplink is suitable for high-bandwidth traffic.
+    pub fn is_high_bandwidth(&self) -> bool {
+        self.effective_throughput.bytes_per_sec > 10_000_000.0 // 10 MB/s
+    }
+    
+    /// Check if this uplink has low packet loss.
+    pub fn has_low_loss(&self) -> bool {
+        self.packet_loss < 0.01 // Less than 1%
+    }
+    
+    /// Calculate a quality score (0.0-1.0) for this uplink.
+    pub fn quality_score(&self) -> f64 {
+        let rtt_score = 1.0 / (1.0 + self.rtt.as_secs_f64() * 10.0);
+        let loss_score = 1.0 - self.packet_loss.min(1.0);
+        let jitter_score = 1.0 / (1.0 + self.jitter.as_secs_f64() * 100.0);
+        let health_score = self.health.priority_modifier();
+        
+        (rtt_score + loss_score + jitter_score + health_score) / 4.0
+    }
+    
+    /// Estimate transfer time for given bytes.
+    pub fn transfer_time(&self, bytes: u64) -> Duration {
+        if self.effective_throughput.bytes_per_sec <= 0.0 {
+            return Duration::MAX;
+        }
+        
+        let transfer_secs = bytes as f64 / self.effective_throughput.bytes_per_sec;
+        Duration::from_secs_f64(transfer_secs + self.rtt.as_secs_f64())
+    }
+    
+    /// Check if this uplink can complete a transfer faster than another.
+    pub fn faster_than(&self, other: &Self, bytes: u64) -> bool {
+        self.transfer_time(bytes) < other.transfer_time(bytes)
+    }
+}
+
 /// RTT tracking with sliding window.
 #[derive(Debug)]
 struct RttTracker {
@@ -727,6 +852,109 @@ impl Uplink {
             jitter: rtt.variance(),
             health: self.state.read().health,
         }
+    }
+
+    /// Get comprehensive connection parameters for throughput optimization.
+    /// This provides all metrics needed to make intelligent routing decisions.
+    pub fn connection_params(&self) -> ConnectionParams {
+        let rtt = self.rtt.read();
+        let state = self.state.read();
+        let stats = *self.stats.read();
+        
+        let bandwidth_up = self.bandwidth.send_bandwidth();
+        let bandwidth_down = self.bandwidth.recv_bandwidth();
+        let smoothed_rtt = rtt.smoothed();
+        let loss = self.loss.loss_ratio();
+        
+        // Calculate bandwidth-delay product
+        let bdp = if smoothed_rtt > Duration::ZERO {
+            (bandwidth_down.bytes_per_sec * smoothed_rtt.as_secs_f64()) as u64
+        } else {
+            0
+        };
+        
+        // Calculate effective throughput (considering loss)
+        let loss_factor = (1.0 - loss).max(0.01);
+        let effective_throughput = bandwidth_down.bytes_per_sec * loss_factor;
+        
+        // Estimate time to transfer 1MB
+        let time_for_1mb = if effective_throughput > 0.0 {
+            Duration::from_secs_f64((1024.0 * 1024.0) / effective_throughput + smoothed_rtt.as_secs_f64())
+        } else {
+            Duration::MAX
+        };
+        
+        // Calculate goodput (actual useful throughput)
+        let total_sent = stats.bytes_sent.max(1);
+        let retransmission_rate = stats.packets_retransmitted as f64 / stats.packets_sent.max(1) as f64;
+        let goodput = bandwidth_down.bytes_per_sec * (1.0 - retransmission_rate);
+        
+        ConnectionParams {
+            // Identity
+            uplink_id: self.numeric_id,
+            interface_type: self.config.interface_type,
+            protocol: self.config.protocol,
+            
+            // Timing
+            rtt: smoothed_rtt,
+            rtt_variance: rtt.variance(),
+            rtt_min: rtt.samples.front().copied().unwrap_or(Duration::ZERO),
+            jitter: rtt.variance(),
+            
+            // Bandwidth
+            bandwidth_up,
+            bandwidth_down,
+            effective_throughput: Bandwidth::from_bps(effective_throughput),
+            goodput: Bandwidth::from_bps(goodput),
+            max_bandwidth_mbps: self.config.max_bandwidth_mbps,
+            
+            // Capacity
+            bdp,
+            cwnd: self.cwnd.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+            
+            // Loss
+            packet_loss: loss,
+            retransmission_rate,
+            
+            // Health
+            health: state.health,
+            consecutive_failures: state.consecutive_failures,
+            is_usable: self.config.enabled 
+                && state.connection_state == ConnectionState::Connected 
+                && state.health.is_usable(),
+            
+            // NAT
+            is_natted: self.nat_state.read().is_natted(),
+            nat_type: self.nat_state.read().nat_type(),
+            
+            // Transfer estimates
+            time_for_1mb,
+            priority_score: self.priority_score.load(Ordering::Relaxed),
+            
+            // Statistics
+            bytes_sent: stats.bytes_sent,
+            bytes_received: stats.bytes_received,
+            packets_sent: stats.packets_sent,
+            packets_received: stats.packets_received,
+            packets_dropped: stats.packets_dropped,
+            packets_retransmitted: stats.packets_retransmitted,
+        }
+    }
+
+    /// Get send bandwidth.
+    pub fn send_bandwidth(&self) -> Bandwidth {
+        self.bandwidth.send_bandwidth()
+    }
+
+    /// Get receive bandwidth.
+    pub fn recv_bandwidth(&self) -> Bandwidth {
+        self.bandwidth.recv_bandwidth()
+    }
+
+    /// Get RTT variance (jitter).
+    pub fn rtt_variance(&self) -> Duration {
+        self.rtt.read().variance()
     }
 
     // NAT detection methods (Dublin Traceroute-inspired)

@@ -12,6 +12,8 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::{Scheduler, SchedulerConfig, Uplink, UplinkConfig};
 use super::{FlowId, PathDiscovery, PathDiscoveryConfig, calculate_flow_hash};
+use super::throughput::{ThroughputOptimizer, ThroughputConfig};
+use super::aggregator::{BandwidthAggregator, AggregatorConfig, AggregationMode};
 use crate::crypto::{NoiseSession, KeyPair, PublicKey};
 use crate::error::{Error, Result};
 use crate::protocol::{Packet, PacketType, PacketFlags};
@@ -32,6 +34,10 @@ pub struct MultipathConfig {
     /// Transport configuration.
     #[serde(default)]
     pub transport: TransportConfig,
+
+    /// Throughput optimization configuration.
+    #[serde(default)]
+    pub throughput: ThroughputConfig,
 
     /// Maximum number of uplinks.
     #[serde(default = "default_max_uplinks")]
@@ -79,7 +85,30 @@ pub struct MultipathConfig {
     /// Path discovery configuration.
     #[serde(default)]
     pub path_discovery: PathDiscoveryConfig,
+
+    /// Enable throughput optimization.
+    #[serde(default = "default_throughput_optimization")]
+    pub throughput_optimization: bool,
+
+    /// Bandwidth probe interval for active throughput measurement.
+    #[serde(default = "default_bandwidth_probe_interval", with = "humantime_serde")]
+    pub bandwidth_probe_interval: Duration,
+
+    /// Bandwidth aggregation mode.
+    /// - None: Single uplink per flow (load balancing only)
+    /// - Full: Stripe packets across ALL uplinks (true bandwidth aggregation)
+    /// - Adaptive: Aggregate only when latency spread is acceptable
+    #[serde(default = "default_aggregation_mode")]
+    pub aggregation_mode: AggregationMode,
+
+    /// Aggregator configuration for bandwidth aggregation.
+    #[serde(default)]
+    pub aggregator: AggregatorConfig,
 }
+
+fn default_throughput_optimization() -> bool { true }
+fn default_bandwidth_probe_interval() -> Duration { Duration::from_secs(5) }
+fn default_aggregation_mode() -> AggregationMode { AggregationMode::None }
 
 fn default_max_uplinks() -> usize { 16 }
 fn default_retries() -> u32 { 3 }
@@ -95,6 +124,7 @@ impl Default for MultipathConfig {
         Self {
             scheduler: SchedulerConfig::default(),
             transport: TransportConfig::default(),
+            throughput: ThroughputConfig::default(),
             max_uplinks: default_max_uplinks(),
             send_retries: default_retries(),
             retry_delay: default_retry_delay(),
@@ -106,6 +136,10 @@ impl Default for MultipathConfig {
             dedup_window_size: default_dedup_window(),
             ecmp_aware: false,
             path_discovery: PathDiscoveryConfig::default(),
+            throughput_optimization: default_throughput_optimization(),
+            bandwidth_probe_interval: default_bandwidth_probe_interval(),
+            aggregation_mode: AggregationMode::default(),
+            aggregator: AggregatorConfig::default(),
         }
     }
 }
@@ -229,6 +263,12 @@ pub struct MultipathManager {
     flow_bindings: DashMap<u64, u16>,
     /// Next flow ID for new connections.
     next_flow_id: AtomicU64,
+    /// Throughput optimizer for maximum bandwidth utilization.
+    throughput_optimizer: ThroughputOptimizer,
+    /// Next probe ID for bandwidth probing.
+    next_probe_id: AtomicU64,
+    /// Bandwidth aggregator for true multi-path aggregation.
+    aggregator: BandwidthAggregator,
 }
 
 impl MultipathManager {
@@ -237,9 +277,14 @@ impl MultipathManager {
         let (event_tx, _) = broadcast::channel(256);
 
         let dedup_size = config.dedup_window_size;
+        let throughput_optimizer = ThroughputOptimizer::new(config.throughput.clone());
+        let aggregator = BandwidthAggregator::new(config.aggregator.clone());
+        
         Self {
             scheduler: Scheduler::new(config.scheduler.clone()),
             path_discovery: PathDiscovery::new(config.path_discovery.clone()),
+            throughput_optimizer,
+            aggregator,
             config,
             session_id: SessionId::generate(),
             connection_id: ConnectionId::new(),
@@ -255,6 +300,7 @@ impl MultipathManager {
             local_keypair,
             flow_bindings: DashMap::new(),
             next_flow_id: AtomicU64::new(1),
+            next_probe_id: AtomicU64::new(1),
         }
     }
 
@@ -318,6 +364,11 @@ impl MultipathManager {
 
         self.uplinks.insert(numeric_id, uplink);
         self.uplink_ids.insert(config.id, numeric_id);
+        
+        // Register with throughput optimizer
+        if self.config.throughput_optimization {
+            self.throughput_optimizer.register_uplink(numeric_id);
+        }
 
         Ok(numeric_id)
     }
@@ -326,6 +377,12 @@ impl MultipathManager {
     pub fn remove_uplink(&self, id: u16) -> Option<Arc<Uplink>> {
         if let Some((_, uplink)) = self.uplinks.remove(&id) {
             self.uplink_ids.remove(uplink.id());
+            
+            // Unregister from throughput optimizer
+            if self.config.throughput_optimization {
+                self.throughput_optimizer.unregister_uplink(id);
+            }
+            
             let _ = self.event_tx.send(MultipathEvent::UplinkDisconnected(uplink.id().clone()));
             Some(uplink)
         } else {
@@ -548,13 +605,111 @@ impl MultipathManager {
 
     /// Send data on a specific flow for ECMP path consistency.
     ///
-    /// When `flow_id` is Some, the data will be sent on the uplink bound to that flow.
-    /// This ensures packets belonging to the same connection/stream traverse the same
-    /// network path, matching ECMP router behavior (Dublin Traceroute technique).
+    /// When aggregation mode is enabled (Full or Adaptive), packets are STRIPED
+    /// across ALL uplinks proportionally to their bandwidth. This provides true
+    /// bandwidth aggregation - a single flow can use the combined bandwidth of
+    /// all uplinks.
     ///
-    /// If the flow has no binding yet, one will be created based on scheduler selection.
+    /// When aggregation is disabled (None), the traditional flow-sticky behavior
+    /// is used where each flow is bound to a single uplink.
     pub async fn send_on_flow(&self, flow_id: Option<u64>, data: &[u8]) -> Result<u64> {
+        // Check if bandwidth aggregation is enabled
+        let use_aggregation = match self.config.aggregation_mode {
+            AggregationMode::Full => true,
+            AggregationMode::Adaptive => {
+                // Use aggregation if latency spread is acceptable
+                let spread = self.aggregator.latency_spread();
+                spread < Duration::from_millis(100)
+            }
+            AggregationMode::None => false,
+        };
+
+        if use_aggregation {
+            self.send_aggregated(data).await
+        } else {
+            self.send_single_path(flow_id, data).await
+        }
+    }
+
+    /// Send using bandwidth aggregation (packet striping).
+    /// Distributes packets across ALL uplinks weighted by their bandwidth.
+    async fn send_aggregated(&self, data: &[u8]) -> Result<u64> {
+        let uplinks = self.uplinks();
+        
+        // Get next stripe (uplink + sequence)
+        let (uplink_id, agg_seq) = self.aggregator.next_stripe(&uplinks)
+            .ok_or(Error::NoAvailableUplinks)?;
+        
+        // Use aggregator sequence in packet header for reordering
+        let seq = SequenceNumber(agg_seq);
+        
+        if let Some(uplink) = self.get_uplink(uplink_id) {
+            // Apply pacing if enabled
+            if self.config.throughput_optimization {
+                let pacing_interval = self.throughput_optimizer.pacing_interval(uplink_id, data.len());
+                if pacing_interval > Duration::ZERO {
+                    tokio::time::sleep(pacing_interval).await;
+                }
+            }
+            
+            match self.send_on_uplink(&uplink, seq, data).await {
+                Ok(_) => {
+                    // Record send with throughput optimizer
+                    if self.config.throughput_optimization {
+                        self.throughput_optimizer.record_send(uplink_id, data.len() as u64);
+                    }
+                    
+                    let mut stats = self.stats.write();
+                    stats.bytes_sent += data.len() as u64;
+                    stats.packets_sent += 1;
+                    
+                    Ok(agg_seq)
+                }
+                Err(e) => {
+                    uplink.record_failure(&e.to_string());
+                    
+                    // Try fallback to another uplink
+                    self.send_aggregated_fallback(data, uplink_id).await
+                }
+            }
+        } else {
+            Err(Error::NoAvailableUplinks)
+        }
+    }
+
+    /// Fallback when primary stripe uplink fails - try next available.
+    async fn send_aggregated_fallback(&self, data: &[u8], failed_uplink: u16) -> Result<u64> {
+        let uplinks = self.uplinks();
+        
+        for uplink in &uplinks {
+            if uplink.numeric_id() == failed_uplink {
+                continue;
+            }
+            if !uplink.is_usable() {
+                continue;
+            }
+            
+            let seq = SequenceNumber(self.aggregator.current_seq());
+            
+            match self.send_on_uplink(uplink, seq, data).await {
+                Ok(_) => {
+                    let mut stats = self.stats.write();
+                    stats.bytes_sent += data.len() as u64;
+                    stats.packets_sent += 1;
+                    return Ok(seq.0);
+                }
+                Err(_) => continue,
+            }
+        }
+        
+        Err(Error::NoAvailableUplinks)
+    }
+
+    /// Send using single-path (flow-sticky) mode.
+    /// Traditional behavior where each flow uses one uplink.
+    async fn send_single_path(&self, flow_id: Option<u64>, data: &[u8]) -> Result<u64> {
         let seq = SequenceNumber(self.next_seq.fetch_add(1, Ordering::SeqCst));
+        let data_size = data.len() as u64;
 
         // Check for existing flow binding first
         let bound_uplink = flow_id.and_then(|fid| self.flow_bindings.get(&fid).map(|r| *r));
@@ -568,15 +723,15 @@ impl MultipathManager {
                 vec![uplink_id]
             } else {
                 // Bound uplink no longer usable, select new one and update binding
-                let new_selection = self.scheduler.select(&uplinks, flow_id);
+                let new_selection = self.scheduler.select_for_size(&uplinks, flow_id, Some(data_size));
                 if let (Some(fid), Some(&new_id)) = (flow_id, new_selection.first()) {
                     self.flow_bindings.insert(fid, new_id);
                 }
                 new_selection
             }
         } else {
-            // No binding - select and optionally create binding
-            let selection = self.scheduler.select(&uplinks, flow_id);
+            // No binding - select using size-aware scheduling
+            let selection = self.scheduler.select_for_size(&uplinks, flow_id, Some(data_size));
             if let (Some(fid), Some(&uplink_id)) = (flow_id, selection.first()) {
                 self.flow_bindings.insert(fid, uplink_id);
             }
@@ -593,9 +748,23 @@ impl MultipathManager {
 
         for uplink_id in &selected {
             if let Some(uplink) = self.get_uplink(*uplink_id) {
+                // Apply pacing if enabled
+                if self.config.throughput_optimization {
+                    let pacing_interval = self.throughput_optimizer.pacing_interval(*uplink_id, data.len());
+                    if pacing_interval > Duration::ZERO {
+                        tokio::time::sleep(pacing_interval).await;
+                    }
+                }
+                
                 match self.send_on_uplink(&uplink, seq, data).await {
                     Ok(_) => {
                         sent = true;
+                        
+                        // Record send with throughput optimizer
+                        if self.config.throughput_optimization {
+                            self.throughput_optimizer.record_send(*uplink_id, data.len() as u64);
+                        }
+                        
                         // For non-redundant strategies, stop after first success
                         if self.config.scheduler.strategy != super::SchedulingStrategy::Redundant {
                             break;
@@ -603,6 +772,12 @@ impl MultipathManager {
                     }
                     Err(e) => {
                         uplink.record_failure(&e.to_string());
+                        
+                        // Record MTU failure if applicable
+                        if self.config.throughput_optimization && e.to_string().contains("too large") {
+                            self.throughput_optimizer.record_mtu_result(*uplink_id, data.len() as u32, false);
+                        }
+                        
                         last_error = Some(e);
                     }
                 }
@@ -667,6 +842,8 @@ impl MultipathManager {
     }
 
     /// Handle incoming packet.
+    /// When aggregation is enabled, packets are passed through the reorder buffer
+    /// to handle out-of-order arrival from different uplinks.
     pub fn handle_packet(&self, data: &[u8], from_uplink: u16) -> Result<Option<Vec<u8>>> {
         let packet = Packet::decode(data)?;
 
@@ -713,6 +890,34 @@ impl MultipathManager {
                     packet.payload.clone()
                 };
 
+                // Check if aggregation is enabled - use reorder buffer
+                let use_aggregation = !matches!(self.config.aggregation_mode, AggregationMode::None);
+                
+                if use_aggregation {
+                    // Pass through reorder buffer for proper sequencing
+                    let ready_packets = self.aggregator.receive(
+                        packet.header.sequence.0,
+                        payload,
+                        from_uplink,
+                    );
+                    
+                    // Return the first ready packet (others will be picked up by poll)
+                    // In practice, we'd want to deliver all ready packets
+                    if let Some(first) = ready_packets.into_iter().next() {
+                        let decrypted_packet = Packet::data(
+                            packet.header.sequence,
+                            packet.header.session_id,
+                            packet.header.uplink_id,
+                            first.clone(),
+                        )?;
+                        let _ = self.event_tx.send(MultipathEvent::PacketReceived(decrypted_packet));
+                        return Ok(Some(first));
+                    } else {
+                        // Packet buffered, waiting for earlier packets
+                        return Ok(None);
+                    }
+                }
+
                 let decrypted_packet = Packet::data(
                     packet.header.sequence,
                     packet.header.session_id,
@@ -733,6 +938,25 @@ impl MultipathManager {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Poll the reorder buffer for packets that are ready due to timeout.
+    /// Call this periodically when using bandwidth aggregation.
+    pub fn poll_reorder_buffer(&self) -> Vec<Vec<u8>> {
+        if matches!(self.config.aggregation_mode, AggregationMode::None) {
+            return vec![];
+        }
+        self.aggregator.poll_timeout()
+    }
+
+    /// Get aggregator statistics.
+    pub fn aggregator_stats(&self) -> super::aggregator::AggregatorStats {
+        self.aggregator.stats()
+    }
+
+    /// Get reorder buffer statistics.
+    pub fn reorder_stats(&self) -> super::aggregator::ReorderStats {
+        self.aggregator.reorder_stats()
     }
 
     /// Receive data from any uplink.
@@ -849,8 +1073,25 @@ impl MultipathManager {
             if let Some((_, pending)) = self.pending.remove(&seq) {
                 // Calculate RTT
                 let rtt = pending.sent_at.elapsed();
-                if let Some(uplink) = self.get_uplink(pending.uplink_id) {
+                let uplink_id = pending.uplink_id;
+                let packet_size = pending.packet.payload.len() as u64;
+                
+                if let Some(uplink) = self.get_uplink(uplink_id) {
                     uplink.record_rtt(rtt);
+                    
+                    // Record with throughput optimizer for BBR-style congestion control
+                    if self.config.throughput_optimization {
+                        self.throughput_optimizer.record_ack(uplink_id, packet_size, rtt);
+                        
+                        // Record bandwidth measurement
+                        if rtt.as_secs_f64() > 0.0 {
+                            let bandwidth = packet_size as f64 / rtt.as_secs_f64();
+                            self.throughput_optimizer.record_bandwidth(uplink_id, bandwidth);
+                        }
+                        
+                        // Record MTU success
+                        self.throughput_optimizer.record_mtu_result(uplink_id, packet_size as u32, true);
+                    }
                 }
             }
         }
@@ -861,7 +1102,23 @@ impl MultipathManager {
     /// Handle pong packet.
     fn handle_pong(&self, packet: &Packet, from_uplink: u16) {
         if packet.payload.len() >= 8 {
-            let ping_ts = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
+            let probe_or_ts = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
+            let payload_size = packet.payload.len() as u64;
+            
+            // Check if this is a bandwidth probe response
+            if self.config.throughput_optimization && payload_size > 64 {
+                // This is likely a bandwidth probe response
+                let probe_id = probe_or_ts;
+                self.throughput_optimizer.record_probe_response(from_uplink, probe_id, payload_size);
+                
+                if let Some(uplink) = self.get_uplink(from_uplink) {
+                    uplink.record_success();
+                }
+                return;
+            }
+            
+            // Regular ping/pong for RTT measurement
+            let ping_ts = probe_or_ts;
             let now_us = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -871,6 +1128,11 @@ impl MultipathManager {
                 let rtt = Duration::from_micros(now_us - ping_ts);
                 if let Some(uplink) = self.get_uplink(from_uplink) {
                     uplink.record_rtt(rtt);
+                    
+                    // Also record with throughput optimizer
+                    if self.config.throughput_optimization {
+                        self.throughput_optimizer.record_ack(from_uplink, payload_size, rtt);
+                    }
                 }
             }
         }
@@ -991,10 +1253,16 @@ impl MultipathManager {
 
         // Cleanup stale path discovery data (Dublin Traceroute: path maintenance)
         self.path_discovery.cleanup(self.config.path_max_age);
+
+        // Update aggregator weights for bandwidth-proportional striping
+        if !matches!(self.config.aggregation_mode, AggregationMode::None) {
+            let uplinks = self.uplinks();
+            self.aggregator.update_weights(&uplinks);
+        }
     }
 
     /// Start the maintenance loop in a background task.
-    /// This handles retries, keepalives, and uplink health monitoring.
+    /// This handles retries, keepalives, uplink health monitoring, and throughput optimization.
     pub fn start_maintenance_loop(self: &Arc<Self>) {
         let manager = Arc::clone(self);
 
@@ -1010,6 +1278,17 @@ impl MultipathManager {
                     manager.config.path_discovery_interval
                 } else {
                     Duration::from_secs(3600) // Fallback, won't trigger if disabled
+                }
+            );
+
+            // Bandwidth probing interval for throughput optimization
+            let bandwidth_probe_enabled = manager.config.throughput_optimization 
+                && manager.config.throughput.probing_enabled;
+            let mut bandwidth_probe_interval = tokio::time::interval(
+                if bandwidth_probe_enabled {
+                    manager.config.bandwidth_probe_interval
+                } else {
+                    Duration::from_secs(3600)
                 }
             );
 
@@ -1044,9 +1323,60 @@ impl MultipathManager {
                     _ = path_discovery_interval.tick(), if path_discovery_enabled => {
                         manager.run_path_discovery().await;
                     }
+                    _ = bandwidth_probe_interval.tick(), if bandwidth_probe_enabled => {
+                        manager.run_bandwidth_probes().await;
+                    }
                 }
             }
         });
+    }
+
+    /// Run active bandwidth probes on uplinks that need probing.
+    async fn run_bandwidth_probes(&self) {
+        let uplinks_to_probe = self.throughput_optimizer.uplinks_needing_probe();
+        
+        for uplink_id in uplinks_to_probe {
+            if let Some(uplink) = self.get_uplink(uplink_id) {
+                if let Some(transport) = uplink.get_transport() {
+                    let probe_id = self.next_probe_id.fetch_add(1, Ordering::SeqCst);
+                    let probe_size = self.config.throughput.probe_size;
+                    
+                    // Create probe packet (ping with larger payload for bandwidth estimation)
+                    let seq = SequenceNumber(self.next_seq.fetch_add(1, Ordering::SeqCst));
+                    
+                    // Use a ping packet with a larger probe payload
+                    let mut probe_payload = vec![0u8; probe_size];
+                    probe_payload[0..8].copy_from_slice(&probe_id.to_be_bytes());
+                    
+                    if let Ok(mut probe_packet) = Packet::new(
+                        PacketType::Ping,
+                        seq,
+                        self.session_id,
+                        uplink_id,
+                        probe_payload,
+                    ) {
+                        probe_packet.set_flag(PacketFlags::ENCRYPTED);
+                        
+                        if let Ok(encoded) = probe_packet.encode() {
+                            // Record probe sent
+                            self.throughput_optimizer.record_probe_sent(uplink_id, probe_id);
+                            
+                            // Send probe burst for more accurate measurement
+                            for _ in 0..self.config.throughput.probe_burst_count {
+                                let _ = transport.send(&encoded).await;
+                            }
+                            
+                            tracing::trace!(
+                                uplink_id = uplink_id,
+                                probe_id = probe_id,
+                                probe_size = probe_size,
+                                "Sent bandwidth probe"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Run path discovery for all connected uplinks.
@@ -1158,6 +1488,33 @@ impl MultipathManager {
         let _ = self.event_tx.send(MultipathEvent::Disconnected);
 
         Ok(())
+    }
+
+    /// Get access to the throughput optimizer.
+    pub fn throughput_optimizer(&self) -> &ThroughputOptimizer {
+        &self.throughput_optimizer
+    }
+
+    /// Get throughput summary across all uplinks.
+    pub fn throughput_summary(&self) -> super::throughput::ThroughputSummary {
+        self.throughput_optimizer.summary(&self.uplinks())
+    }
+
+    /// Get optimal packet size for an uplink (considering path MTU).
+    pub fn optimal_packet_size(&self, uplink_id: u16) -> u32 {
+        self.throughput_optimizer.optimal_packet_size(uplink_id)
+    }
+
+    /// Get effective throughput score for an uplink.
+    pub fn effective_throughput(&self, uplink_id: u16) -> Option<super::throughput::EffectiveThroughput> {
+        self.get_uplink(uplink_id)
+            .map(|u| self.throughput_optimizer.effective_throughput(&u))
+    }
+
+    /// Select the best uplink for a transfer of given size.
+    /// Considers both bandwidth and latency to find the fastest path.
+    pub fn best_uplink_for_size(&self, size_bytes: u64) -> Option<u16> {
+        self.throughput_optimizer.best_for_size(&self.uplinks(), size_bytes)
     }
 
     /// Get quality summary.

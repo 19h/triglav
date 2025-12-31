@@ -203,19 +203,29 @@ async fn main() {
     let tun_name = tun.name().to_string();
     drop(tun);
     
-    // Verify cleanup
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let verify = Command::new("ifconfig")
-        .arg(&tun_name)
-        .output();
+    // Verify cleanup - retry a few times as kernel may take a moment
+    let mut removed = false;
+    for i in 0..5 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let verify = Command::new("ifconfig")
+            .arg(&tun_name)
+            .output();
+        
+        if let Ok(o) = verify {
+            if !o.status.success() {
+                println!("      OK: Interface {} removed from system", tun_name);
+                removed = true;
+                break;
+            }
+        }
+        if i < 4 {
+            // Still exists, wait a bit more
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
     
-    match verify {
-        Ok(o) if !o.status.success() => {
-            println!("      OK: Interface {} removed from system", tun_name);
-        }
-        _ => {
-            println!("      WARN: Interface {} may still exist", tun_name);
-        }
+    if !removed {
+        println!("      WARN: Interface {} may still exist (will be removed on process exit)", tun_name);
     }
 
     println!();

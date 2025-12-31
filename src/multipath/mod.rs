@@ -9,6 +9,9 @@
 //! - ECMP-aware flow hashing (Dublin Traceroute technique)
 //! - NAT detection and traversal support
 //! - Path discovery and diversity assessment
+//! - Throughput optimization with BBR-style congestion control
+//! - Path MTU discovery
+//! - Effective throughput scoring (bandwidth + latency combined)
 
 mod uplink;
 mod scheduler;
@@ -16,10 +19,21 @@ mod manager;
 mod flow_hash;
 mod nat;
 mod path_discovery;
+mod throughput;
+pub mod aggregator;
 
-pub use uplink::{Uplink, UplinkConfig, UplinkState};
+pub use uplink::{Uplink, UplinkConfig, UplinkState, ConnectionParams};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulingStrategy};
 pub use manager::{MultipathManager, MultipathConfig, MultipathEvent};
+pub use aggregator::{
+    BandwidthAggregator, AggregatorConfig, AggregationMode,
+    ReorderBuffer, ReorderStats, AggregatorStats,
+};
+pub use throughput::{
+    ThroughputOptimizer, ThroughputConfig, ThroughputSummary,
+    EffectiveThroughput, BdpEstimator, PmtudState, BbrState,
+    FrameBatcher, DEFAULT_MTU, MIN_MTU, MAX_MTU,
+};
 
 // Dublin Traceroute-inspired modules
 pub use flow_hash::{

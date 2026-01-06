@@ -13,41 +13,37 @@
 //! - Path MTU discovery
 //! - Effective throughput scoring (bandwidth + latency combined)
 
-mod uplink;
-mod scheduler;
-mod manager;
+pub mod aggregator;
 mod flow_hash;
+mod manager;
 mod nat;
 mod path_discovery;
+mod scheduler;
 mod throughput;
-pub mod aggregator;
+mod uplink;
 
-pub use uplink::{Uplink, UplinkConfig, UplinkState, ConnectionParams};
-pub use scheduler::{Scheduler, SchedulerConfig, SchedulingStrategy};
-pub use manager::{MultipathManager, MultipathConfig, MultipathEvent};
 pub use aggregator::{
-    BandwidthAggregator, AggregatorConfig, AggregationMode,
-    ReorderBuffer, ReorderStats, AggregatorStats,
+    AggregationMode, AggregatorConfig, AggregatorStats, BandwidthAggregator, ReorderBuffer,
+    ReorderStats,
 };
+pub use manager::{MultipathConfig, MultipathEvent, MultipathManager};
+pub use scheduler::{Scheduler, SchedulerConfig, SchedulingStrategy};
 pub use throughput::{
-    ThroughputOptimizer, ThroughputConfig, ThroughputSummary,
-    EffectiveThroughput, BdpEstimator, PmtudState, BbrState,
-    FrameBatcher, DEFAULT_MTU, MIN_MTU, MAX_MTU,
+    BbrState, BdpEstimator, EffectiveThroughput, FrameBatcher, PmtudState, ThroughputConfig,
+    ThroughputOptimizer, ThroughputSummary, DEFAULT_MTU, MAX_MTU, MIN_MTU,
 };
+pub use uplink::{ConnectionParams, Uplink, UplinkConfig, UplinkState};
 
 // Dublin Traceroute-inspired modules
 pub use flow_hash::{
-    FlowId, FlowHashBucket, EcmpPathEnumerator,
-    calculate_flow_hash, flow_hash_from_addrs,
+    calculate_flow_hash, flow_hash_from_addrs, EcmpPathEnumerator, FlowHashBucket, FlowId,
 };
 pub use nat::{
-    NatId, NatType, NatDetectionState, UplinkNatState,
-    IpIdMarker, NatProbe, NatProbeResponse, ProbeMatcher,
-    compute_udp_checksum,
+    compute_udp_checksum, IpIdMarker, NatDetectionState, NatId, NatProbe, NatProbeResponse,
+    NatType, ProbeMatcher, UplinkNatState,
 };
 pub use path_discovery::{
-    PathDiscovery, PathDiscoveryConfig, PathDiversity,
-    DiscoveredPath, Hop, EcmpFlowSelector,
+    DiscoveredPath, EcmpFlowSelector, Hop, PathDiscovery, PathDiscoveryConfig, PathDiversity,
 };
 
 use std::time::Duration;

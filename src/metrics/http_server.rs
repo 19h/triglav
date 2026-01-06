@@ -236,7 +236,7 @@ impl MetricsHttpServer {
         health_checker: Arc<dyn HealthChecker + Send + Sync>,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
-        
+
         Self {
             config,
             state: HttpServerState {
@@ -253,12 +253,12 @@ impl MetricsHttpServer {
     pub async fn start(&self) -> Result<(), std::io::Error> {
         let app = self.build_router();
         let addr = self.config.bind_addr;
-        
+
         info!("Starting metrics HTTP server on {}", addr);
-        
+
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        
+
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.recv().await;
@@ -269,7 +269,7 @@ impl MetricsHttpServer {
     /// Build the router.
     fn build_router(&self) -> Router {
         let state = self.state.clone();
-        
+
         let router = Router::new()
             .route("/metrics", get(metrics_handler))
             .route("/health", get(health_handler))
@@ -284,7 +284,7 @@ impl MetricsHttpServer {
         let router = {
             use tower_http::cors::{Any, CorsLayer};
             use tower_http::trace::TraceLayer;
-            
+
             if self.config.enable_cors {
                 router
                     .layer(CorsLayer::new().allow_origin(Any))
@@ -341,7 +341,7 @@ async fn health_handler(
 ) -> impl IntoResponse {
     let alive = state.health_checker.is_alive();
     let ready = state.health_checker.is_ready();
-    
+
     let status = if alive && ready {
         "healthy"
     } else if alive {
@@ -349,13 +349,13 @@ async fn health_handler(
     } else {
         "unhealthy"
     };
-    
+
     let status_code = if alive {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    
+
     let response = HealthResponse {
         status: status.to_string(),
         details: if query.verbose {
@@ -364,7 +364,7 @@ async fn health_handler(
             None
         },
     };
-    
+
     (status_code, Json(response))
 }
 
@@ -390,7 +390,7 @@ async fn readiness_handler(State(state): State<HttpServerState>) -> impl IntoRes
 async fn status_handler(State(state): State<HttpServerState>) -> impl IntoResponse {
     let mut status = state.status_provider.get_status();
     status.uptime_seconds = state.start_time.elapsed().as_secs();
-    
+
     Json(status)
 }
 
@@ -404,7 +404,7 @@ mod tests {
             status: "healthy".to_string(),
             details: None,
         };
-        
+
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("healthy"));
         assert!(!json.contains("details"));
@@ -413,10 +413,10 @@ mod tests {
     #[test]
     fn test_default_health_checker() {
         let checker = DefaultHealthChecker::new();
-        
+
         assert!(checker.is_alive());
         assert!(!checker.is_ready());
-        
+
         checker.set_ready(true);
         assert!(checker.is_ready());
     }

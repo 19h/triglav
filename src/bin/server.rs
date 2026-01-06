@@ -18,20 +18,16 @@ use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
-use triglav::config::{ServerConfig, init_logging};
+use triglav::config::{init_logging, ServerConfig};
 use triglav::crypto::{KeyPair, NoiseSession};
 use triglav::error::{Error, Result};
 use triglav::metrics::{
-    MetricsHttpServer, HttpServerConfig, DefaultHealthChecker,
-    SessionStatus, StatusResponse, StatusProvider,
-    init_metrics, PrometheusMetrics,
+    init_metrics, DefaultHealthChecker, HttpServerConfig, MetricsHttpServer, PrometheusMetrics,
+    SessionStatus, StatusProvider, StatusResponse,
 };
-use triglav::protocol::{Packet, PacketType, PacketFlags, HEADER_SIZE};
-use triglav::server::{
-    DaemonConfig, daemonize, PidFileGuard,
-    SignalHandler, Signal,
-};
-use triglav::types::{SessionId, SequenceNumber, TrafficStats};
+use triglav::protocol::{Packet, PacketFlags, PacketType, HEADER_SIZE};
+use triglav::server::{daemonize, DaemonConfig, PidFileGuard, Signal, SignalHandler};
+use triglav::types::{SequenceNumber, SessionId, TrafficStats};
 
 /// Server state.
 struct Server {
@@ -118,15 +114,17 @@ impl Server {
         keypair: KeyPair,
         metrics: Arc<PrometheusMetrics>,
     ) -> Result<Self> {
-        let addr = config.listen_addrs.first()
+        let addr = config
+            .listen_addrs
+            .first()
             .ok_or_else(|| Error::Config("No listen address specified".into()))?;
 
-        let socket = UdpSocket::bind(addr)
-            .await
-            .map_err(|e| Error::Transport(triglav::error::TransportError::BindFailed {
+        let socket = UdpSocket::bind(addr).await.map_err(|e| {
+            Error::Transport(triglav::error::TransportError::BindFailed {
                 addr: *addr,
                 reason: e.to_string(),
-            }))?;
+            })
+        })?;
 
         info!("Server bound to {}", addr);
 
@@ -175,7 +173,9 @@ impl Server {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                metrics.server_uptime_seconds.set(start_time.elapsed().as_secs_f64());
+                metrics
+                    .server_uptime_seconds
+                    .set(start_time.elapsed().as_secs_f64());
             }
         });
 
@@ -233,7 +233,7 @@ impl Server {
 
             self.stats.write().total_connections += 1;
             self.stats.write().active_connections += 1;
-            
+
             self.metrics.connections_total.inc();
             self.metrics.connections_active.inc();
             self.metrics.sessions_total.inc();
@@ -271,7 +271,12 @@ impl Server {
     }
 
     /// Handle handshake packet.
-    async fn handle_handshake(&self, session: &TransportSession, packet: &Packet, addr: SocketAddr) -> Result<()> {
+    async fn handle_handshake(
+        &self,
+        session: &TransportSession,
+        packet: &Packet,
+        addr: SocketAddr,
+    ) -> Result<()> {
         debug!("Handshake from {} (session {})", addr, session.id);
 
         // Create responder noise session
@@ -302,7 +307,12 @@ impl Server {
     }
 
     /// Handle data packet.
-    async fn handle_data(&self, session: &TransportSession, packet: &Packet, addr: SocketAddr) -> Result<()> {
+    async fn handle_data(
+        &self,
+        session: &TransportSession,
+        packet: &Packet,
+        addr: SocketAddr,
+    ) -> Result<()> {
         // Decrypt if we have a noise session
         let payload = if packet.header.flags.has(PacketFlags::ENCRYPTED) {
             if let Some(ref mut noise) = *session.noise.write() {
@@ -313,10 +323,12 @@ impl Server {
                     packet.payload.clone()
                 }
             } else {
-                return Err(Error::Protocol(triglav::error::ProtocolError::UnexpectedMessage {
-                    expected: "unencrypted or established session".into(),
-                    got: "encrypted without session".into(),
-                }));
+                return Err(Error::Protocol(
+                    triglav::error::ProtocolError::UnexpectedMessage {
+                        expected: "unencrypted or established session".into(),
+                        got: "encrypted without session".into(),
+                    },
+                ));
             }
         } else {
             packet.payload.clone()
@@ -329,18 +341,31 @@ impl Server {
             stats.packets_received += 1;
         }
 
-        debug!("Received {} bytes of data from {} (session {})", payload.len(), addr, session.id);
+        debug!(
+            "Received {} bytes of data from {} (session {})",
+            payload.len(),
+            addr,
+            session.id
+        );
 
         // Echo back the data (encrypted if we have a noise session)
-        self.send_data(session, &payload, packet.header.uplink_id, addr).await?;
+        self.send_data(session, &payload, packet.header.uplink_id, addr)
+            .await?;
 
         Ok(())
     }
 
     /// Send encrypted data to a client.
-    async fn send_data(&self, session: &TransportSession, payload: &[u8], uplink_id: u16, addr: SocketAddr) -> Result<()> {
+    async fn send_data(
+        &self,
+        session: &TransportSession,
+        payload: &[u8],
+        uplink_id: u16,
+        addr: SocketAddr,
+    ) -> Result<()> {
         // Encrypt if we have a noise session
-        let (encrypted_payload, is_encrypted) = if let Some(ref mut noise) = *session.noise.write() {
+        let (encrypted_payload, is_encrypted) = if let Some(ref mut noise) = *session.noise.write()
+        {
             if noise.is_transport() {
                 self.metrics.encrypt_operations.inc();
                 (noise.encrypt(payload)?, true)
@@ -375,7 +400,12 @@ impl Server {
     }
 
     /// Handle ping packet.
-    async fn handle_ping(&self, session: &TransportSession, packet: &Packet, addr: SocketAddr) -> Result<()> {
+    async fn handle_ping(
+        &self,
+        session: &TransportSession,
+        packet: &Packet,
+        addr: SocketAddr,
+    ) -> Result<()> {
         let pong = Packet::pong(
             packet.header.sequence.next(),
             session.id,
@@ -394,12 +424,14 @@ impl Server {
 
         // Record session duration
         let duration = session.last_activity.read().elapsed();
-        self.metrics.session_duration_seconds.observe(duration.as_secs_f64());
+        self.metrics
+            .session_duration_seconds
+            .observe(duration.as_secs_f64());
 
         self.transport_sessions.remove(&session.id);
         self.sessions_by_addr.remove(&addr);
         self.stats.write().active_connections -= 1;
-        
+
         self.metrics.connections_active.dec();
         self.metrics.sessions_active.dec();
 
@@ -410,19 +442,26 @@ impl Server {
     async fn send_packet(&self, packet: &Packet, addr: SocketAddr) -> Result<()> {
         let data = packet.encode()?;
 
-        self.socket.send_to(&data, addr)
+        self.socket
+            .send_to(&data, addr)
             .await
             .map_err(|e| triglav::error::TransportError::SendFailed(e.to_string()))?;
 
         self.stats.write().packets_sent += 1;
         self.stats.write().bytes_sent += data.len() as u64;
-        
-        self.metrics.packets_sent_total.with_label_values(&["server"]).inc();
-        self.metrics.bytes_sent_total.with_label_values(&["server"]).inc_by(data.len() as u64);
+
+        self.metrics
+            .packets_sent_total
+            .with_label_values(&["server"])
+            .inc();
+        self.metrics
+            .bytes_sent_total
+            .with_label_values(&["server"])
+            .inc_by(data.len() as u64);
 
         Ok(())
     }
-    
+
     /// Trigger shutdown.
     fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
@@ -439,14 +478,16 @@ struct ServerStatusProvider {
 impl StatusProvider for ServerStatusProvider {
     fn get_status(&self) -> StatusResponse {
         let stats = self.stats.read();
-        
-        let sessions: Vec<SessionStatus> = self.transport_sessions.iter()
+
+        let sessions: Vec<SessionStatus> = self
+            .transport_sessions
+            .iter()
             .take(100)
             .map(|entry| {
                 let session = entry.value();
                 let addrs = session.client_addrs.read();
                 let session_stats = session.stats.read();
-                
+
                 SessionStatus {
                     id: session.id.to_string(),
                     user_id: session.user_id.read().clone(),
@@ -458,7 +499,7 @@ impl StatusProvider for ServerStatusProvider {
                 }
             })
             .collect();
-        
+
         StatusResponse {
             version: triglav::VERSION.to_string(),
             uptime_seconds: self.start_time.elapsed().as_secs(),
@@ -549,7 +590,7 @@ async fn main() -> Result<()> {
             umask: Some(0o027),
             close_fds: true,
         };
-        
+
         daemonize(&daemon_config)?;
         _pid_guard = pid_file.map(|p| PidFileGuard::new(p).expect("Failed to create PID file"));
     } else {
@@ -572,7 +613,10 @@ async fn main() -> Result<()> {
             info!("Generated new keypair at {}", path.display());
             kp
         } else {
-            return Err(Error::Config(format!("Key file not found: {}", path.display())));
+            return Err(Error::Config(format!(
+                "Key file not found: {}",
+                path.display()
+            )));
         }
     } else if generate_key {
         let kp = KeyPair::generate();
@@ -598,7 +642,10 @@ async fn main() -> Result<()> {
         println!();
         println!("╔══════════════════════════════════════════╗");
         println!("║     TRIGLAV SERVER                       ║");
-        println!("║     Version {}                         ║", triglav::VERSION);
+        println!(
+            "║     Version {}                         ║",
+            triglav::VERSION
+        );
         println!("╚══════════════════════════════════════════╝");
         println!();
         println!("Listening on: {}", listen_addr);
@@ -608,42 +655,35 @@ async fn main() -> Result<()> {
         println!("{}", auth_key);
         println!();
     }
-    
+
     info!("Triglav server starting");
     info!("Listen: {}, Metrics: {}", listen_addr, metrics_addr);
 
     // Create server
-    let server = Arc::new(
-        Server::new(config, keypair, Arc::clone(&metrics)).await?
-    );
-    
+    let server = Arc::new(Server::new(config, keypair, Arc::clone(&metrics)).await?);
+
     // Create a shared stats reference for the status provider
     let shared_stats: Arc<RwLock<ServerStats>> = Arc::new(RwLock::new(ServerStats::default()));
-    
+
     // Create status provider that shares data with server
     let status_provider = Arc::new(ServerStatusProvider {
         start_time: server.start_time,
         transport_sessions: server.transport_sessions.clone(),
         stats: shared_stats,
     });
-    
+
     // Create health checker
     let health_checker = Arc::new(DefaultHealthChecker::new());
     health_checker.set_ready(true);
-    
+
     // Start metrics HTTP server
     let http_config = HttpServerConfig {
         bind_addr: metrics_addr,
         enable_cors: true,
         shutdown_timeout: Duration::from_secs(5),
     };
-    let http_server = MetricsHttpServer::new(
-        http_config,
-        metrics,
-        status_provider,
-        health_checker,
-    );
-    
+    let http_server = MetricsHttpServer::new(http_config, metrics, status_provider, health_checker);
+
     tokio::spawn(async move {
         if let Err(e) = http_server.start().await {
             error!("Metrics HTTP server error: {}", e);
@@ -656,10 +696,10 @@ async fn main() -> Result<()> {
         info!("Received reload signal - reloading configuration");
         // TODO: Implement config reload
     });
-    
+
     let mut signal_rx = signal_handler.subscribe();
     let server_for_shutdown = Arc::clone(&server);
-    
+
     tokio::spawn(async move {
         while let Ok(signal) = signal_rx.recv().await {
             match signal {
@@ -685,7 +725,7 @@ async fn main() -> Result<()> {
             }
         }
     });
-    
+
     // Start signal handler
     tokio::spawn(async move {
         signal_handler.listen().await;
@@ -693,7 +733,7 @@ async fn main() -> Result<()> {
 
     // Run server
     server.run().await?;
-    
+
     info!("Triglav server stopped");
 
     Ok(())

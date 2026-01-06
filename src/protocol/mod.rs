@@ -14,13 +14,13 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 
-mod packet;
-mod message;
 mod codec;
+mod message;
+mod packet;
 
-pub use packet::{Packet, PacketHeader, PacketFlags, PacketType};
-pub use message::{Message, MessageType, ControlMessage, DataMessage};
-pub use codec::{encode_packet, decode_packet, PacketCodec};
+pub use codec::{decode_packet, encode_packet, PacketCodec};
+pub use message::{ControlMessage, DataMessage, Message, MessageType};
+pub use packet::{Packet, PacketFlags, PacketHeader, PacketType};
 
 use crate::PROTOCOL_VERSION;
 

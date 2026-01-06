@@ -86,8 +86,8 @@ impl FlowTuple {
     /// This produces a consistent hash that can be used to select
     /// an uplink, ensuring packets of the same flow use the same path.
     pub fn flow_hash(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         self.src_addr.hash(&mut hasher);
@@ -141,9 +141,9 @@ impl<'a> IpPacket<'a> {
     /// Parse an IP packet from raw bytes.
     pub fn parse(data: &'a [u8]) -> Result<Self> {
         if data.is_empty() {
-            return Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                "Empty packet".into()
-            )));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedPacket("Empty packet".into()),
+            ));
         }
 
         let version = (data[0] >> 4) & 0x0f;
@@ -151,27 +151,30 @@ impl<'a> IpPacket<'a> {
         match version {
             4 => Self::parse_ipv4(data),
             6 => Self::parse_ipv6(data),
-            _ => Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                format!("Unknown IP version: {}", version)
-            ))),
+            _ => Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedPacket(format!(
+                    "Unknown IP version: {}",
+                    version
+                )),
+            )),
         }
     }
 
     /// Parse an IPv4 packet.
     fn parse_ipv4(data: &'a [u8]) -> Result<Self> {
         if data.len() < 20 {
-            return Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                "IPv4 packet too short".into()
-            )));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedPacket("IPv4 packet too short".into()),
+            ));
         }
 
         let ihl = (data[0] & 0x0f) as usize;
         let header_len = ihl * 4;
 
         if data.len() < header_len {
-            return Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                "IPv4 header truncated".into()
-            )));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedPacket("IPv4 header truncated".into()),
+            ));
         }
 
         let total_len = u16::from_be_bytes([data[2], data[3]]) as usize;
@@ -188,13 +191,14 @@ impl<'a> IpPacket<'a> {
                 TransportProtocol::Tcp | TransportProtocol::Udp => {
                     let sport = u16::from_be_bytes([data[header_len], data[header_len + 1]]);
                     let dport = u16::from_be_bytes([data[header_len + 2], data[header_len + 3]]);
-                    
+
                     // For TCP, skip the header (minimum 20 bytes)
                     // For UDP, skip 8 bytes
                     let transport_header = match protocol {
                         TransportProtocol::Tcp => {
                             if data.len() >= header_len + 12 {
-                                let data_offset = ((data[header_len + 12] >> 4) & 0x0f) as usize * 4;
+                                let data_offset =
+                                    ((data[header_len + 12] >> 4) & 0x0f) as usize * 4;
                                 data_offset
                             } else {
                                 20
@@ -203,7 +207,7 @@ impl<'a> IpPacket<'a> {
                         TransportProtocol::Udp => 8,
                         _ => 0,
                     };
-                    
+
                     (Some(sport), Some(dport), header_len + transport_header)
                 }
                 _ => (None, None, header_len),
@@ -230,9 +234,9 @@ impl<'a> IpPacket<'a> {
     /// Parse an IPv6 packet.
     fn parse_ipv6(data: &'a [u8]) -> Result<Self> {
         if data.len() < 40 {
-            return Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                "IPv6 packet too short".into()
-            )));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedPacket("IPv6 packet too short".into()),
+            ));
         }
 
         let payload_len = u16::from_be_bytes([data[4], data[5]]) as usize;
@@ -256,11 +260,12 @@ impl<'a> IpPacket<'a> {
                 TransportProtocol::Tcp | TransportProtocol::Udp => {
                     let sport = u16::from_be_bytes([data[header_len], data[header_len + 1]]);
                     let dport = u16::from_be_bytes([data[header_len + 2], data[header_len + 3]]);
-                    
+
                     let transport_header = match protocol {
                         TransportProtocol::Tcp => {
                             if data.len() >= header_len + 12 {
-                                let data_offset = ((data[header_len + 12] >> 4) & 0x0f) as usize * 4;
+                                let data_offset =
+                                    ((data[header_len + 12] >> 4) & 0x0f) as usize * 4;
                                 data_offset
                             } else {
                                 20
@@ -269,7 +274,7 @@ impl<'a> IpPacket<'a> {
                         TransportProtocol::Udp => 8,
                         _ => 0,
                     };
-                    
+
                     (Some(sport), Some(dport), header_len + transport_header)
                 }
                 _ => (None, None, header_len),
@@ -332,7 +337,10 @@ impl<'a> IpPacket<'a> {
             }
         }
 
-        Ok((TransportProtocol::from_protocol_number(current_header), offset))
+        Ok((
+            TransportProtocol::from_protocol_number(current_header),
+            offset,
+        ))
     }
 
     /// Get the flow tuple for this packet.
@@ -405,17 +413,22 @@ impl<'a> IpPacketMut<'a> {
     /// Create a mutable packet wrapper.
     pub fn new(data: &'a mut [u8]) -> Result<Self> {
         if data.is_empty() {
-            return Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                "Empty packet".into()
-            )));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedPacket("Empty packet".into()),
+            ));
         }
 
         let version = match (data[0] >> 4) & 0x0f {
             4 => IpVersion::V4,
             6 => IpVersion::V6,
-            v => return Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                format!("Unknown IP version: {}", v)
-            ))),
+            v => {
+                return Err(Error::Protocol(
+                    crate::error::ProtocolError::MalformedPacket(format!(
+                        "Unknown IP version: {}",
+                        v
+                    )),
+                ))
+            }
         };
 
         let header_len = match version {
@@ -442,9 +455,9 @@ impl<'a> IpPacketMut<'a> {
                 self.data[8..24].copy_from_slice(&ipv6.octets());
                 Ok(())
             }
-            _ => Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                "Address version mismatch".into()
-            ))),
+            _ => Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedPacket("Address version mismatch".into()),
+            )),
         }
     }
 
@@ -460,9 +473,9 @@ impl<'a> IpPacketMut<'a> {
                 self.data[24..40].copy_from_slice(&ipv6.octets());
                 Ok(())
             }
-            _ => Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                "Address version mismatch".into()
-            ))),
+            _ => Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedPacket("Address version mismatch".into()),
+            )),
         }
     }
 
@@ -519,9 +532,9 @@ impl<'a> IpPacketMut<'a> {
                 let proto = self.data[9];
                 let ihl = ((self.data[0] & 0x0f) as usize) * 4;
                 match proto {
-                    6 => (TransportProtocol::Tcp, ihl + 16),  // TCP checksum at offset 16
+                    6 => (TransportProtocol::Tcp, ihl + 16), // TCP checksum at offset 16
                     17 => (TransportProtocol::Udp, ihl + 6), // UDP checksum at offset 6
-                    _ => return Ok(()), // No checksum to update
+                    _ => return Ok(()),                      // No checksum to update
                 }
             }
             IpVersion::V6 => {
@@ -539,10 +552,8 @@ impl<'a> IpPacketMut<'a> {
         }
 
         // Get old checksum
-        let old_checksum = u16::from_be_bytes([
-            self.data[checksum_offset],
-            self.data[checksum_offset + 1],
-        ]);
+        let old_checksum =
+            u16::from_be_bytes([self.data[checksum_offset], self.data[checksum_offset + 1]]);
 
         // Skip if checksum is zero (UDP optional checksum)
         if protocol == TransportProtocol::Udp && old_checksum == 0 {
@@ -635,7 +646,7 @@ mod tests {
     #[test]
     fn test_parse_ipv4() {
         let packet = IpPacket::parse(IPV4_TCP_SYN).unwrap();
-        
+
         assert_eq!(packet.version, IpVersion::V4);
         assert_eq!(packet.header_len, 20);
         assert_eq!(packet.protocol, TransportProtocol::Tcp);
@@ -650,7 +661,7 @@ mod tests {
     fn test_flow_tuple() {
         let packet = IpPacket::parse(IPV4_TCP_SYN).unwrap();
         let flow = packet.flow_tuple();
-        
+
         assert_eq!(flow.src_addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
         assert_eq!(flow.dst_addr, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         assert_eq!(flow.src_port, 1024);
@@ -662,12 +673,12 @@ mod tests {
     fn test_flow_hash_consistency() {
         let packet = IpPacket::parse(IPV4_TCP_SYN).unwrap();
         let flow = packet.flow_tuple();
-        
+
         // Same flow should produce same hash
         let hash1 = flow.flow_hash();
         let hash2 = flow.flow_hash();
         assert_eq!(hash1, hash2);
-        
+
         // Reverse flow should produce different hash
         let reverse = flow.reverse();
         let hash3 = reverse.flow_hash();
@@ -684,6 +695,9 @@ mod tests {
     fn test_transport_protocol() {
         assert_eq!(TransportProtocol::Tcp.protocol_number(), 6);
         assert_eq!(TransportProtocol::Udp.protocol_number(), 17);
-        assert_eq!(TransportProtocol::from_protocol_number(6), TransportProtocol::Tcp);
+        assert_eq!(
+            TransportProtocol::from_protocol_number(6),
+            TransportProtocol::Tcp
+        );
     }
 }

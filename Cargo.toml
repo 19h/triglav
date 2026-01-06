@@ -1,6 +1,6 @@
 [package]
 name = "triglav"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Kenan Sulayman <triglav@int.mov"]
 description = "High-performance multi-path networking tool with intelligent uplink management"

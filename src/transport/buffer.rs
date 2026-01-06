@@ -1,7 +1,7 @@
 //! Buffer management for high-performance packet processing.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crossbeam_queue::ArrayQueue;
 

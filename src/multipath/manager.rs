@@ -1,8 +1,8 @@
 //! Multi-path connection manager.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -10,17 +10,16 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
+use super::aggregator::{AggregationMode, AggregatorConfig, BandwidthAggregator};
+use super::throughput::{ThroughputConfig, ThroughputOptimizer};
+use super::{calculate_flow_hash, FlowId, PathDiscovery, PathDiscoveryConfig};
 use super::{Scheduler, SchedulerConfig, Uplink, UplinkConfig};
-use super::{FlowId, PathDiscovery, PathDiscoveryConfig, calculate_flow_hash};
-use super::throughput::{ThroughputOptimizer, ThroughputConfig};
-use super::aggregator::{BandwidthAggregator, AggregatorConfig, AggregationMode};
-use crate::crypto::{NoiseSession, KeyPair, PublicKey};
+use crate::crypto::{KeyPair, NoiseSession, PublicKey};
 use crate::error::{Error, Result};
-use crate::protocol::{Packet, PacketType, PacketFlags};
-use crate::transport::{Transport, TransportConfig, connect};
+use crate::protocol::{Packet, PacketFlags, PacketType};
+use crate::transport::{connect, Transport, TransportConfig};
 use crate::types::{
-    ConnectionId, ConnectionState, SequenceNumber, SessionId,
-    TrafficStats, UplinkHealth, UplinkId,
+    ConnectionId, ConnectionState, SequenceNumber, SessionId, TrafficStats, UplinkHealth, UplinkId,
 };
 use std::net::IpAddr;
 
@@ -106,18 +105,40 @@ pub struct MultipathConfig {
     pub aggregator: AggregatorConfig,
 }
 
-fn default_throughput_optimization() -> bool { true }
-fn default_bandwidth_probe_interval() -> Duration { Duration::from_secs(5) }
-fn default_aggregation_mode() -> AggregationMode { AggregationMode::None }
+fn default_throughput_optimization() -> bool {
+    true
+}
+fn default_bandwidth_probe_interval() -> Duration {
+    Duration::from_secs(5)
+}
+fn default_aggregation_mode() -> AggregationMode {
+    AggregationMode::None
+}
 
-fn default_max_uplinks() -> usize { 16 }
-fn default_retries() -> u32 { 3 }
-fn default_retry_delay() -> Duration { Duration::from_millis(100) }
-fn default_health_interval() -> Duration { Duration::from_secs(1) }
-fn default_path_discovery_interval() -> Duration { Duration::from_secs(60) }
-fn default_path_max_age() -> Duration { Duration::from_secs(300) }
-fn default_dedup() -> bool { true }
-fn default_dedup_window() -> usize { 1000 }
+fn default_max_uplinks() -> usize {
+    16
+}
+fn default_retries() -> u32 {
+    3
+}
+fn default_retry_delay() -> Duration {
+    Duration::from_millis(100)
+}
+fn default_health_interval() -> Duration {
+    Duration::from_secs(1)
+}
+fn default_path_discovery_interval() -> Duration {
+    Duration::from_secs(60)
+}
+fn default_path_max_age() -> Duration {
+    Duration::from_secs(300)
+}
+fn default_dedup() -> bool {
+    true
+}
+fn default_dedup_window() -> usize {
+    1000
+}
 
 impl Default for MultipathConfig {
     fn default() -> Self {
@@ -279,7 +300,7 @@ impl MultipathManager {
         let dedup_size = config.dedup_window_size;
         let throughput_optimizer = ThroughputOptimizer::new(config.throughput.clone());
         let aggregator = BandwidthAggregator::new(config.aggregator.clone());
-        
+
         Self {
             scheduler: Scheduler::new(config.scheduler.clone()),
             path_discovery: PathDiscovery::new(config.path_discovery.clone()),
@@ -346,7 +367,8 @@ impl MultipathManager {
 
     /// Get uplink by name.
     pub fn get_uplink_by_name(&self, name: &UplinkId) -> Option<Arc<Uplink>> {
-        self.uplink_ids.get(name)
+        self.uplink_ids
+            .get(name)
             .and_then(|id| self.uplinks.get(&*id).map(|r| r.value().clone()))
     }
 
@@ -364,7 +386,7 @@ impl MultipathManager {
 
         self.uplinks.insert(numeric_id, uplink);
         self.uplink_ids.insert(config.id, numeric_id);
-        
+
         // Register with throughput optimizer
         if self.config.throughput_optimization {
             self.throughput_optimizer.register_uplink(numeric_id);
@@ -377,13 +399,15 @@ impl MultipathManager {
     pub fn remove_uplink(&self, id: u16) -> Option<Arc<Uplink>> {
         if let Some((_, uplink)) = self.uplinks.remove(&id) {
             self.uplink_ids.remove(uplink.id());
-            
+
             // Unregister from throughput optimizer
             if self.config.throughput_optimization {
                 self.throughput_optimizer.unregister_uplink(id);
             }
-            
-            let _ = self.event_tx.send(MultipathEvent::UplinkDisconnected(uplink.id().clone()));
+
+            let _ = self
+                .event_tx
+                .send(MultipathEvent::UplinkDisconnected(uplink.id().clone()));
             Some(uplink)
         } else {
             None
@@ -408,7 +432,9 @@ impl MultipathManager {
         }
 
         // Check if at least one uplink connected
-        let connected = self.uplinks.iter()
+        let connected = self
+            .uplinks
+            .iter()
             .any(|r| r.value().state().connection_state == ConnectionState::Connected);
 
         if connected {
@@ -433,7 +459,8 @@ impl MultipathManager {
             config.remote_addr,
             config.local_addr,
             &self.config.transport,
-        ).await?;
+        )
+        .await?;
 
         // Wrap in Arc for sharing across async operations
         let transport: Arc<dyn Transport> = Arc::from(transport);
@@ -469,19 +496,21 @@ impl MultipathManager {
         let mut buf = vec![0u8; 65536];
         let len = tokio::time::timeout(
             self.config.transport.connect_timeout,
-            transport.recv(&mut buf)
-        ).await
-            .map_err(|_| Error::ConnectionTimeout)?
-            ?;
+            transport.recv(&mut buf),
+        )
+        .await
+        .map_err(|_| Error::ConnectionTimeout)??;
 
         // Decode response packet
         let response_packet = Packet::decode(&buf[..len])?;
 
         if response_packet.header.packet_type != PacketType::Handshake {
-            return Err(Error::Protocol(crate::error::ProtocolError::UnexpectedMessage {
-                expected: "Handshake".into(),
-                got: format!("{:?}", response_packet.header.packet_type),
-            }));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::UnexpectedMessage {
+                    expected: "Handshake".into(),
+                    got: format!("{:?}", response_packet.header.packet_type),
+                },
+            ));
         }
 
         // Process handshake message 2
@@ -489,7 +518,7 @@ impl MultipathManager {
 
         if !noise.is_transport() {
             return Err(Error::Crypto(crate::error::CryptoError::NoiseProtocol(
-                "Handshake did not complete".into()
+                "Handshake did not complete".into(),
             )));
         }
 
@@ -505,7 +534,9 @@ impl MultipathManager {
         // (Dublin Traceroute technique: NAT detection via address comparison)
         self.detect_uplink_nat(uplink, &*transport);
 
-        let _ = self.event_tx.send(MultipathEvent::UplinkConnected(uplink.id().clone()));
+        let _ = self
+            .event_tx
+            .send(MultipathEvent::UplinkConnected(uplink.id().clone()));
 
         Ok(())
     }
@@ -635,39 +666,44 @@ impl MultipathManager {
     /// Distributes packets across ALL uplinks weighted by their bandwidth.
     async fn send_aggregated(&self, data: &[u8]) -> Result<u64> {
         let uplinks = self.uplinks();
-        
+
         // Get next stripe (uplink + sequence)
-        let (uplink_id, agg_seq) = self.aggregator.next_stripe(&uplinks)
+        let (uplink_id, agg_seq) = self
+            .aggregator
+            .next_stripe(&uplinks)
             .ok_or(Error::NoAvailableUplinks)?;
-        
+
         // Use aggregator sequence in packet header for reordering
         let seq = SequenceNumber(agg_seq);
-        
+
         if let Some(uplink) = self.get_uplink(uplink_id) {
             // Apply pacing if enabled
             if self.config.throughput_optimization {
-                let pacing_interval = self.throughput_optimizer.pacing_interval(uplink_id, data.len());
+                let pacing_interval = self
+                    .throughput_optimizer
+                    .pacing_interval(uplink_id, data.len());
                 if pacing_interval > Duration::ZERO {
                     tokio::time::sleep(pacing_interval).await;
                 }
             }
-            
+
             match self.send_on_uplink(&uplink, seq, data).await {
                 Ok(_) => {
                     // Record send with throughput optimizer
                     if self.config.throughput_optimization {
-                        self.throughput_optimizer.record_send(uplink_id, data.len() as u64);
+                        self.throughput_optimizer
+                            .record_send(uplink_id, data.len() as u64);
                     }
-                    
+
                     let mut stats = self.stats.write();
                     stats.bytes_sent += data.len() as u64;
                     stats.packets_sent += 1;
-                    
+
                     Ok(agg_seq)
                 }
                 Err(e) => {
                     uplink.record_failure(&e.to_string());
-                    
+
                     // Try fallback to another uplink
                     self.send_aggregated_fallback(data, uplink_id).await
                 }
@@ -680,7 +716,7 @@ impl MultipathManager {
     /// Fallback when primary stripe uplink fails - try next available.
     async fn send_aggregated_fallback(&self, data: &[u8], failed_uplink: u16) -> Result<u64> {
         let uplinks = self.uplinks();
-        
+
         for uplink in &uplinks {
             if uplink.numeric_id() == failed_uplink {
                 continue;
@@ -688,9 +724,9 @@ impl MultipathManager {
             if !uplink.is_usable() {
                 continue;
             }
-            
+
             let seq = SequenceNumber(self.aggregator.current_seq());
-            
+
             match self.send_on_uplink(uplink, seq, data).await {
                 Ok(_) => {
                     let mut stats = self.stats.write();
@@ -701,7 +737,7 @@ impl MultipathManager {
                 Err(_) => continue,
             }
         }
-        
+
         Err(Error::NoAvailableUplinks)
     }
 
@@ -723,7 +759,9 @@ impl MultipathManager {
                 vec![uplink_id]
             } else {
                 // Bound uplink no longer usable, select new one and update binding
-                let new_selection = self.scheduler.select_for_size(&uplinks, flow_id, Some(data_size));
+                let new_selection =
+                    self.scheduler
+                        .select_for_size(&uplinks, flow_id, Some(data_size));
                 if let (Some(fid), Some(&new_id)) = (flow_id, new_selection.first()) {
                     self.flow_bindings.insert(fid, new_id);
                 }
@@ -731,7 +769,9 @@ impl MultipathManager {
             }
         } else {
             // No binding - select using size-aware scheduling
-            let selection = self.scheduler.select_for_size(&uplinks, flow_id, Some(data_size));
+            let selection = self
+                .scheduler
+                .select_for_size(&uplinks, flow_id, Some(data_size));
             if let (Some(fid), Some(&uplink_id)) = (flow_id, selection.first()) {
                 self.flow_bindings.insert(fid, uplink_id);
             }
@@ -750,21 +790,24 @@ impl MultipathManager {
             if let Some(uplink) = self.get_uplink(*uplink_id) {
                 // Apply pacing if enabled
                 if self.config.throughput_optimization {
-                    let pacing_interval = self.throughput_optimizer.pacing_interval(*uplink_id, data.len());
+                    let pacing_interval = self
+                        .throughput_optimizer
+                        .pacing_interval(*uplink_id, data.len());
                     if pacing_interval > Duration::ZERO {
                         tokio::time::sleep(pacing_interval).await;
                     }
                 }
-                
+
                 match self.send_on_uplink(&uplink, seq, data).await {
                     Ok(_) => {
                         sent = true;
-                        
+
                         // Record send with throughput optimizer
                         if self.config.throughput_optimization {
-                            self.throughput_optimizer.record_send(*uplink_id, data.len() as u64);
+                            self.throughput_optimizer
+                                .record_send(*uplink_id, data.len() as u64);
                         }
-                        
+
                         // For non-redundant strategies, stop after first success
                         if self.config.scheduler.strategy != super::SchedulingStrategy::Redundant {
                             break;
@@ -772,12 +815,18 @@ impl MultipathManager {
                     }
                     Err(e) => {
                         uplink.record_failure(&e.to_string());
-                        
+
                         // Record MTU failure if applicable
-                        if self.config.throughput_optimization && e.to_string().contains("too large") {
-                            self.throughput_optimizer.record_mtu_result(*uplink_id, data.len() as u32, false);
+                        if self.config.throughput_optimization
+                            && e.to_string().contains("too large")
+                        {
+                            self.throughput_optimizer.record_mtu_result(
+                                *uplink_id,
+                                data.len() as u32,
+                                false,
+                            );
                         }
-                        
+
                         last_error = Some(e);
                     }
                 }
@@ -797,17 +846,18 @@ impl MultipathManager {
     }
 
     /// Send packet on a specific uplink.
-    async fn send_on_uplink(&self, uplink: &Uplink, seq: SequenceNumber, data: &[u8]) -> Result<()> {
+    async fn send_on_uplink(
+        &self,
+        uplink: &Uplink,
+        seq: SequenceNumber,
+        data: &[u8],
+    ) -> Result<()> {
         // Encrypt the payload using the uplink's noise session
         let encrypted_payload = uplink.encrypt(data)?;
 
         // Create packet with encrypted payload
-        let mut packet = Packet::data(
-            seq,
-            self.session_id,
-            uplink.numeric_id(),
-            encrypted_payload,
-        )?;
+        let mut packet =
+            Packet::data(seq, self.session_id, uplink.numeric_id(), encrypted_payload)?;
 
         // Mark as encrypted
         packet.set_flag(PacketFlags::ENCRYPTED);
@@ -815,10 +865,11 @@ impl MultipathManager {
         let encoded = packet.encode()?;
 
         // Get transport and send
-        let transport = uplink.get_transport()
-            .ok_or_else(|| Error::Transport(crate::error::TransportError::SendFailed(
-                "no transport".into()
-            )))?;
+        let transport = uplink.get_transport().ok_or_else(|| {
+            Error::Transport(crate::error::TransportError::SendFailed(
+                "no transport".into(),
+            ))
+        })?;
 
         transport.send(&encoded).await?;
         uplink.record_send(encoded.len());
@@ -831,12 +882,15 @@ impl MultipathManager {
         );
 
         // Track pending packet for retry (store original data for potential retransmission)
-        self.pending.insert(seq.0, PendingPacket {
-            packet: Packet::data(seq, self.session_id, uplink.numeric_id(), data.to_vec())?,
-            sent_at: Instant::now(),
-            retries: 0,
-            uplink_id: uplink.numeric_id(),
-        });
+        self.pending.insert(
+            seq.0,
+            PendingPacket {
+                packet: Packet::data(seq, self.session_id, uplink.numeric_id(), data.to_vec())?,
+                sent_at: Instant::now(),
+                retries: 0,
+                uplink_id: uplink.numeric_id(),
+            },
+        );
 
         Ok(())
     }
@@ -849,10 +903,12 @@ impl MultipathManager {
 
         // Verify session
         if packet.header.session_id != self.session_id {
-            return Err(Error::Protocol(crate::error::ProtocolError::InvalidVersion {
-                expected: 0,
-                got: 1,
-            }));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::InvalidVersion {
+                    expected: 0,
+                    got: 1,
+                },
+            ));
         }
 
         // Deduplication using O(1) sliding window
@@ -891,16 +947,15 @@ impl MultipathManager {
                 };
 
                 // Check if aggregation is enabled - use reorder buffer
-                let use_aggregation = !matches!(self.config.aggregation_mode, AggregationMode::None);
-                
+                let use_aggregation =
+                    !matches!(self.config.aggregation_mode, AggregationMode::None);
+
                 if use_aggregation {
                     // Pass through reorder buffer for proper sequencing
-                    let ready_packets = self.aggregator.receive(
-                        packet.header.sequence.0,
-                        payload,
-                        from_uplink,
-                    );
-                    
+                    let ready_packets =
+                        self.aggregator
+                            .receive(packet.header.sequence.0, payload, from_uplink);
+
                     // Return the first ready packet (others will be picked up by poll)
                     // In practice, we'd want to deliver all ready packets
                     if let Some(first) = ready_packets.into_iter().next() {
@@ -910,7 +965,9 @@ impl MultipathManager {
                             packet.header.uplink_id,
                             first.clone(),
                         )?;
-                        let _ = self.event_tx.send(MultipathEvent::PacketReceived(decrypted_packet));
+                        let _ = self
+                            .event_tx
+                            .send(MultipathEvent::PacketReceived(decrypted_packet));
                         return Ok(Some(first));
                     } else {
                         // Packet buffered, waiting for earlier packets
@@ -925,7 +982,9 @@ impl MultipathManager {
                     payload.clone(),
                 )?;
 
-                let _ = self.event_tx.send(MultipathEvent::PacketReceived(decrypted_packet));
+                let _ = self
+                    .event_tx
+                    .send(MultipathEvent::PacketReceived(decrypted_packet));
                 Ok(Some(payload))
             }
             PacketType::Ack => {
@@ -965,7 +1024,9 @@ impl MultipathManager {
         let mut buf = vec![0u8; 65536];
 
         // Try to receive from any connected uplink
-        let uplinks: Vec<_> = self.uplinks.iter()
+        let uplinks: Vec<_> = self
+            .uplinks
+            .iter()
             .filter(|r| r.value().is_usable())
             .map(|r| r.value().clone())
             .collect();
@@ -978,13 +1039,14 @@ impl MultipathManager {
         // A more sophisticated approach would use select! to wait on all simultaneously
         for uplink in &uplinks {
             if let Some(transport) = uplink.get_transport() {
-                match tokio::time::timeout(
-                    Duration::from_millis(100),
-                    transport.recv(&mut buf)
-                ).await {
+                match tokio::time::timeout(Duration::from_millis(100), transport.recv(&mut buf))
+                    .await
+                {
                     Ok(Ok(len)) => {
                         // Decode and handle the packet
-                        if let Some(payload) = self.handle_packet(&buf[..len], uplink.numeric_id())? {
+                        if let Some(payload) =
+                            self.handle_packet(&buf[..len], uplink.numeric_id())?
+                        {
                             return Ok((payload, uplink.numeric_id()));
                         }
                     }
@@ -1016,7 +1078,9 @@ impl MultipathManager {
                 }
 
                 // Get usable uplinks
-                let uplinks: Vec<_> = manager.uplinks.iter()
+                let uplinks: Vec<_> = manager
+                    .uplinks
+                    .iter()
                     .filter(|r| r.value().is_usable())
                     .map(|r| r.value().clone())
                     .collect();
@@ -1031,8 +1095,10 @@ impl MultipathManager {
                     if let Some(transport) = uplink.get_transport() {
                         match tokio::time::timeout(
                             Duration::from_millis(50),
-                            transport.recv(&mut buf)
-                        ).await {
+                            transport.recv(&mut buf),
+                        )
+                        .await
+                        {
                             Ok(Ok(len)) => {
                                 match manager.handle_packet(&buf[..len], uplink.numeric_id()) {
                                     Ok(Some(payload)) => {
@@ -1075,22 +1141,28 @@ impl MultipathManager {
                 let rtt = pending.sent_at.elapsed();
                 let uplink_id = pending.uplink_id;
                 let packet_size = pending.packet.payload.len() as u64;
-                
+
                 if let Some(uplink) = self.get_uplink(uplink_id) {
                     uplink.record_rtt(rtt);
-                    
+
                     // Record with throughput optimizer for BBR-style congestion control
                     if self.config.throughput_optimization {
-                        self.throughput_optimizer.record_ack(uplink_id, packet_size, rtt);
-                        
+                        self.throughput_optimizer
+                            .record_ack(uplink_id, packet_size, rtt);
+
                         // Record bandwidth measurement
                         if rtt.as_secs_f64() > 0.0 {
                             let bandwidth = packet_size as f64 / rtt.as_secs_f64();
-                            self.throughput_optimizer.record_bandwidth(uplink_id, bandwidth);
+                            self.throughput_optimizer
+                                .record_bandwidth(uplink_id, bandwidth);
                         }
-                        
+
                         // Record MTU success
-                        self.throughput_optimizer.record_mtu_result(uplink_id, packet_size as u32, true);
+                        self.throughput_optimizer.record_mtu_result(
+                            uplink_id,
+                            packet_size as u32,
+                            true,
+                        );
                     }
                 }
             }
@@ -1104,19 +1176,23 @@ impl MultipathManager {
         if packet.payload.len() >= 8 {
             let probe_or_ts = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
             let payload_size = packet.payload.len() as u64;
-            
+
             // Check if this is a bandwidth probe response
             if self.config.throughput_optimization && payload_size > 64 {
                 // This is likely a bandwidth probe response
                 let probe_id = probe_or_ts;
-                self.throughput_optimizer.record_probe_response(from_uplink, probe_id, payload_size);
-                
+                self.throughput_optimizer.record_probe_response(
+                    from_uplink,
+                    probe_id,
+                    payload_size,
+                );
+
                 if let Some(uplink) = self.get_uplink(from_uplink) {
                     uplink.record_success();
                 }
                 return;
             }
-            
+
             // Regular ping/pong for RTT measurement
             let ping_ts = probe_or_ts;
             let now_us = std::time::SystemTime::now()
@@ -1128,10 +1204,11 @@ impl MultipathManager {
                 let rtt = Duration::from_micros(now_us - ping_ts);
                 if let Some(uplink) = self.get_uplink(from_uplink) {
                     uplink.record_rtt(rtt);
-                    
+
                     // Also record with throughput optimizer
                     if self.config.throughput_optimization {
-                        self.throughput_optimizer.record_ack(from_uplink, payload_size, rtt);
+                        self.throughput_optimizer
+                            .record_ack(from_uplink, payload_size, rtt);
                     }
                 }
             }
@@ -1149,13 +1226,18 @@ impl MultipathManager {
             let pending = entry.value();
             let uplink = self.get_uplink(pending.uplink_id);
 
-            let rto = uplink.as_ref()
-                .map_or(Duration::from_millis(500), |u| Duration::from_millis((u.rtt().as_millis() as u64 * 2).max(100)));
+            let rto = uplink.as_ref().map_or(Duration::from_millis(500), |u| {
+                Duration::from_millis((u.rtt().as_millis() as u64 * 2).max(100))
+            });
 
             if now.duration_since(pending.sent_at) > rto {
                 if pending.retries < self.config.send_retries {
                     // Clone data for retry
-                    to_retry.push((*entry.key(), pending.packet.payload.clone(), pending.uplink_id));
+                    to_retry.push((
+                        *entry.key(),
+                        pending.packet.payload.clone(),
+                        pending.uplink_id,
+                    ));
                 } else {
                     to_fail.push(*entry.key());
                 }
@@ -1174,7 +1256,8 @@ impl MultipathManager {
             let selected = self.scheduler.select(&uplinks, Some(seq));
 
             // Try to find an uplink that's different from the one that failed
-            let new_uplink_id = selected.iter()
+            let new_uplink_id = selected
+                .iter()
                 .find(|&&id| id != old_uplink_id)
                 .copied()
                 .or_else(|| selected.first().copied());
@@ -1182,7 +1265,10 @@ impl MultipathManager {
             if let Some(new_uplink_id) = new_uplink_id {
                 if let Some(uplink) = self.get_uplink(new_uplink_id) {
                     // Actually send the packet through the new uplink
-                    match self.send_on_uplink(&uplink, SequenceNumber(seq), &data).await {
+                    match self
+                        .send_on_uplink(&uplink, SequenceNumber(seq), &data)
+                        .await
+                    {
                         Ok(_) => {
                             tracing::debug!(
                                 seq = seq,
@@ -1226,7 +1312,11 @@ impl MultipathManager {
                     uplink.record_loss();
                 }
 
-                tracing::warn!(seq = seq, "Packet failed after {} retries", self.config.send_retries);
+                tracing::warn!(
+                    seq = seq,
+                    "Packet failed after {} retries",
+                    self.config.send_retries
+                );
                 let _ = self.event_tx.send(MultipathEvent::SendFailed(seq));
             }
         }
@@ -1268,29 +1358,26 @@ impl MultipathManager {
 
         tokio::spawn(async move {
             let mut retry_interval = tokio::time::interval(Duration::from_millis(100));
-            let mut maintenance_interval = tokio::time::interval(manager.config.health_check_interval);
+            let mut maintenance_interval =
+                tokio::time::interval(manager.config.health_check_interval);
             let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
 
             // Path discovery interval (Dublin Traceroute: periodic ECMP probing)
             let path_discovery_enabled = !manager.config.path_discovery_interval.is_zero();
-            let mut path_discovery_interval = tokio::time::interval(
-                if path_discovery_enabled {
-                    manager.config.path_discovery_interval
-                } else {
-                    Duration::from_secs(3600) // Fallback, won't trigger if disabled
-                }
-            );
+            let mut path_discovery_interval = tokio::time::interval(if path_discovery_enabled {
+                manager.config.path_discovery_interval
+            } else {
+                Duration::from_secs(3600) // Fallback, won't trigger if disabled
+            });
 
             // Bandwidth probing interval for throughput optimization
-            let bandwidth_probe_enabled = manager.config.throughput_optimization 
-                && manager.config.throughput.probing_enabled;
-            let mut bandwidth_probe_interval = tokio::time::interval(
-                if bandwidth_probe_enabled {
-                    manager.config.bandwidth_probe_interval
-                } else {
-                    Duration::from_secs(3600)
-                }
-            );
+            let bandwidth_probe_enabled =
+                manager.config.throughput_optimization && manager.config.throughput.probing_enabled;
+            let mut bandwidth_probe_interval = tokio::time::interval(if bandwidth_probe_enabled {
+                manager.config.bandwidth_probe_interval
+            } else {
+                Duration::from_secs(3600)
+            });
 
             loop {
                 if *manager.state.read() != ConnectionState::Connected {
@@ -1334,20 +1421,20 @@ impl MultipathManager {
     /// Run active bandwidth probes on uplinks that need probing.
     async fn run_bandwidth_probes(&self) {
         let uplinks_to_probe = self.throughput_optimizer.uplinks_needing_probe();
-        
+
         for uplink_id in uplinks_to_probe {
             if let Some(uplink) = self.get_uplink(uplink_id) {
                 if let Some(transport) = uplink.get_transport() {
                     let probe_id = self.next_probe_id.fetch_add(1, Ordering::SeqCst);
                     let probe_size = self.config.throughput.probe_size;
-                    
+
                     // Create probe packet (ping with larger payload for bandwidth estimation)
                     let seq = SequenceNumber(self.next_seq.fetch_add(1, Ordering::SeqCst));
-                    
+
                     // Use a ping packet with a larger probe payload
                     let mut probe_payload = vec![0u8; probe_size];
                     probe_payload[0..8].copy_from_slice(&probe_id.to_be_bytes());
-                    
+
                     if let Ok(mut probe_packet) = Packet::new(
                         PacketType::Ping,
                         seq,
@@ -1356,16 +1443,17 @@ impl MultipathManager {
                         probe_payload,
                     ) {
                         probe_packet.set_flag(PacketFlags::ENCRYPTED);
-                        
+
                         if let Ok(encoded) = probe_packet.encode() {
                             // Record probe sent
-                            self.throughput_optimizer.record_probe_sent(uplink_id, probe_id);
-                            
+                            self.throughput_optimizer
+                                .record_probe_sent(uplink_id, probe_id);
+
                             // Send probe burst for more accurate measurement
                             for _ in 0..self.config.throughput.probe_burst_count {
                                 let _ = transport.send(&encoded).await;
                             }
-                            
+
                             tracing::trace!(
                                 uplink_id = uplink_id,
                                 probe_id = probe_id,
@@ -1388,7 +1476,9 @@ impl MultipathManager {
             return;
         }
 
-        let uplinks: Vec<_> = self.uplinks.iter()
+        let uplinks: Vec<_> = self
+            .uplinks
+            .iter()
             .filter(|r| r.value().is_usable())
             .map(|r| r.value().clone())
             .collect();
@@ -1414,7 +1504,10 @@ impl MultipathManager {
                 // Send a sample of probes to different TTLs
                 // Full probing would require raw socket access for ICMP;
                 // here we record the intent and allow external probe injection
-                for (ttl, flow_id, marker) in probes.iter().take(self.config.path_discovery.num_paths as usize) {
+                for (ttl, flow_id, marker) in probes
+                    .iter()
+                    .take(self.config.path_discovery.num_paths as usize)
+                {
                     // Record that we're probing this path
                     // Actual probe transmission depends on transport capability
                     tracing::trace!(
@@ -1427,10 +1520,11 @@ impl MultipathManager {
                 }
 
                 // Update NAT state from path discovery results
-                self.path_discovery.update_nat_state(uplink.numeric_id(), |state| {
-                    // Sync with uplink's NAT state
-                    state.set_nat_type(uplink.nat_type());
-                });
+                self.path_discovery
+                    .update_nat_state(uplink.numeric_id(), |state| {
+                        // Sync with uplink's NAT state
+                        state.set_nat_type(uplink.nat_type());
+                    });
 
                 // Emit path discovery event with current diversity metrics
                 let diversity = self.path_discovery.get_diversity(remote_addr);
@@ -1480,7 +1574,9 @@ impl MultipathManager {
 
         // Close all uplinks
         for entry in &self.uplinks {
-            entry.value().set_connection_state(ConnectionState::Disconnecting);
+            entry
+                .value()
+                .set_connection_state(ConnectionState::Disconnecting);
         }
 
         self.pending.clear();
@@ -1506,7 +1602,10 @@ impl MultipathManager {
     }
 
     /// Get effective throughput score for an uplink.
-    pub fn effective_throughput(&self, uplink_id: u16) -> Option<super::throughput::EffectiveThroughput> {
+    pub fn effective_throughput(
+        &self,
+        uplink_id: u16,
+    ) -> Option<super::throughput::EffectiveThroughput> {
         self.get_uplink(uplink_id)
             .map(|u| self.throughput_optimizer.effective_throughput(&u))
     }
@@ -1514,14 +1613,13 @@ impl MultipathManager {
     /// Select the best uplink for a transfer of given size.
     /// Considers both bandwidth and latency to find the fastest path.
     pub fn best_uplink_for_size(&self, size_bytes: u64) -> Option<u16> {
-        self.throughput_optimizer.best_for_size(&self.uplinks(), size_bytes)
+        self.throughput_optimizer
+            .best_for_size(&self.uplinks(), size_bytes)
     }
 
     /// Get quality summary.
     pub fn quality_summary(&self) -> QualitySummary {
-        let uplinks: Vec<_> = self.uplinks.iter()
-            .map(|r| r.value().clone())
-            .collect();
+        let uplinks: Vec<_> = self.uplinks.iter().map(|r| r.value().clone()).collect();
 
         let usable = uplinks.iter().filter(|u| u.is_usable()).count();
         let total = uplinks.len();
@@ -1540,7 +1638,8 @@ impl MultipathManager {
             sum / uplinks.len() as f64
         };
 
-        let total_bandwidth = uplinks.iter()
+        let total_bandwidth = uplinks
+            .iter()
             .filter(|u| u.is_usable())
             .map(|u| u.bandwidth())
             .fold(crate::types::Bandwidth::ZERO, |acc, b| {
@@ -1591,8 +1690,12 @@ impl MultipathManager {
         }
 
         let protocol = data[9];
-        let src_ip = IpAddr::V4(std::net::Ipv4Addr::new(data[12], data[13], data[14], data[15]));
-        let dst_ip = IpAddr::V4(std::net::Ipv4Addr::new(data[16], data[17], data[18], data[19]));
+        let src_ip = IpAddr::V4(std::net::Ipv4Addr::new(
+            data[12], data[13], data[14], data[15],
+        ));
+        let dst_ip = IpAddr::V4(std::net::Ipv4Addr::new(
+            data[16], data[17], data[18], data[19],
+        ));
 
         // Extract ports for TCP (6) and UDP (17)
         let (src_port, dst_port) = if (protocol == 6 || protocol == 17) && data.len() >= ihl + 4 {
@@ -1627,13 +1730,14 @@ impl MultipathManager {
         // Extract ports for TCP (6) and UDP (17)
         // Note: This is simplified and doesn't handle extension headers
         let header_len = 40;
-        let (src_port, dst_port, protocol) = if (next_header == 6 || next_header == 17) && data.len() >= header_len + 4 {
-            let sport = u16::from_be_bytes([data[header_len], data[header_len + 1]]);
-            let dport = u16::from_be_bytes([data[header_len + 2], data[header_len + 3]]);
-            (sport, dport, next_header)
-        } else {
-            (0, 0, next_header)
-        };
+        let (src_port, dst_port, protocol) =
+            if (next_header == 6 || next_header == 17) && data.len() >= header_len + 4 {
+                let sport = u16::from_be_bytes([data[header_len], data[header_len + 1]]);
+                let dport = u16::from_be_bytes([data[header_len + 2], data[header_len + 3]]);
+                (sport, dport, next_header)
+            } else {
+                (0, 0, next_header)
+            };
 
         let hash = calculate_flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
         Some(u64::from(hash))
@@ -1646,7 +1750,8 @@ impl MultipathManager {
 
     /// Get uplinks that are not behind NAT (useful for peer-to-peer connections).
     pub fn non_natted_uplinks(&self) -> Vec<Arc<Uplink>> {
-        self.uplinks.iter()
+        self.uplinks
+            .iter()
             .filter(|r| r.value().is_usable() && !r.value().is_natted())
             .map(|r| r.value().clone())
             .collect()
@@ -1654,7 +1759,8 @@ impl MultipathManager {
 
     /// Get NAT type summary for all uplinks.
     pub fn nat_summary(&self) -> Vec<(UplinkId, super::nat::NatType, bool)> {
-        self.uplinks.iter()
+        self.uplinks
+            .iter()
             .map(|r| {
                 let uplink = r.value();
                 (uplink.id().clone(), uplink.nat_type(), uplink.is_natted())
@@ -1672,11 +1778,13 @@ impl MultipathManager {
         }
 
         // Separate uplinks by NAT status
-        let non_natted: Vec<_> = uplinks.iter()
+        let non_natted: Vec<_> = uplinks
+            .iter()
             .filter(|u| u.is_usable() && !u.is_natted())
             .collect();
 
-        let natted: Vec<_> = uplinks.iter()
+        let natted: Vec<_> = uplinks
+            .iter()
             .filter(|u| u.is_usable() && u.is_natted())
             .collect();
 
@@ -1694,10 +1802,9 @@ impl MultipathManager {
 
         // Fall back to NATted uplinks
         if !natted.is_empty() {
-            let selected = self.scheduler.select(
-                &natted.into_iter().cloned().collect::<Vec<_>>(),
-                flow_id,
-            );
+            let selected = self
+                .scheduler
+                .select(&natted.into_iter().cloned().collect::<Vec<_>>(), flow_id);
             if !selected.is_empty() {
                 return Some(selected[0]);
             }
@@ -1772,9 +1879,13 @@ impl MultipathManager {
 
     /// Cleanup stale flow bindings (for flows whose uplinks are no longer usable).
     pub fn cleanup_stale_flows(&self) {
-        let stale: Vec<u64> = self.flow_bindings.iter()
+        let stale: Vec<u64> = self
+            .flow_bindings
+            .iter()
             .filter(|entry| {
-                !self.get_uplink(*entry.value()).is_some_and(|u| u.is_usable())
+                !self
+                    .get_uplink(*entry.value())
+                    .is_some_and(|u| u.is_usable())
             })
             .map(|entry| *entry.key())
             .collect();
@@ -1838,10 +1949,10 @@ mod tests {
         assert!(!window.is_duplicate(3));
         // Window full: [1, 2, 3]
         assert!(!window.is_duplicate(4)); // Pushes out 1
-        // Window now: [2, 3, 4]
+                                          // Window now: [2, 3, 4]
         assert!(!window.is_duplicate(1)); // 1 is no longer in window, so not duplicate
-        assert!(window.is_duplicate(3));  // Still in window
-        assert!(window.is_duplicate(4));  // Still in window
+        assert!(window.is_duplicate(3)); // Still in window
+        assert!(window.is_duplicate(4)); // Still in window
     }
 
     #[test]

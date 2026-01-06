@@ -370,14 +370,25 @@ async fn test_symmetric_paths_distribution() {
     println!("\n=== Symmetric Paths Distribution ===");
     println!("Proxy 1: recv={}, sent={}", p1_recv, p1_sent);
     println!("Proxy 2: recv={}, sent={}", p2_recv, p2_sent);
-    println!("Server received: {} packets, {} bytes", 
-             server.total_packets(), server.total_bytes());
+    println!(
+        "Server received: {} packets, {} bytes",
+        server.total_packets(),
+        server.total_bytes()
+    );
     println!("Server unique sources: {}", server.unique_sources());
 
     // Both paths should receive roughly equal traffic
-    assert!(p1_recv >= 40, "Proxy 1 should receive ~50 packets, got {}", p1_recv);
-    assert!(p2_recv >= 40, "Proxy 2 should receive ~50 packets, got {}", p2_recv);
-    
+    assert!(
+        p1_recv >= 40,
+        "Proxy 1 should receive ~50 packets, got {}",
+        p1_recv
+    );
+    assert!(
+        p2_recv >= 40,
+        "Proxy 2 should receive ~50 packets, got {}",
+        p2_recv
+    );
+
     // Server should see traffic from both proxy addresses
     assert!(server.unique_sources() >= 2, "Server should see 2 sources");
 
@@ -432,10 +443,16 @@ async fn test_asymmetric_latency_paths() {
     let start = Instant::now();
     for i in 0..25 {
         let msg = format!("FAST:{:04}", i);
-        fast_client.send_to(msg.as_bytes(), fast_addr).await.unwrap();
-        
+        fast_client
+            .send_to(msg.as_bytes(), fast_addr)
+            .await
+            .unwrap();
+
         let msg = format!("SLOW:{:04}", i);
-        slow_client.send_to(msg.as_bytes(), slow_addr).await.unwrap();
+        slow_client
+            .send_to(msg.as_bytes(), slow_addr)
+            .await
+            .unwrap();
     }
     let send_time = start.elapsed();
 
@@ -509,10 +526,16 @@ async fn test_lossy_path() {
     // Send 100 packets through each
     for i in 0..100 {
         let msg = format!("GOOD:{:04}", i);
-        good_client.send_to(msg.as_bytes(), good_addr).await.unwrap();
-        
+        good_client
+            .send_to(msg.as_bytes(), good_addr)
+            .await
+            .unwrap();
+
         let msg = format!("LOSS:{:04}", i);
-        lossy_client.send_to(msg.as_bytes(), lossy_addr).await.unwrap();
+        lossy_client
+            .send_to(msg.as_bytes(), lossy_addr)
+            .await
+            .unwrap();
     }
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -525,7 +548,10 @@ async fn test_lossy_path() {
 
     println!("\n=== Lossy Path Test ===");
     println!("Good path: recv={}, sent={}", good_recv, good_sent);
-    println!("Lossy path: recv={}, sent={}, dropped={}", lossy_recv, lossy_sent, lossy_drop);
+    println!(
+        "Lossy path: recv={}, sent={}, dropped={}",
+        lossy_recv, lossy_sent, lossy_drop
+    );
     println!("Server total: {} packets", server.total_packets());
 
     // Good path should forward almost all
@@ -533,7 +559,7 @@ async fn test_lossy_path() {
 
     // Lossy path should drop some (10% loss rate)
     assert!(lossy_drop > 0, "Lossy path should drop some packets");
-    
+
     // With 10% loss, expect 5-20 drops on average
     let loss_rate = lossy_drop as f64 / lossy_recv as f64;
     assert!(
@@ -791,9 +817,15 @@ async fn test_jitter_reordering() {
     for i in 0..50 {
         let msg = format!("SEQ:{:04}", i);
         if i % 2 == 0 {
-            jittery_client.send_to(msg.as_bytes(), jittery_addr).await.unwrap();
+            jittery_client
+                .send_to(msg.as_bytes(), jittery_addr)
+                .await
+                .unwrap();
         } else {
-            stable_client.send_to(msg.as_bytes(), stable_addr).await.unwrap();
+            stable_client
+                .send_to(msg.as_bytes(), stable_addr)
+                .await
+                .unwrap();
         }
         // Small delay to maintain send order
         tokio::time::sleep(Duration::from_millis(2)).await;
@@ -848,14 +880,11 @@ async fn test_rtt_measurement() {
     for i in 0..20 {
         let msg = format!("PING:{}", i);
         let start = Instant::now();
-        
+
         client.send_to(msg.as_bytes(), proxy_addr).await.unwrap();
-        
+
         let mut buf = [0u8; 1024];
-        match tokio::time::timeout(
-            Duration::from_secs(1),
-            client.recv_from(&mut buf),
-        ).await {
+        match tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf)).await {
             Ok(Ok(_)) => {
                 rtts.push(start.elapsed());
             }

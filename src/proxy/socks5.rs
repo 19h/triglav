@@ -8,8 +8,8 @@
 //! - Domain name resolution
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -129,10 +129,12 @@ impl Socks5Server {
     pub async fn run(&self) -> Result<()> {
         let listener = TcpListener::bind(self.config.listen_addr)
             .await
-            .map_err(|e| Error::Transport(crate::error::TransportError::BindFailed {
-                addr: self.config.listen_addr,
-                reason: e.to_string(),
-            }))?;
+            .map_err(|e| {
+                Error::Transport(crate::error::TransportError::BindFailed {
+                    addr: self.config.listen_addr,
+                    reason: e.to_string(),
+                })
+            })?;
 
         info!("SOCKS5 proxy listening on {}", self.config.listen_addr);
 
@@ -202,36 +204,43 @@ impl Socks5Server {
     async fn handle_auth(stream: &mut TcpStream, config: &Socks5Config) -> Result<()> {
         // Read version and number of methods
         let mut buf = [0u8; 2];
-        stream.read_exact(&mut buf).await
-            .map_err(Error::Io)?;
+        stream.read_exact(&mut buf).await.map_err(Error::Io)?;
 
         if buf[0] != SOCKS_VERSION {
-            return Err(Error::Protocol(crate::error::ProtocolError::InvalidVersion {
-                expected: SOCKS_VERSION,
-                got: buf[0],
-            }));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::InvalidVersion {
+                    expected: SOCKS_VERSION,
+                    got: buf[0],
+                },
+            ));
         }
 
         let nmethods = buf[1] as usize;
         let mut methods = vec![0u8; nmethods];
-        stream.read_exact(&mut methods).await
-            .map_err(Error::Io)?;
+        stream.read_exact(&mut methods).await.map_err(Error::Io)?;
 
         // Select authentication method
         let selected_method = if config.allow_no_auth && methods.contains(&AUTH_NONE) {
             AUTH_NONE
-        } else if config.username.is_some() && config.password.is_some() && methods.contains(&AUTH_PASSWORD) {
+        } else if config.username.is_some()
+            && config.password.is_some()
+            && methods.contains(&AUTH_PASSWORD)
+        {
             AUTH_PASSWORD
         } else {
             AUTH_NO_ACCEPTABLE
         };
 
         // Send selected method
-        stream.write_all(&[SOCKS_VERSION, selected_method]).await
+        stream
+            .write_all(&[SOCKS_VERSION, selected_method])
+            .await
             .map_err(Error::Io)?;
 
         if selected_method == AUTH_NO_ACCEPTABLE {
-            return Err(Error::Authentication("No acceptable authentication method".into()));
+            return Err(Error::Authentication(
+                "No acceptable authentication method".into(),
+            ));
         }
 
         // Handle password authentication if selected
@@ -268,8 +277,14 @@ impl Socks5Server {
         let username_str = String::from_utf8_lossy(&username);
         let password_str = String::from_utf8_lossy(&password);
 
-        let valid = config.username.as_ref().is_some_and(|u| u == &*username_str)
-            && config.password.as_ref().is_some_and(|p| p == &*password_str);
+        let valid = config
+            .username
+            .as_ref()
+            .is_some_and(|u| u == &*username_str)
+            && config
+                .password
+                .as_ref()
+                .is_some_and(|p| p == &*password_str);
 
         // Send auth result
         let status = u8::from(!valid);
@@ -289,17 +304,21 @@ impl Socks5Server {
         stream.read_exact(&mut header).await.map_err(Error::Io)?;
 
         if header[0] != SOCKS_VERSION {
-            return Err(Error::Protocol(crate::error::ProtocolError::InvalidVersion {
-                expected: SOCKS_VERSION,
-                got: header[0],
-            }));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::InvalidVersion {
+                    expected: SOCKS_VERSION,
+                    got: header[0],
+                },
+            ));
         }
 
         let cmd = header[1];
         let atyp = header[3];
 
         if cmd != CMD_CONNECT {
-            return Err(Error::Protocol(crate::error::ProtocolError::InvalidMessageType(cmd)));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::InvalidMessageType(cmd),
+            ));
         }
 
         // Read address based on type
@@ -317,7 +336,10 @@ impl Socks5Server {
                 stream.read_exact(&mut len_buf).await.map_err(Error::Io)?;
                 let len = len_buf[0] as usize;
                 let mut domain_buf = vec![0u8; len];
-                stream.read_exact(&mut domain_buf).await.map_err(Error::Io)?;
+                stream
+                    .read_exact(&mut domain_buf)
+                    .await
+                    .map_err(Error::Io)?;
                 let mut port_buf = [0u8; 2];
                 stream.read_exact(&mut port_buf).await.map_err(Error::Io)?;
                 let port = u16::from_be_bytes(port_buf);
@@ -333,7 +355,9 @@ impl Socks5Server {
                 SocksAddr::Ipv6(Ipv6Addr::from(ip_buf), port)
             }
             _ => {
-                return Err(Error::Protocol(crate::error::ProtocolError::InvalidMessageType(atyp)));
+                return Err(Error::Protocol(
+                    crate::error::ProtocolError::InvalidMessageType(atyp),
+                ));
             }
         };
 
@@ -349,7 +373,10 @@ impl Socks5Server {
     }
 
     /// Connect to target through multipath.
-    async fn connect_through_multipath(target: &SocksAddr, manager: &MultipathManager) -> Result<()> {
+    async fn connect_through_multipath(
+        target: &SocksAddr,
+        manager: &MultipathManager,
+    ) -> Result<()> {
         // Encode the connect request
         let connect_req = format!("CONNECT {target}\r\n");
 

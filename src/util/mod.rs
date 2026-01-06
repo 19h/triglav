@@ -5,13 +5,13 @@ use std::net::{IpAddr, SocketAddr};
 use crate::types::InterfaceType;
 
 // Re-export submodules
+mod connectivity;
 mod interface;
 mod netwatch;
-mod connectivity;
 
+pub use connectivity::*;
 pub use interface::*;
 pub use netwatch::*;
-pub use connectivity::*;
 
 /// Network interface information.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +35,7 @@ impl NetworkInterface {
         // Will be set by gateway detection
         false
     }
-    
+
     /// Get a string representation of the MAC address.
     pub fn mac_string(&self) -> Option<String> {
         self.mac_address.map(|mac| {
@@ -61,15 +61,24 @@ pub fn guess_interface_type(name: &str) -> InterfaceType {
         InterfaceType::Wifi
     } else if name.starts_with("wlan") || name.starts_with("wl") || name.starts_with("wlp") {
         InterfaceType::Wifi
-    } else if name.starts_with("cell") || name.starts_with("pdp") 
-        || name.starts_with("rmnet") || name.starts_with("wwan") 
-        || name.starts_with("usb") {
+    } else if name.starts_with("cell")
+        || name.starts_with("pdp")
+        || name.starts_with("rmnet")
+        || name.starts_with("wwan")
+        || name.starts_with("usb")
+    {
         InterfaceType::Cellular
-    } else if name.starts_with("tun") || name.starts_with("tap") 
-        || name.starts_with("utun") || name.starts_with("wg") {
+    } else if name.starts_with("tun")
+        || name.starts_with("tap")
+        || name.starts_with("utun")
+        || name.starts_with("wg")
+    {
         InterfaceType::Tunnel
-    } else if name.starts_with("bridge") || name.starts_with("br") 
-        || name.starts_with("virbr") || name.starts_with("docker") {
+    } else if name.starts_with("bridge")
+        || name.starts_with("br")
+        || name.starts_with("virbr")
+        || name.starts_with("docker")
+    {
         InterfaceType::Ethernet
     } else if name.starts_with("veth") || name.starts_with("vnet") {
         InterfaceType::Tunnel
@@ -117,7 +126,10 @@ pub fn format_duration(duration: std::time::Duration) -> String {
 }
 
 /// Parse socket address with optional port.
-pub fn parse_addr_with_default_port(s: &str, default_port: u16) -> Result<SocketAddr, std::net::AddrParseError> {
+pub fn parse_addr_with_default_port(
+    s: &str,
+    default_port: u16,
+) -> Result<SocketAddr, std::net::AddrParseError> {
     if s.contains(':') && !s.starts_with('[') {
         // IPv4 with port or just IPv4
         if s.matches(':').count() == 1 {
@@ -180,9 +192,7 @@ pub fn if_nametoindex(_name: &str) -> Option<u32> {
 #[cfg(unix)]
 pub fn if_indextoname(index: u32) -> Option<String> {
     let mut buf = [0u8; libc::IF_NAMESIZE];
-    let result = unsafe {
-        libc::if_indextoname(index, buf.as_mut_ptr().cast::<libc::c_char>())
-    };
+    let result = unsafe { libc::if_indextoname(index, buf.as_mut_ptr().cast::<libc::c_char>()) };
     if result.is_null() {
         None
     } else {

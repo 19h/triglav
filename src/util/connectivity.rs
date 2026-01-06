@@ -22,11 +22,7 @@ pub const DEFAULT_STUN_SERVERS: &[&str] = &[
 ];
 
 /// DNS servers for connectivity testing.
-pub const DEFAULT_DNS_SERVERS: &[&str] = &[
-    "8.8.8.8:53",
-    "1.1.1.1:53",
-    "9.9.9.9:53",
-];
+pub const DEFAULT_DNS_SERVERS: &[&str] = &["8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"];
 
 /// Connectivity probe configuration.
 #[derive(Debug, Clone)]
@@ -122,7 +118,7 @@ impl ConnectivityProber {
     pub fn new(config: ConnectivityConfig) -> Self {
         let (event_tx, _) = broadcast::channel(64);
         let (shutdown_tx, _) = broadcast::channel(1);
-        
+
         Self {
             config,
             results: Arc::new(RwLock::new(HashMap::new())),
@@ -149,26 +145,30 @@ impl ConnectivityProber {
     /// Probe connectivity for a specific interface and local address.
     pub async fn probe(&self, interface: &str, local_addr: IpAddr) -> ConnectivityResult {
         let _start = Instant::now();
-        
+
         // Try STUN first
         let stun_result = self.probe_stun(interface, local_addr).await;
-        
+
         if let Some(result) = stun_result {
             // Update cache
-            self.results.write().insert(interface.to_string(), result.clone());
+            self.results
+                .write()
+                .insert(interface.to_string(), result.clone());
             let _ = self.event_tx.send(result.clone());
             return result;
         }
-        
+
         // Fallback to DNS probe
         let dns_result = self.probe_dns(interface, local_addr).await;
-        
+
         if let Some(result) = dns_result {
-            self.results.write().insert(interface.to_string(), result.clone());
+            self.results
+                .write()
+                .insert(interface.to_string(), result.clone());
             let _ = self.event_tx.send(result.clone());
             return result;
         }
-        
+
         // Failed
         let result = ConnectivityResult {
             interface: interface.to_string(),
@@ -180,8 +180,10 @@ impl ConnectivityProber {
             timestamp: Instant::now(),
             error: Some("All connectivity probes failed".to_string()),
         };
-        
-        self.results.write().insert(interface.to_string(), result.clone());
+
+        self.results
+            .write()
+            .insert(interface.to_string(), result.clone());
         let _ = self.event_tx.send(result.clone());
         result
     }
@@ -193,7 +195,12 @@ impl ConnectivityProber {
                 match self.do_stun_probe(interface, local_addr, server).await {
                     Ok(result) => return Some(result),
                     Err(e) => {
-                        debug!("STUN probe to {} failed (attempt {}): {}", server, retry + 1, e);
+                        debug!(
+                            "STUN probe to {} failed (attempt {}): {}",
+                            server,
+                            retry + 1,
+                            e
+                        );
                     }
                 }
             }
@@ -209,43 +216,46 @@ impl ConnectivityProber {
         server: &str,
     ) -> Result<ConnectivityResult, String> {
         let start = Instant::now();
-        
+
         // Parse server address
-        let server_addr: SocketAddr = server.parse()
+        let server_addr: SocketAddr = server
+            .parse()
             .map_err(|e| format!("Invalid STUN server address: {}", e))?;
-        
+
         // Create socket bound to local address
         let bind_addr = SocketAddr::new(local_addr, 0);
-        
+
         // Bind with interface if possible
-        let socket = self.create_bound_socket(bind_addr, interface).await
+        let socket = self
+            .create_bound_socket(bind_addr, interface)
+            .await
             .map_err(|e| format!("Failed to create socket: {}", e))?;
-        
+
         // Build STUN binding request
         let txn_id: [u8; 12] = rand::random();
         let request = build_stun_binding_request(&txn_id);
-        
+
         // Send request
-        socket.send_to(&request, server_addr).await
+        socket
+            .send_to(&request, server_addr)
+            .await
             .map_err(|e| format!("Failed to send STUN request: {}", e))?;
-        
+
         // Wait for response
         let mut buf = [0u8; 1024];
-        let timeout_result = tokio::time::timeout(
-            self.config.timeout,
-            socket.recv_from(&mut buf)
-        ).await;
-        
+        let timeout_result =
+            tokio::time::timeout(self.config.timeout, socket.recv_from(&mut buf)).await;
+
         let rtt = start.elapsed();
-        
+
         let (len, _from) = timeout_result
             .map_err(|_| "STUN response timeout".to_string())?
             .map_err(|e| format!("Failed to receive STUN response: {}", e))?;
-        
+
         // Parse STUN response
         let external_addr = parse_stun_response(&buf[..len], &txn_id)
             .ok_or_else(|| "Failed to parse STUN response".to_string())?;
-        
+
         // Determine NAT type
         let local = socket.local_addr().map_err(|e| e.to_string())?;
         let nat_type = if external_addr.ip() == local.ip() && external_addr.port() == local.port() {
@@ -258,7 +268,7 @@ impl ConnectivityProber {
             // Would need multiple STUN servers to determine full NAT type
             NatType::Unknown
         };
-        
+
         Ok(ConnectivityResult {
             interface: interface.to_string(),
             local_addr: local,
@@ -278,7 +288,12 @@ impl ConnectivityProber {
                 match self.do_dns_probe(interface, local_addr, server).await {
                     Ok(result) => return Some(result),
                     Err(e) => {
-                        debug!("DNS probe to {} failed (attempt {}): {}", server, retry + 1, e);
+                        debug!(
+                            "DNS probe to {} failed (attempt {}): {}",
+                            server,
+                            retry + 1,
+                            e
+                        );
                     }
                 }
             }
@@ -294,39 +309,42 @@ impl ConnectivityProber {
         server: &str,
     ) -> Result<ConnectivityResult, String> {
         let start = Instant::now();
-        
-        let server_addr: SocketAddr = server.parse()
+
+        let server_addr: SocketAddr = server
+            .parse()
             .map_err(|e| format!("Invalid DNS server address: {}", e))?;
-        
+
         let bind_addr = SocketAddr::new(local_addr, 0);
-        let socket = self.create_bound_socket(bind_addr, interface).await
+        let socket = self
+            .create_bound_socket(bind_addr, interface)
+            .await
             .map_err(|e| format!("Failed to create socket: {}", e))?;
-        
+
         // Build a simple DNS query for "." (root)
         let query = build_dns_query();
-        
-        socket.send_to(&query, server_addr).await
+
+        socket
+            .send_to(&query, server_addr)
+            .await
             .map_err(|e| format!("Failed to send DNS query: {}", e))?;
-        
+
         let mut buf = [0u8; 512];
-        let timeout_result = tokio::time::timeout(
-            self.config.timeout,
-            socket.recv_from(&mut buf)
-        ).await;
-        
+        let timeout_result =
+            tokio::time::timeout(self.config.timeout, socket.recv_from(&mut buf)).await;
+
         let rtt = start.elapsed();
-        
+
         let (len, _) = timeout_result
             .map_err(|_| "DNS response timeout".to_string())?
             .map_err(|e| format!("Failed to receive DNS response: {}", e))?;
-        
+
         // Basic validation - check it looks like a DNS response
         if len < 12 {
             return Err("DNS response too short".to_string());
         }
-        
+
         let local = socket.local_addr().map_err(|e| e.to_string())?;
-        
+
         Ok(ConnectivityResult {
             interface: interface.to_string(),
             local_addr: local,
@@ -345,17 +363,21 @@ impl ConnectivityProber {
         bind_addr: SocketAddr,
         interface: &str,
     ) -> std::io::Result<UdpSocket> {
-        use socket2::{Socket, Domain, Type, Protocol};
-        
-        let domain = if bind_addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let domain = if bind_addr.is_ipv6() {
+            Domain::IPV6
+        } else {
+            Domain::IPV4
+        };
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-        
+
         // Bind to interface if supported
         #[cfg(target_os = "linux")]
         {
             use std::ffi::CString;
             use std::os::unix::io::AsRawFd;
-            
+
             if let Ok(cname) = CString::new(interface) {
                 // SO_BINDTODEVICE requires CAP_NET_RAW or root
                 let ret = unsafe {
@@ -368,17 +390,20 @@ impl ConnectivityProber {
                     )
                 };
                 if ret != 0 {
-                    debug!("SO_BINDTODEVICE failed for {}: {}, falling back to address binding", 
-                           interface, std::io::Error::last_os_error());
+                    debug!(
+                        "SO_BINDTODEVICE failed for {}: {}, falling back to address binding",
+                        interface,
+                        std::io::Error::last_os_error()
+                    );
                 }
             }
         }
-        
+
         #[cfg(target_os = "macos")]
         {
             if let Some(idx) = super::if_nametoindex(interface) {
                 use std::os::unix::io::AsRawFd;
-                
+
                 let ret = unsafe {
                     libc::setsockopt(
                         socket.as_raw_fd(),
@@ -389,15 +414,18 @@ impl ConnectivityProber {
                     )
                 };
                 if ret != 0 {
-                    debug!("IP_BOUND_IF failed for {}: {}, falling back to address binding",
-                           interface, std::io::Error::last_os_error());
+                    debug!(
+                        "IP_BOUND_IF failed for {}: {}, falling back to address binding",
+                        interface,
+                        std::io::Error::last_os_error()
+                    );
                 }
             }
         }
-        
+
         socket.set_nonblocking(true)?;
         socket.bind(&bind_addr.into())?;
-        
+
         UdpSocket::from_std(socket.into())
     }
 
@@ -410,7 +438,7 @@ impl ConnectivityProber {
 /// Build a STUN Binding Request.
 fn build_stun_binding_request(txn_id: &[u8; 12]) -> Vec<u8> {
     let mut request = Vec::with_capacity(20);
-    
+
     // Message Type: Binding Request (0x0001)
     request.extend_from_slice(&[0x00, 0x01]);
     // Message Length: 0 (no attributes)
@@ -419,7 +447,7 @@ fn build_stun_binding_request(txn_id: &[u8; 12]) -> Vec<u8> {
     request.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
     // Transaction ID
     request.extend_from_slice(txn_id);
-    
+
     request
 }
 
@@ -428,36 +456,36 @@ fn parse_stun_response(data: &[u8], expected_txn_id: &[u8; 12]) -> Option<Socket
     if data.len() < 20 {
         return None;
     }
-    
+
     // Check message type (Binding Response: 0x0101)
     if data[0] != 0x01 || data[1] != 0x01 {
         return None;
     }
-    
+
     // Check magic cookie
     if &data[4..8] != &[0x21, 0x12, 0xa4, 0x42] {
         return None;
     }
-    
+
     // Check transaction ID
     if &data[8..20] != expected_txn_id {
         return None;
     }
-    
+
     // Parse attributes
     let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
     let attrs_end = 20 + msg_len.min(data.len() - 20);
     let mut pos = 20;
-    
+
     while pos + 4 <= attrs_end {
         let attr_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
         let attr_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
-        
+
         if pos + attr_len > attrs_end {
             break;
         }
-        
+
         // XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001)
         if attr_type == 0x0020 || attr_type == 0x0001 {
             if attr_len >= 8 {
@@ -469,7 +497,7 @@ fn parse_stun_response(data: &[u8], expected_txn_id: &[u8; 12]) -> Option<Socket
                 } else {
                     u16::from_be_bytes(port_bytes)
                 };
-                
+
                 if family == 0x01 && attr_len >= 8 {
                     // IPv4
                     let addr_bytes = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
@@ -505,25 +533,25 @@ fn parse_stun_response(data: &[u8], expected_txn_id: &[u8; 12]) -> Option<Socket
                 }
             }
         }
-        
+
         // Align to 4 bytes
         pos += (attr_len + 3) & !3;
     }
-    
+
     None
 }
 
 /// Build a minimal DNS query.
 fn build_dns_query() -> Vec<u8> {
     let mut query = Vec::with_capacity(17);
-    
+
     // Transaction ID
     let txn_id: u16 = rand::random();
     query.extend_from_slice(&txn_id.to_be_bytes());
-    
+
     // Flags: standard query, recursion desired
     query.extend_from_slice(&[0x01, 0x00]);
-    
+
     // Questions: 1
     query.extend_from_slice(&[0x00, 0x01]);
     // Answer RRs: 0
@@ -532,15 +560,15 @@ fn build_dns_query() -> Vec<u8> {
     query.extend_from_slice(&[0x00, 0x00]);
     // Additional RRs: 0
     query.extend_from_slice(&[0x00, 0x00]);
-    
+
     // Query: root domain "."
     query.push(0x00); // Empty label = root
-    
+
     // Type: A (1)
     query.extend_from_slice(&[0x00, 0x01]);
     // Class: IN (1)
     query.extend_from_slice(&[0x00, 0x01]);
-    
+
     query
 }
 
@@ -552,7 +580,7 @@ mod tests {
     fn test_build_stun_request() {
         let txn_id = [0u8; 12];
         let request = build_stun_binding_request(&txn_id);
-        
+
         assert_eq!(request.len(), 20);
         assert_eq!(&request[0..2], &[0x00, 0x01]); // Binding Request
         assert_eq!(&request[4..8], &[0x21, 0x12, 0xa4, 0x42]); // Magic Cookie
@@ -561,7 +589,7 @@ mod tests {
     #[test]
     fn test_build_dns_query() {
         let query = build_dns_query();
-        
+
         assert!(query.len() >= 17);
         // Check it's a standard query
         assert_eq!(query[2] & 0x80, 0x00);

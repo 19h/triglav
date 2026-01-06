@@ -57,18 +57,18 @@
 //! ```
 
 mod device;
-mod packet;
+mod dns;
 mod nat;
+mod packet;
 mod routing;
 mod runner;
-mod dns;
 
-pub use device::{TunDevice, TunConfig, TunHandle};
-pub use packet::{IpPacket, IpVersion, TransportProtocol as IpTransportProtocol, FlowTuple};
-pub use nat::{NatTable, NatEntry, NatConfig};
-pub use routing::{RouteManager, Route, RouteConfig};
-pub use runner::{TunnelRunner, TunnelConfig, TunnelStats};
-pub use dns::{DnsInterceptor, DnsConfig};
+pub use device::{TunConfig, TunDevice, TunHandle};
+pub use dns::{DnsConfig, DnsInterceptor};
+pub use nat::{NatConfig, NatEntry, NatTable};
+pub use packet::{FlowTuple, IpPacket, IpVersion, TransportProtocol as IpTransportProtocol};
+pub use routing::{Route, RouteConfig, RouteManager};
+pub use runner::{TunnelConfig, TunnelRunner, TunnelStats};
 
 use crate::error::Result;
 
@@ -92,7 +92,7 @@ pub fn check_privileges() -> Result<bool> {
         if uid == 0 {
             return Ok(true);
         }
-        
+
         // Check for CAP_NET_ADMIN on Linux
         #[cfg(target_os = "linux")]
         {
@@ -100,26 +100,26 @@ pub fn check_privileges() -> Result<bool> {
             // A full implementation would use libcap
             Ok(false)
         }
-        
+
         #[cfg(target_os = "macos")]
         {
             // On macOS, only root can create utun devices
             Ok(false)
         }
-        
+
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             Ok(false)
         }
     }
-    
+
     #[cfg(windows)]
     {
         // On Windows, check if we can access WinTUN
         // This is a simplified check
         Ok(true) // Assume we have access if WinTUN is installed
     }
-    
+
     #[cfg(not(any(unix, windows)))]
     {
         Ok(false)

@@ -6,18 +6,18 @@
 //! - Daemon mode support
 //! - Signal handling
 
-mod users;
-mod sessions;
 mod daemon;
+mod sessions;
 mod signals;
+mod users;
 
 // New key-based API
 pub use users::{AuthorizedKey, KeyStore};
 
 // Legacy compatibility (deprecated)
 #[allow(deprecated)]
-pub use users::{User, UserManager, UserRole, UserRegistration, UserKey};
+pub use users::{User, UserKey, UserManager, UserRegistration, UserRole};
 
-pub use sessions::*;
 pub use daemon::*;
+pub use sessions::*;
 pub use signals::*;

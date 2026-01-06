@@ -129,17 +129,17 @@ impl KeyStore {
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(db_path.as_ref())
             .map_err(|e| Error::Config(format!("Failed to open key database: {}", e)))?;
-        
+
         Self::init_schema(&conn)?;
-        
+
         let store = Self {
             db: std::sync::Mutex::new(conn),
             cache: RwLock::new(HashMap::new()),
             last_refresh: RwLock::new(Instant::now()),
         };
-        
+
         store.refresh_cache()?;
-        
+
         Ok(store)
     }
 
@@ -147,9 +147,9 @@ impl KeyStore {
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()
             .map_err(|e| Error::Config(format!("Failed to create in-memory database: {}", e)))?;
-        
+
         Self::init_schema(&conn)?;
-        
+
         Ok(Self {
             db: std::sync::Mutex::new(conn),
             cache: RwLock::new(HashMap::new()),
@@ -177,51 +177,56 @@ impl KeyStore {
 
             CREATE INDEX IF NOT EXISTS idx_keys_enabled ON authorized_keys(enabled);
             CREATE INDEX IF NOT EXISTS idx_keys_expires ON authorized_keys(expires_at);
-            "#
-        ).map_err(|e| Error::Config(format!("Failed to initialize schema: {}", e)))?;
-        
+            "#,
+        )
+        .map_err(|e| Error::Config(format!("Failed to initialize schema: {}", e)))?;
+
         Ok(())
     }
 
     /// Refresh the in-memory cache.
     pub fn refresh_cache(&self) -> Result<()> {
         let db = self.db.lock().unwrap();
-        
-        let mut stmt = db.prepare(
-            "SELECT public_key, label, enabled, created_at, last_seen, 
+
+        let mut stmt = db
+            .prepare(
+                "SELECT public_key, label, enabled, created_at, last_seen, 
                     max_connections, rate_limit_bps, expires_at,
                     total_bytes_tx, total_bytes_rx, total_connections
-             FROM authorized_keys"
-        ).map_err(|e| Error::Config(format!("Failed to prepare query: {}", e)))?;
-        
-        let keys: Vec<AuthorizedKey> = stmt.query_map([], |row| {
-            Ok(AuthorizedKey {
-                public_key: row.get(0)?,
-                label: row.get(1)?,
-                enabled: row.get::<_, i32>(2)? != 0,
-                created_at: row.get(3)?,
-                last_seen: row.get(4)?,
-                max_connections: row.get(5)?,
-                rate_limit_bps: row.get(6)?,
-                expires_at: row.get(7)?,
-                total_bytes_tx: row.get(8)?,
-                total_bytes_rx: row.get(9)?,
-                total_connections: row.get(10)?,
+             FROM authorized_keys",
+            )
+            .map_err(|e| Error::Config(format!("Failed to prepare query: {}", e)))?;
+
+        let keys: Vec<AuthorizedKey> = stmt
+            .query_map([], |row| {
+                Ok(AuthorizedKey {
+                    public_key: row.get(0)?,
+                    label: row.get(1)?,
+                    enabled: row.get::<_, i32>(2)? != 0,
+                    created_at: row.get(3)?,
+                    last_seen: row.get(4)?,
+                    max_connections: row.get(5)?,
+                    rate_limit_bps: row.get(6)?,
+                    expires_at: row.get(7)?,
+                    total_bytes_tx: row.get(8)?,
+                    total_bytes_rx: row.get(9)?,
+                    total_connections: row.get(10)?,
+                })
             })
-        }).map_err(|e| Error::Config(format!("Failed to query keys: {}", e)))?
-        .filter_map(|r| r.ok())
-        .collect();
-        
+            .map_err(|e| Error::Config(format!("Failed to query keys: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
         let mut cache = self.cache.write();
         cache.clear();
         for key in keys {
             cache.insert(key.public_key.clone(), key);
         }
-        
+
         *self.last_refresh.write() = Instant::now();
-        
+
         info!("Loaded {} authorized keys", cache.len());
-        
+
         Ok(())
     }
 
@@ -245,19 +250,24 @@ impl KeyStore {
                 key.total_bytes_tx,
                 key.total_bytes_rx,
                 key.total_connections,
-            ]
-        ).map_err(|e| Error::Config(format!("Failed to authorize key: {}", e)))?;
-        
+            ],
+        )
+        .map_err(|e| Error::Config(format!("Failed to authorize key: {}", e)))?;
+
         drop(db);
-        
+
         // Update cache
         self.cache.write().insert(key.public_key.clone(), key);
-        
+
         Ok(())
     }
 
     /// Authorize a key from a PublicKey.
-    pub fn authorize_public_key(&self, public_key: &PublicKey, label: Option<&str>) -> Result<AuthorizedKey> {
+    pub fn authorize_public_key(
+        &self,
+        public_key: &PublicKey,
+        label: Option<&str>,
+    ) -> Result<AuthorizedKey> {
         let mut key = AuthorizedKey::from_public_key(public_key);
         if let Some(l) = label {
             key.label = Some(l.to_string());
@@ -275,7 +285,8 @@ impl KeyStore {
 
     /// Check if a public key is authorized.
     pub fn is_authorized(&self, public_key: &str) -> bool {
-        self.cache.read()
+        self.cache
+            .read()
             .get(public_key)
             .map(|k| k.is_valid())
             .unwrap_or(false)
@@ -289,16 +300,16 @@ impl KeyStore {
     /// Authenticate a connection attempt. Returns the key if authorized.
     pub fn authenticate(&self, public_key: &str) -> Option<AuthorizedKey> {
         let key = self.cache.read().get(public_key).cloned()?;
-        
+
         if !key.is_valid() {
             debug!("Key {} is not valid", key.short_id());
             return None;
         }
-        
+
         // Update last seen
         let _ = self.update_last_seen(public_key);
         let _ = self.increment_connections(public_key);
-        
+
         Some(key)
     }
 
@@ -307,16 +318,17 @@ impl KeyStore {
         let db = self.db.lock().unwrap();
         db.execute(
             "UPDATE authorized_keys SET enabled = 0 WHERE public_key = ?1",
-            params![public_key]
-        ).map_err(|e| Error::Config(format!("Failed to revoke key: {}", e)))?;
-        
+            params![public_key],
+        )
+        .map_err(|e| Error::Config(format!("Failed to revoke key: {}", e)))?;
+
         drop(db);
-        
+
         // Update cache
         if let Some(key) = self.cache.write().get_mut(public_key) {
             key.enabled = false;
         }
-        
+
         info!("Revoked key {}", &public_key[..public_key.len().min(8)]);
         Ok(())
     }
@@ -326,13 +338,14 @@ impl KeyStore {
         let db = self.db.lock().unwrap();
         db.execute(
             "DELETE FROM authorized_keys WHERE public_key = ?1",
-            params![public_key]
-        ).map_err(|e| Error::Config(format!("Failed to delete key: {}", e)))?;
-        
+            params![public_key],
+        )
+        .map_err(|e| Error::Config(format!("Failed to delete key: {}", e)))?;
+
         drop(db);
-        
+
         self.cache.write().remove(public_key);
-        
+
         info!("Deleted key {}", &public_key[..public_key.len().min(8)]);
         Ok(())
     }
@@ -344,7 +357,8 @@ impl KeyStore {
 
     /// List only valid (enabled, not expired) keys.
     pub fn list_valid(&self) -> Vec<AuthorizedKey> {
-        self.cache.read()
+        self.cache
+            .read()
             .values()
             .filter(|k| k.is_valid())
             .cloned()
@@ -362,19 +376,20 @@ impl KeyStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
         let db = self.db.lock().unwrap();
         db.execute(
             "UPDATE authorized_keys SET last_seen = ?1 WHERE public_key = ?2",
-            params![now, public_key]
-        ).map_err(|e| Error::Config(format!("Failed to update last seen: {}", e)))?;
-        
+            params![now, public_key],
+        )
+        .map_err(|e| Error::Config(format!("Failed to update last seen: {}", e)))?;
+
         drop(db);
-        
+
         if let Some(key) = self.cache.write().get_mut(public_key) {
             key.last_seen = Some(now);
         }
-        
+
         Ok(())
     }
 
@@ -385,13 +400,13 @@ impl KeyStore {
             "UPDATE authorized_keys SET total_connections = total_connections + 1 WHERE public_key = ?1",
             params![public_key]
         ).map_err(|e| Error::Config(format!("Failed to increment connections: {}", e)))?;
-        
+
         drop(db);
-        
+
         if let Some(key) = self.cache.write().get_mut(public_key) {
             key.total_connections += 1;
         }
-        
+
         Ok(())
     }
 
@@ -403,16 +418,17 @@ impl KeyStore {
                 total_bytes_tx = total_bytes_tx + ?1,
                 total_bytes_rx = total_bytes_rx + ?2
              WHERE public_key = ?3",
-            params![bytes_tx, bytes_rx, public_key]
-        ).map_err(|e| Error::Config(format!("Failed to record traffic: {}", e)))?;
-        
+            params![bytes_tx, bytes_rx, public_key],
+        )
+        .map_err(|e| Error::Config(format!("Failed to record traffic: {}", e)))?;
+
         drop(db);
-        
+
         if let Some(key) = self.cache.write().get_mut(public_key) {
             key.total_bytes_tx += bytes_tx;
             key.total_bytes_rx += bytes_rx;
         }
-        
+
         Ok(())
     }
 }
@@ -495,10 +511,12 @@ mod tests {
     #[test]
     fn test_authorize_key() {
         let store = KeyStore::in_memory().unwrap();
-        
+
         let keypair = KeyPair::generate();
-        let key = store.authorize_public_key(&keypair.public, Some("test-key")).unwrap();
-        
+        let key = store
+            .authorize_public_key(&keypair.public, Some("test-key"))
+            .unwrap();
+
         assert!(key.enabled);
         assert_eq!(key.label, Some("test-key".to_string()));
         assert!(store.is_authorized(&key.public_key));
@@ -507,14 +525,14 @@ mod tests {
     #[test]
     fn test_authenticate() {
         let store = KeyStore::in_memory().unwrap();
-        
+
         let keypair = KeyPair::generate();
         store.authorize_public_key(&keypair.public, None).unwrap();
-        
+
         let pubkey = keypair.public.to_base64();
         let result = store.authenticate(&pubkey);
         assert!(result.is_some());
-        
+
         // Check that last_seen was updated
         let key = store.get(&pubkey).unwrap();
         assert!(key.last_seen.is_some());
@@ -524,14 +542,14 @@ mod tests {
     #[test]
     fn test_revoke() {
         let store = KeyStore::in_memory().unwrap();
-        
+
         let keypair = KeyPair::generate();
         let key = store.authorize_public_key(&keypair.public, None).unwrap();
-        
+
         assert!(store.is_authorized(&key.public_key));
-        
+
         store.revoke(&key.public_key).unwrap();
-        
+
         assert!(!store.is_authorized(&key.public_key));
         assert!(store.authenticate(&key.public_key).is_none());
     }
@@ -539,13 +557,13 @@ mod tests {
     #[test]
     fn test_expiry() {
         let store = KeyStore::in_memory().unwrap();
-        
+
         let keypair = KeyPair::generate();
         let mut key = AuthorizedKey::from_public_key(&keypair.public);
         // Set expiry in the past
         key.expires_at = 1;
         store.authorize(key.clone()).unwrap();
-        
+
         assert!(!store.is_authorized(&key.public_key));
         assert!(store.authenticate(&key.public_key).is_none());
     }
@@ -553,9 +571,9 @@ mod tests {
     #[test]
     fn test_generate_authorized_key() {
         let store = KeyStore::in_memory().unwrap();
-        
+
         let (key, keypair) = store.generate_authorized_key(Some("generated")).unwrap();
-        
+
         assert_eq!(key.public_key, keypair.public.to_base64());
         assert_eq!(key.label, Some("generated".to_string()));
         assert!(store.is_authorized(&key.public_key));
@@ -564,13 +582,13 @@ mod tests {
     #[test]
     fn test_traffic_recording() {
         let store = KeyStore::in_memory().unwrap();
-        
+
         let keypair = KeyPair::generate();
         let key = store.authorize_public_key(&keypair.public, None).unwrap();
-        
+
         store.record_traffic(&key.public_key, 1000, 2000).unwrap();
         store.record_traffic(&key.public_key, 500, 500).unwrap();
-        
+
         let updated = store.get(&key.public_key).unwrap();
         assert_eq!(updated.total_bytes_tx, 1500);
         assert_eq!(updated.total_bytes_rx, 2500);

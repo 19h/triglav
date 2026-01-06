@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
-use super::flow_hash::{FlowId, EcmpPathEnumerator};
-use super::nat::{NatId, NatProbe, NatProbeResponse, IpIdMarker, UplinkNatState};
+use super::flow_hash::{EcmpPathEnumerator, FlowId};
+use super::nat::{IpIdMarker, NatId, NatProbe, NatProbeResponse, UplinkNatState};
 
 /// Discovered hop information.
 #[derive(Debug, Clone)]
@@ -214,7 +214,8 @@ impl PathDiversity {
         let intermediate_hops: std::collections::HashSet<_> = paths
             .iter()
             .flat_map(|p| {
-                p.hops.iter()
+                p.hops
+                    .iter()
                     .skip(1)
                     .filter(|h| !h.is_last)
                     .filter_map(|h| h.addr)
@@ -284,14 +285,30 @@ pub struct PathDiscoveryConfig {
     pub retries: u8,
 }
 
-fn default_min_ttl() -> u8 { 1 }
-fn default_max_ttl() -> u8 { 32 }
-fn default_num_paths() -> u16 { 8 }
-fn default_base_src_port() -> u16 { 33434 }
-fn default_use_src_port() -> bool { true }
-fn default_probe_timeout() -> Duration { Duration::from_secs(3) }
-fn default_probe_delay() -> Duration { Duration::from_millis(50) }
-fn default_retries() -> u8 { 2 }
+fn default_min_ttl() -> u8 {
+    1
+}
+fn default_max_ttl() -> u8 {
+    32
+}
+fn default_num_paths() -> u16 {
+    8
+}
+fn default_base_src_port() -> u16 {
+    33434
+}
+fn default_use_src_port() -> bool {
+    true
+}
+fn default_probe_timeout() -> Duration {
+    Duration::from_secs(3)
+}
+fn default_probe_delay() -> Duration {
+    Duration::from_millis(50)
+}
+fn default_retries() -> u8 {
+    2
+}
 
 impl Default for PathDiscoveryConfig {
     fn default() -> Self {
@@ -389,9 +406,7 @@ impl PathDiscovery {
         let dest_paths = paths.entry(dst_addr).or_default();
 
         // Find or create path for this flow hash
-        let path = dest_paths
-            .iter_mut()
-            .find(|p| p.flow_hash == hop.flow_hash);
+        let path = dest_paths.iter_mut().find(|p| p.flow_hash == hop.flow_hash);
 
         if let Some(path) = path {
             path.add_hop(hop);
@@ -416,7 +431,11 @@ impl PathDiscovery {
 
     /// Get discovered paths for a destination.
     pub fn get_paths(&self, dst_addr: SocketAddr) -> Vec<DiscoveredPath> {
-        self.paths.read().get(&dst_addr).cloned().unwrap_or_default()
+        self.paths
+            .read()
+            .get(&dst_addr)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Get path diversity for a destination.
@@ -431,7 +450,9 @@ impl PathDiscovery {
         let diversity = PathDiversity::from_paths(&paths);
 
         // Cache result
-        self.diversity_cache.write().insert(dst_addr, diversity.clone());
+        self.diversity_cache
+            .write()
+            .insert(dst_addr, diversity.clone());
 
         diversity
     }

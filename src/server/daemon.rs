@@ -77,7 +77,7 @@ pub fn daemonize(config: &DaemonConfig) -> Result<()> {
     use nix::sys::stat;
     use nix::unistd::{chdir, fork, setsid, ForkResult};
     use std::os::unix::io::AsRawFd;
-    
+
     // Check for existing PID file
     if let Some(ref pid_file) = config.pid_file {
         if pid_file.exists() {
@@ -87,7 +87,8 @@ pub fn daemonize(config: &DaemonConfig) -> Result<()> {
                     if is_process_running(pid) {
                         return Err(Error::Config(format!(
                             "Daemon already running with PID {} (from {})",
-                            pid, pid_file.display()
+                            pid,
+                            pid_file.display()
                         )));
                     }
                 }
@@ -133,15 +134,14 @@ pub fn daemonize(config: &DaemonConfig) -> Result<()> {
     }
 
     // Change working directory
-    chdir(&config.work_dir)
-        .map_err(|e| Error::Config(format!("chdir failed: {}", e)))?;
+    chdir(&config.work_dir).map_err(|e| Error::Config(format!("chdir failed: {}", e)))?;
 
     // Close standard file descriptors and redirect to /dev/null
     if config.close_fds {
         let devnull = File::open("/dev/null")
             .map_err(|e| Error::Config(format!("Failed to open /dev/null: {}", e)))?;
         let fd = devnull.as_raw_fd();
-        
+
         unsafe {
             libc::dup2(fd, 0); // stdin
             libc::dup2(fd, 1); // stdout
@@ -160,33 +160,35 @@ pub fn daemonize(config: &DaemonConfig) -> Result<()> {
     }
 
     info!("Daemonized successfully (PID: {})", process::id());
-    
+
     Ok(())
 }
 
 #[cfg(not(unix))]
 pub fn daemonize(_config: &DaemonConfig) -> Result<()> {
-    Err(Error::Config("Daemon mode is not supported on this platform".into()))
+    Err(Error::Config(
+        "Daemon mode is not supported on this platform".into(),
+    ))
 }
 
 /// Write the current PID to a file.
 pub fn write_pid_file(path: &Path) -> Result<()> {
     let pid = process::id();
-    
+
     // Create parent directories if needed
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| Error::Config(format!("Failed to create PID file directory: {}", e)))?;
     }
-    
+
     let mut file = File::create(path)
         .map_err(|e| Error::Config(format!("Failed to create PID file: {}", e)))?;
-    
+
     writeln!(file, "{}", pid)
         .map_err(|e| Error::Config(format!("Failed to write PID file: {}", e)))?;
-    
+
     info!("Wrote PID {} to {}", pid, path.display());
-    
+
     Ok(())
 }
 
@@ -220,16 +222,14 @@ fn drop_privileges(user: &Option<String>, group: &Option<String>) -> Result<()> 
     // Set group first (can't change group after dropping user privileges)
     if let Some(group_name) = group {
         let gid = resolve_group(group_name)?;
-        setgid(Gid::from_raw(gid))
-            .map_err(|e| Error::Config(format!("setgid failed: {}", e)))?;
+        setgid(Gid::from_raw(gid)).map_err(|e| Error::Config(format!("setgid failed: {}", e)))?;
         info!("Set group to {} (gid={})", group_name, gid);
     }
 
     // Set user
     if let Some(user_name) = user {
         let uid = resolve_user(user_name)?;
-        setuid(Uid::from_raw(uid))
-            .map_err(|e| Error::Config(format!("setuid failed: {}", e)))?;
+        setuid(Uid::from_raw(uid)).map_err(|e| Error::Config(format!("setuid failed: {}", e)))?;
         info!("Set user to {} (uid={})", user_name, uid);
     }
 
@@ -240,21 +240,20 @@ fn drop_privileges(user: &Option<String>, group: &Option<String>) -> Result<()> 
 #[cfg(unix)]
 fn resolve_user(user: &str) -> Result<u32> {
     use std::ffi::CString;
-    
+
     // Try parsing as numeric UID first
     if let Ok(uid) = user.parse::<u32>() {
         return Ok(uid);
     }
-    
+
     // Look up by name
-    let cname = CString::new(user)
-        .map_err(|_| Error::Config("Invalid user name".into()))?;
-    
+    let cname = CString::new(user).map_err(|_| Error::Config("Invalid user name".into()))?;
+
     let pwd = unsafe { libc::getpwnam(cname.as_ptr()) };
     if pwd.is_null() {
         return Err(Error::Config(format!("User not found: {}", user)));
     }
-    
+
     Ok(unsafe { (*pwd).pw_uid })
 }
 
@@ -262,21 +261,20 @@ fn resolve_user(user: &str) -> Result<u32> {
 #[cfg(unix)]
 fn resolve_group(group: &str) -> Result<u32> {
     use std::ffi::CString;
-    
+
     // Try parsing as numeric GID first
     if let Ok(gid) = group.parse::<u32>() {
         return Ok(gid);
     }
-    
+
     // Look up by name
-    let cname = CString::new(group)
-        .map_err(|_| Error::Config("Invalid group name".into()))?;
-    
+    let cname = CString::new(group).map_err(|_| Error::Config("Invalid group name".into()))?;
+
     let grp = unsafe { libc::getgrnam(cname.as_ptr()) };
     if grp.is_null() {
         return Err(Error::Config(format!("Group not found: {}", group)));
     }
-    
+
     Ok(unsafe { (*grp).gr_gid })
 }
 
@@ -313,13 +311,13 @@ mod tests {
     fn test_pid_file() {
         let dir = tempdir().unwrap();
         let pid_path = dir.path().join("test.pid");
-        
+
         write_pid_file(&pid_path).unwrap();
-        
+
         let content = fs::read_to_string(&pid_path).unwrap();
         let pid: u32 = content.trim().parse().unwrap();
         assert_eq!(pid, process::id());
-        
+
         remove_pid_file(&pid_path).unwrap();
         assert!(!pid_path.exists());
     }
@@ -328,12 +326,12 @@ mod tests {
     fn test_pid_file_guard() {
         let dir = tempdir().unwrap();
         let pid_path = dir.path().join("guard.pid");
-        
+
         {
             let _guard = PidFileGuard::new(&pid_path).unwrap();
             assert!(pid_path.exists());
         }
-        
+
         // Should be removed on drop
         assert!(!pid_path.exists());
     }
@@ -345,7 +343,7 @@ mod tests {
             .with_work_dir("/tmp")
             .with_user("nobody")
             .with_group("nogroup");
-        
+
         assert_eq!(config.pid_file, Some(PathBuf::from("/var/run/test.pid")));
         assert_eq!(config.work_dir, PathBuf::from("/tmp"));
         assert_eq!(config.user, Some("nobody".to_string()));
@@ -357,7 +355,7 @@ mod tests {
     fn test_is_process_running() {
         // Current process should be running
         assert!(is_process_running(process::id() as i32));
-        
+
         // Invalid PID should not be running
         assert!(!is_process_running(999999999));
     }

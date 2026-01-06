@@ -2,21 +2,20 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
+use super::nat::UplinkNatState;
 use crate::crypto::NoiseSession;
 use crate::metrics::QualityMetrics;
 use crate::transport::{Transport, TransportProtocol};
 use crate::types::{
-    Bandwidth, ConnectionState, InterfaceType, Latency,
-    TrafficStats, UplinkHealth, UplinkId,
+    Bandwidth, ConnectionState, InterfaceType, Latency, TrafficStats, UplinkHealth, UplinkId,
 };
-use super::nat::UplinkNatState;
 
 /// Uplink configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,8 +48,12 @@ pub struct UplinkConfig {
     pub priority_override: u32,
 }
 
-fn default_weight() -> u32 { 100 }
-fn default_enabled() -> bool { true }
+fn default_weight() -> u32 {
+    100
+}
+fn default_enabled() -> bool {
+    true
+}
 
 impl Default for UplinkConfig {
     fn default() -> Self {
@@ -116,7 +119,7 @@ pub struct ConnectionParams {
     pub interface_type: InterfaceType,
     /// Transport protocol.
     pub protocol: TransportProtocol,
-    
+
     // Timing
     /// Smoothed round-trip time.
     pub rtt: Duration,
@@ -126,7 +129,7 @@ pub struct ConnectionParams {
     pub rtt_min: Duration,
     /// Jitter (variance in delay).
     pub jitter: Duration,
-    
+
     // Bandwidth
     /// Upload bandwidth estimate.
     pub bandwidth_up: Bandwidth,
@@ -138,7 +141,7 @@ pub struct ConnectionParams {
     pub goodput: Bandwidth,
     /// Maximum bandwidth limit (0 = unlimited).
     pub max_bandwidth_mbps: u32,
-    
+
     // Capacity
     /// Bandwidth-delay product in bytes.
     pub bdp: u64,
@@ -146,13 +149,13 @@ pub struct ConnectionParams {
     pub cwnd: u32,
     /// Packets in flight.
     pub in_flight: u32,
-    
+
     // Loss
     /// Packet loss ratio (0.0-1.0).
     pub packet_loss: f64,
     /// Retransmission rate (0.0-1.0).
     pub retransmission_rate: f64,
-    
+
     // Health
     /// Health status.
     pub health: UplinkHealth,
@@ -160,19 +163,19 @@ pub struct ConnectionParams {
     pub consecutive_failures: u32,
     /// Whether uplink is usable.
     pub is_usable: bool,
-    
+
     // NAT
     /// Whether behind NAT.
     pub is_natted: bool,
     /// NAT type.
     pub nat_type: super::nat::NatType,
-    
+
     // Transfer estimates
     /// Estimated time to transfer 1MB.
     pub time_for_1mb: Duration,
     /// Computed priority score.
     pub priority_score: u32,
-    
+
     // Statistics
     /// Total bytes sent.
     pub bytes_sent: u64,
@@ -193,39 +196,39 @@ impl ConnectionParams {
     pub fn is_low_latency(&self) -> bool {
         self.rtt < Duration::from_millis(50) && self.jitter < Duration::from_millis(10)
     }
-    
+
     /// Check if this uplink is suitable for high-bandwidth traffic.
     pub fn is_high_bandwidth(&self) -> bool {
         self.effective_throughput.bytes_per_sec > 10_000_000.0 // 10 MB/s
     }
-    
+
     /// Check if this uplink has low packet loss.
     pub fn has_low_loss(&self) -> bool {
         self.packet_loss < 0.01 // Less than 1%
     }
-    
+
     /// Calculate a quality score (0.0-1.0) for this uplink.
     pub fn quality_score(&self) -> f64 {
         let rtt_score = 1.0 / (1.0 + self.rtt.as_secs_f64() * 10.0);
         let loss_score = 1.0 - self.packet_loss.min(1.0);
         let jitter_score = 1.0 / (1.0 + self.jitter.as_secs_f64() * 100.0);
         let health_score = self.health.priority_modifier();
-        
+
         (rtt_score + loss_score + jitter_score + health_score) / 4.0
     }
-    
+
     /// Estimate transfer time for given bytes.
     pub fn transfer_time(&self, bytes: u64) -> Duration {
         if self.effective_throughput.bytes_per_sec <= 0.0 {
             return Duration::MAX;
         }
-        
+
         let transfer_secs = bytes as f64 / self.effective_throughput.bytes_per_sec;
         // Cap at 1 hour to avoid Duration overflow
         let total_secs = (transfer_secs + self.rtt.as_secs_f64()).min(3600.0);
         Duration::from_secs_f64(total_secs)
     }
-    
+
     /// Check if this uplink can complete a transfer faster than another.
     pub fn faster_than(&self, other: &Self, bytes: u64) -> bool {
         self.transfer_time(bytes) < other.transfer_time(bytes)
@@ -562,7 +565,8 @@ impl Uplink {
 
     /// Send raw data through the transport (no encryption).
     pub async fn send_raw(&self, data: &[u8]) -> crate::error::Result<usize> {
-        let transport = self.get_transport()
+        let transport = self
+            .get_transport()
             .ok_or_else(|| crate::error::TransportError::SendFailed("no transport".into()))?;
 
         let len = transport.send(data).await?;
@@ -576,18 +580,23 @@ impl Uplink {
         // Encrypt the data
         let ciphertext = {
             let mut noise = self.noise_session.lock();
-            let session = noise.as_mut()
-                .ok_or_else(|| crate::error::CryptoError::NoiseProtocol("no noise session".into()))?;
+            let session = noise.as_mut().ok_or_else(|| {
+                crate::error::CryptoError::NoiseProtocol("no noise session".into())
+            })?;
 
             if !session.is_transport() {
-                return Err(crate::error::CryptoError::NoiseProtocol("handshake not complete".into()).into());
+                return Err(crate::error::CryptoError::NoiseProtocol(
+                    "handshake not complete".into(),
+                )
+                .into());
             }
 
             session.encrypt(data)?
         };
 
         // Get transport and send
-        let transport = self.get_transport()
+        let transport = self
+            .get_transport()
             .ok_or_else(|| crate::error::TransportError::SendFailed("no transport".into()))?;
 
         transport.send(&ciphertext).await?;
@@ -597,7 +606,8 @@ impl Uplink {
 
     /// Receive data from transport.
     pub async fn recv(&self, buf: &mut [u8]) -> crate::error::Result<usize> {
-        let transport = self.get_transport()
+        let transport = self
+            .get_transport()
             .ok_or_else(|| crate::error::TransportError::ReceiveFailed("no transport".into()))?;
 
         let len = transport.recv(buf).await?;
@@ -606,8 +616,12 @@ impl Uplink {
     }
 
     /// Receive data from transport with source address.
-    pub async fn recv_from(&self, buf: &mut [u8]) -> crate::error::Result<(usize, std::net::SocketAddr)> {
-        let transport = self.get_transport()
+    pub async fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> crate::error::Result<(usize, std::net::SocketAddr)> {
+        let transport = self
+            .get_transport()
             .ok_or_else(|| crate::error::TransportError::ReceiveFailed("no transport".into()))?;
 
         let (len, addr) = transport.recv_from(buf).await?;
@@ -618,11 +632,14 @@ impl Uplink {
     /// Decrypt received data.
     pub fn decrypt(&self, ciphertext: &[u8]) -> crate::error::Result<Vec<u8>> {
         let mut noise = self.noise_session.lock();
-        let session = noise.as_mut()
+        let session = noise
+            .as_mut()
             .ok_or_else(|| crate::error::CryptoError::NoiseProtocol("no noise session".into()))?;
 
         if !session.is_transport() {
-            return Err(crate::error::CryptoError::NoiseProtocol("handshake not complete".into()).into());
+            return Err(
+                crate::error::CryptoError::NoiseProtocol("handshake not complete".into()).into(),
+            );
         }
 
         Ok(session.decrypt(ciphertext)?)
@@ -630,17 +647,23 @@ impl Uplink {
 
     /// Check if the noise session is ready for transport.
     pub fn is_noise_ready(&self) -> bool {
-        self.noise_session.lock().as_ref().is_some_and(crate::crypto::NoiseSession::is_transport)
+        self.noise_session
+            .lock()
+            .as_ref()
+            .is_some_and(crate::crypto::NoiseSession::is_transport)
     }
 
     /// Encrypt data (get ciphertext without sending).
     pub fn encrypt(&self, data: &[u8]) -> crate::error::Result<Vec<u8>> {
         let mut noise = self.noise_session.lock();
-        let session = noise.as_mut()
+        let session = noise
+            .as_mut()
             .ok_or_else(|| crate::error::CryptoError::NoiseProtocol("no noise session".into()))?;
 
         if !session.is_transport() {
-            return Err(crate::error::CryptoError::NoiseProtocol("handshake not complete".into()).into());
+            return Err(
+                crate::error::CryptoError::NoiseProtocol("handshake not complete".into()).into(),
+            );
         }
 
         Ok(session.encrypt(data)?)
@@ -649,7 +672,8 @@ impl Uplink {
     /// Write handshake message.
     pub fn write_handshake(&self, payload: &[u8]) -> crate::error::Result<Vec<u8>> {
         let mut noise = self.noise_session.lock();
-        let session = noise.as_mut()
+        let session = noise
+            .as_mut()
             .ok_or_else(|| crate::error::CryptoError::NoiseProtocol("no noise session".into()))?;
         Ok(session.write_handshake(payload)?)
     }
@@ -657,7 +681,8 @@ impl Uplink {
     /// Read handshake message.
     pub fn read_handshake(&self, message: &[u8]) -> crate::error::Result<Vec<u8>> {
         let mut noise = self.noise_session.lock();
-        let session = noise.as_mut()
+        let session = noise
+            .as_mut()
             .ok_or_else(|| crate::error::CryptoError::NoiseProtocol("no noise session".into()))?;
         Ok(session.read_handshake(message)?)
     }
@@ -862,79 +887,81 @@ impl Uplink {
         let rtt = self.rtt.read();
         let state = self.state.read();
         let stats = *self.stats.read();
-        
+
         let bandwidth_up = self.bandwidth.send_bandwidth();
         let bandwidth_down = self.bandwidth.recv_bandwidth();
         let smoothed_rtt = rtt.smoothed();
         let loss = self.loss.loss_ratio();
-        
+
         // Calculate bandwidth-delay product
         let bdp = if smoothed_rtt > Duration::ZERO {
             (bandwidth_down.bytes_per_sec * smoothed_rtt.as_secs_f64()) as u64
         } else {
             0
         };
-        
+
         // Calculate effective throughput (considering loss)
         let loss_factor = (1.0 - loss).max(0.01);
         let effective_throughput = bandwidth_down.bytes_per_sec * loss_factor;
-        
+
         // Estimate time to transfer 1MB
         let time_for_1mb = if effective_throughput > 0.0 {
-            let secs = ((1024.0 * 1024.0) / effective_throughput + smoothed_rtt.as_secs_f64()).min(3600.0);
+            let secs =
+                ((1024.0 * 1024.0) / effective_throughput + smoothed_rtt.as_secs_f64()).min(3600.0);
             Duration::from_secs_f64(secs)
         } else {
             Duration::from_secs(3600) // 1 hour max
         };
-        
+
         // Calculate goodput (actual useful throughput)
         let total_sent = stats.bytes_sent.max(1);
-        let retransmission_rate = stats.packets_retransmitted as f64 / stats.packets_sent.max(1) as f64;
+        let retransmission_rate =
+            stats.packets_retransmitted as f64 / stats.packets_sent.max(1) as f64;
         let goodput = bandwidth_down.bytes_per_sec * (1.0 - retransmission_rate);
-        
+
         ConnectionParams {
             // Identity
             uplink_id: self.numeric_id,
             interface_type: self.config.interface_type,
             protocol: self.config.protocol,
-            
+
             // Timing
             rtt: smoothed_rtt,
             rtt_variance: rtt.variance(),
             rtt_min: rtt.samples.front().copied().unwrap_or(Duration::ZERO),
             jitter: rtt.variance(),
-            
+
             // Bandwidth
             bandwidth_up,
             bandwidth_down,
             effective_throughput: Bandwidth::from_bps(effective_throughput),
             goodput: Bandwidth::from_bps(goodput),
             max_bandwidth_mbps: self.config.max_bandwidth_mbps,
-            
+
             // Capacity
             bdp,
             cwnd: self.cwnd.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Relaxed),
-            
+
             // Loss
             packet_loss: loss,
             retransmission_rate,
-            
+
             // Health
             health: state.health,
             consecutive_failures: state.consecutive_failures,
-            is_usable: self.config.enabled 
-                && state.connection_state == ConnectionState::Connected 
+            is_usable: self.config.enabled
+                && state.connection_state == ConnectionState::Connected
                 && state.health.is_usable(),
-            
+
             // NAT
             is_natted: self.nat_state.read().is_natted(),
             nat_type: self.nat_state.read().nat_type(),
-            
+
             // Transfer estimates
             time_for_1mb,
             priority_score: self.priority_score.load(Ordering::Relaxed),
-            
+
             // Statistics
             bytes_sent: stats.bytes_sent,
             bytes_received: stats.bytes_received,

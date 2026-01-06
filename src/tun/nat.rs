@@ -307,15 +307,20 @@ impl NatTable {
 
         // Modify packet
         let mut pkt = IpPacketMut::new(packet)?;
-        
+
         // Update transport checksum first (before modifying addresses)
         pkt.update_transport_checksum(entry.original_src, entry.translated_src)?;
-        
+
         // Set new source address
         pkt.set_src_addr(entry.translated_src)?;
 
         // Update source port in transport header
-        self.set_src_port_direct(pkt.data_mut(), header_len, protocol, entry.translated_src_port)?;
+        self.set_src_port_direct(
+            pkt.data_mut(),
+            header_len,
+            protocol,
+            entry.translated_src_port,
+        )?;
 
         // Update stats
         {
@@ -374,15 +379,20 @@ impl NatTable {
 
         // Modify packet to restore original destination
         let mut pkt = IpPacketMut::new(packet)?;
-        
+
         // Update transport checksum first
         pkt.update_transport_checksum(entry.translated_src, entry.original_src)?;
-        
+
         // Restore original destination address
         pkt.set_dst_addr(entry.original_src)?;
 
         // Restore original destination port
-        self.set_dst_port_direct(pkt.data_mut(), header_len, protocol, entry.original_src_port)?;
+        self.set_dst_port_direct(
+            pkt.data_mut(),
+            header_len,
+            protocol,
+            entry.original_src_port,
+        )?;
 
         // Update stats
         {
@@ -469,23 +479,24 @@ impl NatTable {
     fn get_tunnel_address(&self, original: IpAddr) -> IpAddr {
         match original {
             IpAddr::V4(_) => IpAddr::V4(self.config.tunnel_ipv4),
-            IpAddr::V6(_) => {
-                self.config.tunnel_ipv6
-                    .map(IpAddr::V6)
-                    .unwrap_or_else(|| IpAddr::V4(self.config.tunnel_ipv4))
-            }
+            IpAddr::V6(_) => self
+                .config
+                .tunnel_ipv6
+                .map(IpAddr::V6)
+                .unwrap_or_else(|| IpAddr::V4(self.config.tunnel_ipv4)),
         }
     }
 
     fn allocate_port(&self) -> Result<u16> {
         let range_size = self.config.port_range_end - self.config.port_range_start;
-        
+
         for _ in 0..range_size {
             let port = self.next_port.fetch_add(1, Ordering::SeqCst);
-            
+
             // Wrap around
             if port >= self.config.port_range_end {
-                self.next_port.store(self.config.port_range_start, Ordering::SeqCst);
+                self.next_port
+                    .store(self.config.port_range_start, Ordering::SeqCst);
             }
 
             // Check if port is available
@@ -498,7 +509,13 @@ impl NatTable {
         Err(Error::Config("NAT port exhaustion".into()))
     }
 
-    fn set_src_port_direct(&self, packet: &mut [u8], header_len: usize, protocol: TransportProtocol, port: u16) -> Result<()> {
+    fn set_src_port_direct(
+        &self,
+        packet: &mut [u8],
+        header_len: usize,
+        protocol: TransportProtocol,
+        port: u16,
+    ) -> Result<()> {
         if packet.len() < header_len + 2 {
             return Ok(());
         }
@@ -514,7 +531,13 @@ impl NatTable {
         Ok(())
     }
 
-    fn set_dst_port_direct(&self, packet: &mut [u8], header_len: usize, protocol: TransportProtocol, port: u16) -> Result<()> {
+    fn set_dst_port_direct(
+        &self,
+        packet: &mut [u8],
+        header_len: usize,
+        protocol: TransportProtocol,
+        port: u16,
+    ) -> Result<()> {
         if packet.len() < header_len + 4 {
             return Ok(());
         }

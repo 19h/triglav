@@ -53,26 +53,26 @@
 #![allow(clippy::must_use_candidate)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
-#![allow(clippy::missing_const_for_fn)]      // Many functions can't be const due to trait bounds
-#![allow(clippy::doc_markdown)]              // ASCII diagrams in docs
-#![allow(clippy::unreadable_literal)]        // Numeric literals are clear
-#![allow(clippy::cast_possible_truncation)]  // Intentional score calculations
-#![allow(clippy::cast_sign_loss)]            // Scores are always positive
-#![allow(clippy::cast_precision_loss)]       // Acceptable for stats
-#![allow(clippy::cast_possible_wrap)]        // Intentional for sequence arithmetic
-#![allow(clippy::suboptimal_flops)]          // Clarity over micro-optimization
-#![allow(clippy::similar_names)]             // state/stats are intentionally named
+#![allow(clippy::missing_const_for_fn)] // Many functions can't be const due to trait bounds
+#![allow(clippy::doc_markdown)] // ASCII diagrams in docs
+#![allow(clippy::unreadable_literal)] // Numeric literals are clear
+#![allow(clippy::cast_possible_truncation)] // Intentional score calculations
+#![allow(clippy::cast_sign_loss)] // Scores are always positive
+#![allow(clippy::cast_precision_loss)] // Acceptable for stats
+#![allow(clippy::cast_possible_wrap)] // Intentional for sequence arithmetic
+#![allow(clippy::suboptimal_flops)] // Clarity over micro-optimization
+#![allow(clippy::similar_names)] // state/stats are intentionally named
 #![allow(clippy::significant_drop_tightening)] // Lock ordering is intentional
-#![allow(clippy::option_if_let_else)]        // More readable in context
-#![allow(clippy::use_self)]                  // Explicit type names in matches
-#![allow(clippy::redundant_pub_crate)]       // Explicit visibility
-#![allow(clippy::cognitive_complexity)]      // Complex state machines
-#![allow(clippy::too_many_lines)]            // Complete implementations
-#![allow(clippy::future_not_send)]           // Async internals
-#![allow(clippy::struct_excessive_bools)]    // Boolean config fields are appropriate
-#![allow(clippy::match_same_arms)]           // Explicit arm per variant is clearer
-#![allow(clippy::return_self_not_must_use)]  // Builder methods don't need must_use
-#![allow(clippy::ignored_unit_patterns)]     // Ok(_) vs Ok(()) is stylistic
+#![allow(clippy::option_if_let_else)] // More readable in context
+#![allow(clippy::use_self)] // Explicit type names in matches
+#![allow(clippy::redundant_pub_crate)] // Explicit visibility
+#![allow(clippy::cognitive_complexity)] // Complex state machines
+#![allow(clippy::too_many_lines)] // Complete implementations
+#![allow(clippy::future_not_send)] // Async internals
+#![allow(clippy::struct_excessive_bools)] // Boolean config fields are appropriate
+#![allow(clippy::match_same_arms)] // Explicit arm per variant is clearer
+#![allow(clippy::return_self_not_must_use)] // Builder methods don't need must_use
+#![allow(clippy::ignored_unit_patterns)] // Ok(_) vs Ok(()) is stylistic
 
 pub mod config;
 pub mod crypto;
@@ -116,10 +116,10 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::metrics::QualityMetrics;
     pub use crate::multipath::{MultipathManager, Uplink};
-    pub use crate::types::UplinkId;
     pub use crate::protocol::{Message, Packet};
-    pub use crate::proxy::{Socks5Server, Socks5Config, HttpProxyServer, HttpProxyConfig};
+    pub use crate::proxy::{HttpProxyConfig, HttpProxyServer, Socks5Config, Socks5Server};
     pub use crate::transport::{Transport, TransportConfig};
-    pub use crate::tun::{TunnelRunner, TunnelConfig, TunDevice, TunConfig};
+    pub use crate::tun::{TunConfig, TunDevice, TunnelConfig, TunnelRunner};
+    pub use crate::types::UplinkId;
     pub use crate::types::*;
 }

@@ -1,17 +1,17 @@
 //! Integration tests for Triglav client-server communication.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use triglav::crypto::{KeyPair, NoiseSession};
 use triglav::error::Result;
-use triglav::multipath::{MultipathManager, MultipathConfig, UplinkConfig};
-use triglav::protocol::{Packet, PacketType, PacketFlags, HEADER_SIZE};
-use triglav::proxy::{Socks5Server, Socks5Config, HttpProxyServer, HttpProxyConfig};
+use triglav::multipath::{MultipathConfig, MultipathManager, UplinkConfig};
+use triglav::protocol::{Packet, PacketFlags, PacketType, HEADER_SIZE};
+use triglav::proxy::{HttpProxyConfig, HttpProxyServer, Socks5Config, Socks5Server};
 use triglav::transport::TransportProtocol;
-use triglav::types::{SessionId, SequenceNumber, UplinkId};
+use triglav::types::{SequenceNumber, SessionId, UplinkId};
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -85,11 +85,12 @@ impl TestServer {
         let session_id = packet.header.session_id;
 
         // Get or create session
-        let session = self.sessions.entry(session_id).or_insert_with(|| {
-            TestSession {
+        let session = self
+            .sessions
+            .entry(session_id)
+            .or_insert_with(|| TestSession {
                 noise: RwLock::new(None),
-            }
-        });
+            });
 
         match packet.header.packet_type {
             PacketType::Handshake => {
@@ -106,7 +107,9 @@ impl TestServer {
                     response,
                 )?;
 
-                self.socket.send_to(&response_packet.encode()?, addr).await?;
+                self.socket
+                    .send_to(&response_packet.encode()?, addr)
+                    .await?;
                 *session.noise.write() = Some(noise);
             }
             PacketType::Data => {
@@ -126,15 +129,16 @@ impl TestServer {
                 };
 
                 // Echo back (encrypted if we have session)
-                let (response_payload, encrypted) = if let Some(ref mut noise) = *session.noise.write() {
-                    if noise.is_transport() {
-                        (noise.encrypt(&payload)?, true)
+                let (response_payload, encrypted) =
+                    if let Some(ref mut noise) = *session.noise.write() {
+                        if noise.is_transport() {
+                            (noise.encrypt(&payload)?, true)
+                        } else {
+                            (payload.clone(), false)
+                        }
                     } else {
                         (payload.clone(), false)
-                    }
-                } else {
-                    (payload.clone(), false)
-                };
+                    };
 
                 let mut response_packet = Packet::data(
                     self.next_sequence(),
@@ -147,7 +151,9 @@ impl TestServer {
                     response_packet.set_flag(PacketFlags::ENCRYPTED);
                 }
 
-                self.socket.send_to(&response_packet.encode()?, addr).await?;
+                self.socket
+                    .send_to(&response_packet.encode()?, addr)
+                    .await?;
             }
             PacketType::Ping => {
                 let pong = Packet::pong(
@@ -172,7 +178,9 @@ impl TestServer {
 #[tokio::test]
 async fn test_handshake_and_echo() {
     // Start server on random port
-    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let server_addr = server.local_addr().unwrap();
     let server_public = server.public_key().clone();
 
@@ -237,7 +245,9 @@ async fn test_handshake_and_echo() {
 #[tokio::test]
 async fn test_multiple_messages() {
     // Start server
-    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let server_addr = server.local_addr().unwrap();
     let server_public = server.public_key().clone();
 
@@ -287,7 +297,9 @@ async fn test_multiple_messages() {
 #[tokio::test]
 async fn test_large_payload() {
     // Start server
-    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let server_addr = server.local_addr().unwrap();
     let server_public = server.public_key().clone();
 
@@ -339,7 +351,9 @@ async fn test_socks5_proxy_startup() {
     use tokio::net::TcpStream;
 
     // Start backend server
-    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let server_addr = server.local_addr().unwrap();
     let server_public = server.public_key().clone();
 
@@ -395,10 +409,7 @@ async fn test_socks5_proxy_startup() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Connect to SOCKS5 proxy and perform handshake
-    let result = tokio::time::timeout(
-        Duration::from_secs(2),
-        TcpStream::connect(socks_addr)
-    ).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(socks_addr)).await;
 
     match result {
         Ok(Ok(mut stream)) => {
@@ -436,16 +447,17 @@ async fn test_socks5_proxy_startup() {
 
             // Read the echoed CONNECT request first
             let mut connect_echo = vec![0u8; 100];
-            let read_result = tokio::time::timeout(
-                Duration::from_secs(2),
-                stream.read(&mut connect_echo)
-            ).await;
+            let read_result =
+                tokio::time::timeout(Duration::from_secs(2), stream.read(&mut connect_echo)).await;
 
             match read_result {
                 Ok(Ok(n)) if n > 0 => {
                     let received = String::from_utf8_lossy(&connect_echo[..n]);
-                    assert!(received.contains("CONNECT"),
-                        "Should receive echoed CONNECT request, got: {}", received);
+                    assert!(
+                        received.contains("CONNECT"),
+                        "Should receive echoed CONNECT request, got: {}",
+                        received
+                    );
                     println!("SOCKS5 received CONNECT echo: {:?}", received);
                 }
                 Ok(Ok(_)) => panic!("Connection closed before receiving CONNECT echo"),
@@ -460,17 +472,18 @@ async fn test_socks5_proxy_startup() {
 
             // Read echoed test data
             let mut echo_buf = vec![0u8; test_data.len() + 50];
-            let read_result = tokio::time::timeout(
-                Duration::from_secs(2),
-                stream.read(&mut echo_buf)
-            ).await;
+            let read_result =
+                tokio::time::timeout(Duration::from_secs(2), stream.read(&mut echo_buf)).await;
 
             match read_result {
                 Ok(Ok(n)) if n > 0 => {
                     let received = &echo_buf[..n];
-                    println!("SOCKS5 received {} bytes: {:?}", n, String::from_utf8_lossy(received));
-                    assert_eq!(received, test_data,
-                        "Echoed data should match test data");
+                    println!(
+                        "SOCKS5 received {} bytes: {:?}",
+                        n,
+                        String::from_utf8_lossy(received)
+                    );
+                    assert_eq!(received, test_data, "Echoed data should match test data");
                     println!("SOCKS5 proxy end-to-end data forwarding verified!");
                 }
                 Ok(Ok(_)) => panic!("Connection closed before receiving test data echo"),
@@ -491,7 +504,9 @@ async fn test_http_proxy_connect() {
     use tokio::net::TcpStream;
 
     // Start backend server
-    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let server_addr = server.local_addr().unwrap();
     let server_public = server.public_key().clone();
 
@@ -538,10 +553,7 @@ async fn test_http_proxy_connect() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Connect to HTTP proxy
-    let result = tokio::time::timeout(
-        Duration::from_secs(2),
-        TcpStream::connect(http_addr)
-    ).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(http_addr)).await;
 
     match result {
         Ok(Ok(stream)) => {
@@ -549,20 +561,25 @@ async fn test_http_proxy_connect() {
             let mut reader = BufReader::new(reader);
 
             // Send HTTP CONNECT request
-            writer.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n").await.unwrap();
+            writer
+                .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+                .await
+                .unwrap();
             writer.flush().await.unwrap();
 
             // Read response line
             let mut response_line = String::new();
-            let read_result = tokio::time::timeout(
-                Duration::from_secs(2),
-                reader.read_line(&mut response_line)
-            ).await;
+            let read_result =
+                tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+                    .await;
 
             match read_result {
                 Ok(Ok(_)) => {
-                    assert!(response_line.contains("200"),
-                        "Should get 200 response, got: {}", response_line);
+                    assert!(
+                        response_line.contains("200"),
+                        "Should get 200 response, got: {}",
+                        response_line
+                    );
                     println!("HTTP proxy CONNECT response: {}", response_line.trim());
 
                     // Read remaining headers until empty line
@@ -581,17 +598,18 @@ async fn test_http_proxy_connect() {
 
                     // Read echoed data (first the CONNECT request echo, then our data)
                     let mut echo_buf = vec![0u8; 200];
-                    let read_result = tokio::time::timeout(
-                        Duration::from_secs(2),
-                        reader.read(&mut echo_buf)
-                    ).await;
+                    let read_result =
+                        tokio::time::timeout(Duration::from_secs(2), reader.read(&mut echo_buf))
+                            .await;
 
                     match read_result {
                         Ok(Ok(n)) if n > 0 => {
                             let received = String::from_utf8_lossy(&echo_buf[..n]);
                             println!("HTTP proxy received: {:?}", received);
-                            assert!(received.contains("CONNECT"),
-                                "Should receive echoed CONNECT request");
+                            assert!(
+                                received.contains("CONNECT"),
+                                "Should receive echoed CONNECT request"
+                            );
                             println!("HTTP proxy end-to-end test passed!");
                         }
                         Ok(Ok(_)) => panic!("Connection closed before receiving echo"),
@@ -619,7 +637,9 @@ async fn test_flow_binding_consistency() {
     //! This is the core Dublin Traceroute ECMP consistency requirement.
 
     // Start server
-    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let server_addr = server.local_addr().unwrap();
     let server_public = server.public_key().clone();
 
@@ -657,20 +677,35 @@ async fn test_flow_binding_consistency() {
     // Send multiple messages on the same flow
     for i in 0..5 {
         let msg = format!("Flow message {}", i);
-        manager.send_on_flow(Some(flow_id), msg.as_bytes()).await.unwrap();
+        manager
+            .send_on_flow(Some(flow_id), msg.as_bytes())
+            .await
+            .unwrap();
 
         // Verify flow binding is consistent
         let bound_uplink = manager.get_flow_binding(flow_id);
-        assert_eq!(bound_uplink, Some(uplink_id),
-            "Flow should remain bound to same uplink on message {}", i);
+        assert_eq!(
+            bound_uplink,
+            Some(uplink_id),
+            "Flow should remain bound to same uplink on message {}",
+            i
+        );
     }
 
     // Verify flow count
-    assert_eq!(manager.active_flow_count(), 1, "Should have exactly 1 active flow");
+    assert_eq!(
+        manager.active_flow_count(),
+        1,
+        "Should have exactly 1 active flow"
+    );
 
     // Release the flow
     manager.release_flow(flow_id);
-    assert_eq!(manager.active_flow_count(), 0, "Flow count should be 0 after release");
+    assert_eq!(
+        manager.active_flow_count(),
+        0,
+        "Flow count should be 0 after release"
+    );
 
     server.shutdown();
 }
@@ -681,7 +716,9 @@ async fn test_multiple_flows_different_bindings() {
     //! Uses two separate ports on the same server to simulate multiple uplinks.
 
     // Start server
-    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let server_addr = server.local_addr().unwrap();
     let server_public = server.public_key().clone();
 
@@ -725,8 +762,14 @@ async fn test_multiple_flows_different_bindings() {
     let flow1 = manager.allocate_flow_on_uplink(uplink1_id);
     let flow2 = manager.allocate_flow_on_uplink(uplink2_id);
 
-    assert!(flow1.is_some(), "Should be able to allocate flow on uplink 1");
-    assert!(flow2.is_some(), "Should be able to allocate flow on uplink 2");
+    assert!(
+        flow1.is_some(),
+        "Should be able to allocate flow on uplink 1"
+    );
+    assert!(
+        flow2.is_some(),
+        "Should be able to allocate flow on uplink 2"
+    );
 
     let flow1_id = flow1.unwrap();
     let flow2_id = flow2.unwrap();
@@ -736,7 +779,10 @@ async fn test_multiple_flows_different_bindings() {
     assert_eq!(manager.get_flow_binding(flow2_id), Some(uplink2_id));
 
     // Verify different flows have different IDs
-    assert_ne!(flow1_id, flow2_id, "Different flows should have different IDs");
+    assert_ne!(
+        flow1_id, flow2_id,
+        "Different flows should have different IDs"
+    );
 
     // Verify active flow count
     assert_eq!(manager.active_flow_count(), 2);
@@ -751,7 +797,9 @@ async fn test_nat_state_detection() {
     use triglav::multipath::NatType;
 
     // Start server
-    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let server_addr = server.local_addr().unwrap();
     let server_public = server.public_key().clone();
 
@@ -785,14 +833,22 @@ async fn test_nat_state_detection() {
 
     // Check NAT summary - since we're on loopback, NAT detection will see private address
     let nat_summary = manager.nat_summary();
-    assert!(!nat_summary.is_empty(), "Should have NAT summary for uplinks");
+    assert!(
+        !nat_summary.is_empty(),
+        "Should have NAT summary for uplinks"
+    );
 
     // Simulate external NAT detection (as if from STUN)
-    manager.set_uplink_nat_state(uplink_id, NatType::FullCone, Some("203.0.113.1:12345".parse().unwrap()));
+    manager.set_uplink_nat_state(
+        uplink_id,
+        NatType::FullCone,
+        Some("203.0.113.1:12345".parse().unwrap()),
+    );
 
     // Verify NAT state was updated
     let updated_summary = manager.nat_summary();
-    let (_, nat_type, is_natted) = updated_summary.iter()
+    let (_, nat_type, is_natted) = updated_summary
+        .iter()
         .find(|(id, _, _)| id.as_str() == "test-uplink")
         .expect("Should find test-uplink");
 
@@ -809,7 +865,9 @@ async fn test_nat_aware_uplink_selection() {
     use triglav::multipath::NatType;
 
     // Start server
-    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let server_addr = server.local_addr().unwrap();
     let server_public = server.public_key().clone();
 
@@ -851,15 +909,26 @@ async fn test_nat_aware_uplink_selection() {
     assert_eq!(non_natted.len(), 1, "Should have 1 non-NATted uplink");
 
     // Now mark as symmetric NAT (worst case)
-    manager.set_uplink_nat_state(uplink_id, NatType::Symmetric, Some("203.0.113.1:12345".parse().unwrap()));
+    manager.set_uplink_nat_state(
+        uplink_id,
+        NatType::Symmetric,
+        Some("203.0.113.1:12345".parse().unwrap()),
+    );
 
     // Non-NATted list should be empty now
     let non_natted = manager.non_natted_uplinks();
-    assert!(non_natted.is_empty(), "Non-NATted list should be empty after marking as Symmetric NAT");
+    assert!(
+        non_natted.is_empty(),
+        "Non-NATted list should be empty after marking as Symmetric NAT"
+    );
 
     // But NAT-aware selection should still return the uplink (as fallback)
     let selected = manager.select_nat_aware(None);
-    assert_eq!(selected, Some(uplink_id), "Should still select uplink as fallback");
+    assert_eq!(
+        selected,
+        Some(uplink_id),
+        "Should still select uplink as fallback"
+    );
 
     server.shutdown();
 }
@@ -868,10 +937,12 @@ async fn test_nat_aware_uplink_selection() {
 async fn test_path_discovery_event() {
     //! Verify that path discovery events are emitted when enabled.
 
-    use triglav::multipath::{MultipathEvent};
+    use triglav::multipath::MultipathEvent;
 
     // Start server
-    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let server_addr = server.local_addr().unwrap();
     let server_public = server.public_key().clone();
 
@@ -916,9 +987,15 @@ async fn test_path_discovery_event() {
 
     while start.elapsed() < timeout {
         match tokio::time::timeout(Duration::from_millis(100), event_rx.recv()).await {
-            Ok(Ok(MultipathEvent::PathDiscoveryComplete { destination, paths_found, diversity_score })) => {
-                println!("Path discovery complete: destination={}, paths={}, diversity={}",
-                    destination, paths_found, diversity_score);
+            Ok(Ok(MultipathEvent::PathDiscoveryComplete {
+                destination,
+                paths_found,
+                diversity_score,
+            })) => {
+                println!(
+                    "Path discovery complete: destination={}, paths={}, diversity={}",
+                    destination, paths_found, diversity_score
+                );
                 found_path_discovery = true;
                 break;
             }
@@ -926,17 +1003,22 @@ async fn test_path_discovery_event() {
                 println!("Received event: {:?}", event);
             }
             Ok(Err(_)) => break, // Channel closed
-            Err(_) => continue, // Timeout, try again
+            Err(_) => continue,  // Timeout, try again
         }
     }
 
-    assert!(found_path_discovery, "Should receive PathDiscoveryComplete event");
+    assert!(
+        found_path_discovery,
+        "Should receive PathDiscoveryComplete event"
+    );
 
     // Verify path discovery state via the manager
     let path_discovery = manager.path_discovery();
     let diversity = path_discovery.get_diversity(server_addr);
-    println!("Path diversity: unique_paths={}, score={}",
-        diversity.unique_paths, diversity.diversity_score);
+    println!(
+        "Path diversity: unique_paths={}, score={}",
+        diversity.unique_paths, diversity.diversity_score
+    );
 
     server.shutdown();
 }
@@ -968,7 +1050,10 @@ async fn test_flow_hash_calculation() {
     // Different ports should produce different hashes (usually)
     let flow2 = flow.with_src_port(12346);
     let hash3 = flow2.flow_hash();
-    assert_ne!(hash1, hash3, "Different ports should produce different hashes");
+    assert_ne!(
+        hash1, hash3,
+        "Different ports should produce different hashes"
+    );
 
     // TCP and UDP should produce different hashes
     let flow_tcp = FlowId::new(
@@ -985,8 +1070,11 @@ async fn test_flow_hash_calculation() {
         80,
         17, // UDP
     );
-    assert_ne!(flow_tcp.flow_hash(), flow_udp.flow_hash(),
-        "TCP and UDP flows should have different hashes");
+    assert_ne!(
+        flow_tcp.flow_hash(),
+        flow_udp.flow_hash(),
+        "TCP and UDP flows should have different hashes"
+    );
 }
 
 #[tokio::test]
@@ -994,7 +1082,9 @@ async fn test_stale_flow_cleanup() {
     //! Verify that stale flows are cleaned up when their uplink becomes unusable.
 
     // Start server
-    let server = TestServer::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server = TestServer::new("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let server_addr = server.local_addr().unwrap();
     let server_public = server.public_key().clone();
 
@@ -1036,8 +1126,15 @@ async fn test_stale_flow_cleanup() {
     manager.cleanup_stale_flows();
 
     // Flow should be cleaned up since its uplink is gone
-    assert_eq!(manager.active_flow_count(), 0, "Stale flow should be cleaned up");
-    assert!(manager.get_flow_binding(flow_id).is_none(), "Flow binding should be removed");
+    assert_eq!(
+        manager.active_flow_count(),
+        0,
+        "Stale flow should be cleaned up"
+    );
+    assert!(
+        manager.get_flow_binding(flow_id).is_none(),
+        "Flow binding should be removed"
+    );
 
     server.shutdown();
 }

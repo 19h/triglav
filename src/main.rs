@@ -13,13 +13,13 @@ use tokio::signal;
 use tokio::sync::broadcast;
 
 use triglav::cli::*;
-use triglav::config::{Config, init_logging};
+use triglav::config::{init_logging, Config};
 use triglav::crypto::KeyPair;
 use triglav::error::Result;
 use triglav::multipath::{MultipathConfig, MultipathManager, UplinkConfig};
-use triglav::proxy::{Socks5Server, Socks5Config, HttpProxyServer, HttpProxyConfig};
+use triglav::proxy::{HttpProxyConfig, HttpProxyServer, Socks5Config, Socks5Server};
 use triglav::transport::TransportProtocol;
-use triglav::tun::{TunnelRunner, TunnelConfig, TunConfig, NatConfig, RouteConfig};
+use triglav::tun::{NatConfig, RouteConfig, TunConfig, TunnelConfig, TunnelRunner};
 use triglav::types::AuthKey;
 use triglav::util;
 use triglav::VERSION;
@@ -62,10 +62,22 @@ async fn main() -> Result<()> {
 
 /// Run the server
 async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
-    println!("{}", "╔══════════════════════════════════════════╗".bright_cyan());
-    println!("{}", "║     TRIGLAV SERVER                       ║".bright_cyan());
-    println!("{}", format!("║     Version {}                         ║", VERSION).bright_cyan());
-    println!("{}", "╚══════════════════════════════════════════╝".bright_cyan());
+    println!(
+        "{}",
+        "╔══════════════════════════════════════════╗".bright_cyan()
+    );
+    println!(
+        "{}",
+        "║     TRIGLAV SERVER                       ║".bright_cyan()
+    );
+    println!(
+        "{}",
+        format!("║     Version {}                         ║", VERSION).bright_cyan()
+    );
+    println!(
+        "{}",
+        "╚══════════════════════════════════════════╝".bright_cyan()
+    );
     println!();
 
     // Load or generate key
@@ -75,7 +87,11 @@ async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
         } else if args.generate_key {
             let kp = KeyPair::generate();
             save_keypair(&kp, key_path)?;
-            println!("{} Generated new keypair at {}", "✓".green(), key_path.display());
+            println!(
+                "{} Generated new keypair at {}",
+                "✓".green(),
+                key_path.display()
+            );
             kp
         } else {
             return Err(triglav::Error::Config(format!(
@@ -89,7 +105,7 @@ async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
         kp
     } else {
         return Err(triglav::Error::Config(
-            "No key specified. Use --key <path> or --generate-key".into()
+            "No key specified. Use --key <path> or --generate-key".into(),
         ));
     };
 
@@ -136,10 +152,22 @@ async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
 
 /// Start TUN tunnel (true VPN mode)
 async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
-    println!("{}", "╔══════════════════════════════════════════╗".bright_cyan());
-    println!("{}", "║     TRIGLAV TUN TUNNEL                   ║".bright_cyan());
-    println!("{}", format!("║     Version {}                         ║", VERSION).bright_cyan());
-    println!("{}", "╚══════════════════════════════════════════╝".bright_cyan());
+    println!(
+        "{}",
+        "╔══════════════════════════════════════════╗".bright_cyan()
+    );
+    println!(
+        "{}",
+        "║     TRIGLAV TUN TUNNEL                   ║".bright_cyan()
+    );
+    println!(
+        "{}",
+        format!("║     Version {}                         ║", VERSION).bright_cyan()
+    );
+    println!(
+        "{}",
+        "╚══════════════════════════════════════════╝".bright_cyan()
+    );
     println!();
 
     // Check privileges
@@ -190,7 +218,9 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
     println!();
 
     // Parse IPv4 address
-    let ipv4: std::net::Ipv4Addr = args.ipv4.parse()
+    let ipv4: std::net::Ipv4Addr = args
+        .ipv4
+        .parse()
         .map_err(|_| triglav::Error::Config(format!("Invalid IPv4 address: {}", args.ipv4)))?;
 
     // Build tunnel configuration
@@ -208,7 +238,9 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
 
     // Exclude server addresses from tunnel
     for addr in server_addrs {
-        route_config.exclude_routes.push(format!("{}/32", addr.ip()));
+        route_config
+            .exclude_routes
+            .push(format!("{}/32", addr.ip()));
     }
 
     let tunnel_config = TunnelConfig {
@@ -221,12 +253,20 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
     // Create tunnel runner
     let mut runner = TunnelRunner::new(tunnel_config)?;
 
-    println!("{} TUN device: {}", "→".cyan(), runner.tun_name().bright_white());
+    println!(
+        "{} TUN device: {}",
+        "→".cyan(),
+        runner.tun_name().bright_white()
+    );
     println!("  IPv4:     {}", ipv4);
     if args.full_tunnel {
         println!("  Mode:     {} (all traffic)", "Full Tunnel".bright_green());
     } else if !args.route.is_empty() {
-        println!("  Mode:     {} ({} routes)", "Split Tunnel".yellow(), args.route.len());
+        println!(
+            "  Mode:     {} ({} routes)",
+            "Split Tunnel".yellow(),
+            args.route.len()
+        );
     } else {
         println!("  Mode:     {} (manual routes)", "Manual".dimmed());
     }
@@ -298,9 +338,18 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
 
 /// Connect to a server (legacy proxy mode)
 async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
-    println!("{}", "╔══════════════════════════════════════════╗".bright_cyan());
-    println!("{}", "║     TRIGLAV CLIENT                       ║".bright_cyan());
-    println!("{}", "╚══════════════════════════════════════════╝".bright_cyan());
+    println!(
+        "{}",
+        "╔══════════════════════════════════════════╗".bright_cyan()
+    );
+    println!(
+        "{}",
+        "║     TRIGLAV CLIENT                       ║".bright_cyan()
+    );
+    println!(
+        "{}",
+        "╚══════════════════════════════════════════╝".bright_cyan()
+    );
     println!();
 
     // Parse auth key
@@ -414,7 +463,10 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
         };
         let socks_server = Socks5Server::new(socks_config, Arc::clone(&manager));
 
-        println!("  SOCKS5:   {} (listening)", format!("127.0.0.1:{}", socks_port).cyan());
+        println!(
+            "  SOCKS5:   {} (listening)",
+            format!("127.0.0.1:{}", socks_port).cyan()
+        );
 
         // Run SOCKS5 server in background
         tokio::spawn(async move {
@@ -434,7 +486,10 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
         };
         let http_server = HttpProxyServer::new(http_config, Arc::clone(&manager));
 
-        println!("  HTTP:     {} (listening)", format!("127.0.0.1:{}", http_port).cyan());
+        println!(
+            "  HTTP:     {} (listening)",
+            format!("127.0.0.1:{}", http_port).cyan()
+        );
 
         // Run HTTP proxy server in background
         tokio::spawn(async move {
@@ -512,8 +567,16 @@ fn run_keygen(args: KeygenArgs) -> Result<()> {
             println!("{}: {}", "Secret Key".yellow(), keypair.secret.to_base64());
         }
         KeyFormat::Hex => {
-            println!("{}: {}", "Public Key".cyan(), hex::encode(keypair.public.as_bytes()));
-            println!("{}: {}", "Secret Key".yellow(), hex::encode(keypair.secret.as_bytes()));
+            println!(
+                "{}: {}",
+                "Public Key".cyan(),
+                hex::encode(keypair.public.as_bytes())
+            );
+            println!(
+                "{}: {}",
+                "Secret Key".yellow(),
+                hex::encode(keypair.secret.as_bytes())
+            );
         }
     }
 
@@ -537,31 +600,49 @@ fn run_keygen(args: KeygenArgs) -> Result<()> {
 async fn run_status(args: StatusArgs) -> Result<()> {
     // Try to connect to local metrics endpoint
     let metrics_url = "http://127.0.0.1:9090";
-    
+
     // Try status endpoint first
     let status_url = format!("{}/status", metrics_url);
-    
+
     match reqwest::get(&status_url).await {
         Ok(response) if response.status().is_success() => {
-            let status: serde_json::Value = response.json().await
+            let status: serde_json::Value = response
+                .json()
+                .await
                 .unwrap_or_else(|_| serde_json::json!({}));
-            
+
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status).unwrap_or_default()
+                );
                 return Ok(());
             }
-            
-            println!("{}", "╔══════════════════════════════════════════╗".bright_cyan());
-            println!("{}", "║     TRIGLAV STATUS                       ║".bright_cyan());
-            println!("{}", "╚══════════════════════════════════════════╝".bright_cyan());
+
+            println!(
+                "{}",
+                "╔══════════════════════════════════════════╗".bright_cyan()
+            );
+            println!(
+                "{}",
+                "║     TRIGLAV STATUS                       ║".bright_cyan()
+            );
+            println!(
+                "{}",
+                "╚══════════════════════════════════════════╝".bright_cyan()
+            );
             println!();
-            
+
             // Version and uptime
             if let Some(version) = status.get("version").and_then(|v| v.as_str()) {
                 println!("  {} {}", "Version:".bright_white(), version);
             }
             if let Some(uptime) = status.get("uptime_seconds").and_then(|v| v.as_u64()) {
-                println!("  {} {}", "Uptime:".bright_white(), util::format_duration(Duration::from_secs(uptime)));
+                println!(
+                    "  {} {}",
+                    "Uptime:".bright_white(),
+                    util::format_duration(Duration::from_secs(uptime))
+                );
             }
             if let Some(state) = status.get("state").and_then(|v| v.as_str()) {
                 let state_colored = match state {
@@ -572,7 +653,7 @@ async fn run_status(args: StatusArgs) -> Result<()> {
                 println!("  {} {}", "State:".bright_white(), state_colored);
             }
             println!();
-            
+
             // Uplinks
             if let Some(uplinks) = status.get("uplinks").and_then(|v| v.as_array()) {
                 println!("{}", "Uplinks:".bright_white().bold());
@@ -580,26 +661,39 @@ async fn run_status(args: StatusArgs) -> Result<()> {
                     println!("  {} No uplinks configured", "○".dimmed());
                 } else {
                     for uplink in uplinks {
-                        let id = uplink.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        let state = uplink.get("state").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let id = uplink
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let state = uplink
+                            .get("state")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
                         let rtt = uplink.get("rtt_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        let loss = uplink.get("loss_percent").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        
+                        let loss = uplink
+                            .get("loss_percent")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+
                         let status_icon = match state {
                             "connected" => "●".green(),
                             "connecting" => "◐".yellow(),
                             _ => "○".red(),
                         };
-                        
+
                         println!(
                             "  {} {} - {} | RTT: {:.1}ms | Loss: {:.1}%",
-                            status_icon, id.bright_white(), state, rtt, loss
+                            status_icon,
+                            id.bright_white(),
+                            state,
+                            rtt,
+                            loss
                         );
                     }
                 }
                 println!();
             }
-            
+
             // Sessions
             if let Some(sessions) = status.get("sessions").and_then(|v| v.as_array()) {
                 println!("{}", "Sessions:".bright_white().bold());
@@ -610,18 +704,18 @@ async fn run_status(args: StatusArgs) -> Result<()> {
                 }
                 println!();
             }
-            
+
             // Traffic
             if let (Some(tx), Some(rx)) = (
                 status.get("total_bytes_sent").and_then(|v| v.as_u64()),
-                status.get("total_bytes_received").and_then(|v| v.as_u64())
+                status.get("total_bytes_received").and_then(|v| v.as_u64()),
             ) {
                 println!("{}", "Traffic:".bright_white().bold());
                 println!("  {} TX: {}", "↑".cyan(), util::format_bytes(tx));
                 println!("  {} RX: {}", "↓".cyan(), util::format_bytes(rx));
                 println!();
             }
-            
+
             // Detailed stats
             if args.detailed {
                 // Fetch metrics
@@ -630,7 +724,11 @@ async fn run_status(args: StatusArgs) -> Result<()> {
                     if let Ok(metrics_text) = metrics_response.text().await {
                         println!("{}", "Metrics:".bright_white().bold());
                         // Show a few key metrics
-                        for line in metrics_text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).take(20) {
+                        for line in metrics_text
+                            .lines()
+                            .filter(|l| !l.starts_with('#') && !l.is_empty())
+                            .take(20)
+                        {
                             println!("  {}", line.dimmed());
                         }
                     }
@@ -644,26 +742,44 @@ async fn run_status(args: StatusArgs) -> Result<()> {
         }
         Err(_) => {
             // No server running, show offline status
-            println!("{}", "╔══════════════════════════════════════════╗".bright_cyan());
-            println!("{}", "║     TRIGLAV STATUS                       ║".bright_cyan());
-            println!("{}", "╚══════════════════════════════════════════╝".bright_cyan());
+            println!(
+                "{}",
+                "╔══════════════════════════════════════════╗".bright_cyan()
+            );
+            println!(
+                "{}",
+                "║     TRIGLAV STATUS                       ║".bright_cyan()
+            );
+            println!(
+                "{}",
+                "╚══════════════════════════════════════════╝".bright_cyan()
+            );
             println!();
-            println!("  {} {}", "Status:".bright_white(), "Not connected".yellow());
+            println!(
+                "  {} {}",
+                "Status:".bright_white(),
+                "Not connected".yellow()
+            );
             println!();
             println!("No Triglav instance detected on {}.", metrics_url.cyan());
             println!();
             println!("To start:");
-            println!("  Server: {} {}", "triglav server --generate-key".cyan(), "");
+            println!(
+                "  Server: {} {}",
+                "triglav server --generate-key".cyan(),
+                ""
+            );
             println!("  Client: {} {}", "triglav connect <key>".cyan(), "");
-            
+
             // Show available network interfaces
             println!();
             println!("{}", "Available Interfaces:".bright_white().bold());
             let interfaces = util::get_network_interfaces();
-            let usable: Vec<_> = interfaces.iter()
+            let usable: Vec<_> = interfaces
+                .iter()
                 .filter(|i| i.is_up && !i.is_loopback)
                 .collect();
-            
+
             if usable.is_empty() {
                 println!("  {} No usable network interfaces found", "⚠".yellow());
             } else {
@@ -683,19 +799,19 @@ async fn run_status(args: StatusArgs) -> Result<()> {
             }
         }
     }
-    
+
     // Watch mode
     if args.watch {
         println!();
         println!("{}", "Watching for updates... (Ctrl+C to stop)".dimmed());
-        
+
         let mut interval = tokio::time::interval(Duration::from_secs(args.interval));
         loop {
             interval.tick().await;
-            
+
             // Clear screen and re-run
             print!("\x1B[2J\x1B[1;1H");
-            
+
             // Recursive call without watch to avoid infinite loop
             let mut no_watch_args = args.clone();
             no_watch_args.watch = false;
@@ -717,12 +833,20 @@ async fn run_uplink(args: UplinkArgs) -> Result<()> {
 
             let interfaces = util::get_network_interfaces();
             for iface in interfaces {
-                let status = if iface.is_up { "UP".green() } else { "DOWN".red() };
+                let status = if iface.is_up {
+                    "UP".green()
+                } else {
+                    "DOWN".red()
+                };
                 let type_str = format!("{:?}", iface.interface_type).dimmed();
 
                 println!(
                     "  {} {} ({}) - {} [{}]",
-                    if iface.is_up { "●".green() } else { "○".dimmed() },
+                    if iface.is_up {
+                        "●".green()
+                    } else {
+                        "○".dimmed()
+                    },
                     iface.name.bright_white(),
                     iface.address,
                     type_str,
@@ -859,7 +983,11 @@ fn run_config(args: ConfigArgs) -> Result<()> {
 
     if let Some(ref path) = args.output {
         std::fs::write(path, &output)?;
-        println!("{} Configuration written to {}", "✓".green(), path.display());
+        println!(
+            "{} Configuration written to {}",
+            "✓".green(),
+            path.display()
+        );
     } else {
         println!("{}", output);
     }

@@ -8,9 +8,9 @@
 
 use std::fmt;
 
-use snow::{Builder, HandshakeState, TransportState};
 use snow::params::NoiseParams;
 use snow::resolvers::{CryptoResolver, DefaultResolver};
+use snow::{Builder, HandshakeState, TransportState};
 
 use crate::crypto::{PublicKey, SecretKey};
 use crate::error::CryptoError;
@@ -226,9 +226,9 @@ impl NoiseSession {
 
                 Ok(buf)
             }
-            NoiseState::Transport(_) => {
-                Err(CryptoError::NoiseProtocol("already in transport mode".into()))
-            }
+            NoiseState::Transport(_) => Err(CryptoError::NoiseProtocol(
+                "already in transport mode".into(),
+            )),
             NoiseState::Failed => Err(CryptoError::NoiseProtocol("session failed".into())),
         }
     }
@@ -250,9 +250,9 @@ impl NoiseSession {
 
                 Ok(buf)
             }
-            NoiseState::Transport(_) => {
-                Err(CryptoError::NoiseProtocol("already in transport mode".into()))
-            }
+            NoiseState::Transport(_) => Err(CryptoError::NoiseProtocol(
+                "already in transport mode".into(),
+            )),
             NoiseState::Failed => Err(CryptoError::NoiseProtocol("session failed".into())),
         }
     }

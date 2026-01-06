@@ -25,13 +25,7 @@ pub struct FlowId {
 
 impl FlowId {
     /// Create a new flow identifier.
-    pub fn new(
-        src_ip: IpAddr,
-        dst_ip: IpAddr,
-        src_port: u16,
-        dst_port: u16,
-        protocol: u8,
-    ) -> Self {
+    pub fn new(src_ip: IpAddr, dst_ip: IpAddr, src_port: u16, dst_port: u16, protocol: u8) -> Self {
         Self {
             src_ip,
             dst_ip,
@@ -62,7 +56,11 @@ impl FlowId {
     /// ECMP-enabled network devices.
     pub fn flow_hash(&self) -> u16 {
         let hash = self.compute_hash();
-        if hash == 0 { 0xffff } else { hash }
+        if hash == 0 {
+            0xffff
+        } else {
+            hash
+        }
     }
 
     /// Internal hash computation matching Dublin Traceroute algorithm.

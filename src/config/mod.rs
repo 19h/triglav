@@ -65,11 +65,15 @@ impl Config {
     /// Validate configuration.
     pub fn validate(&self) -> Result<()> {
         if self.server.enabled && self.server.listen_addrs.is_empty() {
-            return Err(Error::InvalidConfig("Server enabled but no listen addresses".into()));
+            return Err(Error::InvalidConfig(
+                "Server enabled but no listen addresses".into(),
+            ));
         }
 
         if self.client.enabled && self.client.uplinks.is_empty() {
-            return Err(Error::InvalidConfig("Client enabled but no uplinks configured".into()));
+            return Err(Error::InvalidConfig(
+                "Client enabled but no uplinks configured".into(),
+            ));
         }
 
         Ok(())
@@ -77,11 +81,10 @@ impl Config {
 
     /// Get default config path.
     pub fn default_path() -> PathBuf {
-        directories::ProjectDirs::from("com", "triglav", "triglav")
-            .map_or_else(
-                || PathBuf::from("triglav.toml"),
-                |dirs| dirs.config_dir().join("config.toml"),
-            )
+        directories::ProjectDirs::from("com", "triglav", "triglav").map_or_else(
+            || PathBuf::from("triglav.toml"),
+            |dirs| dirs.config_dir().join("config.toml"),
+        )
     }
 
     /// Create example configuration.
@@ -150,9 +153,15 @@ pub struct ServerConfig {
     pub rate_limit: u32,
 }
 
-fn default_max_connections() -> usize { 10000 }
-fn default_idle_timeout() -> std::time::Duration { std::time::Duration::from_secs(300) }
-fn default_tcp_fallback() -> bool { true }
+fn default_max_connections() -> usize {
+    10000
+}
+fn default_idle_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(300)
+}
+fn default_tcp_fallback() -> bool {
+    true
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -204,8 +213,12 @@ pub struct ClientConfig {
     pub max_reconnects: u32,
 }
 
-fn default_reconnect_delay() -> std::time::Duration { std::time::Duration::from_secs(5) }
-fn default_max_reconnects() -> u32 { 10 }
+fn default_reconnect_delay() -> std::time::Duration {
+    std::time::Duration::from_secs(5)
+}
+fn default_max_reconnects() -> u32 {
+    10
+}
 
 impl Default for ClientConfig {
     fn default() -> Self {
@@ -242,9 +255,15 @@ pub struct LoggingConfig {
     pub color: bool,
 }
 
-fn default_log_level() -> String { "info".into() }
-fn default_log_format() -> String { "text".into() }
-fn default_color() -> bool { true }
+fn default_log_level() -> String {
+    "info".into()
+}
+fn default_log_format() -> String {
+    "text".into()
+}
+fn default_color() -> bool {
+    true
+}
 
 impl Default for LoggingConfig {
     fn default() -> Self {
@@ -261,8 +280,8 @@ impl Default for LoggingConfig {
 pub fn init_logging(config: &LoggingConfig) -> Result<()> {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
 
     let subscriber = tracing_subscriber::registry().with(filter);
 

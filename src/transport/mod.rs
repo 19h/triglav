@@ -3,15 +3,15 @@
 //! Provides UDP fast-path and TCP fallback transport with dual-stack IPv4/IPv6 support.
 //! Designed for high performance with zero-copy operations where possible.
 
-mod udp;
-mod tcp;
-mod socket;
 mod buffer;
+mod socket;
+mod tcp;
+mod udp;
 
-pub use udp::{UdpTransport, UdpSocket};
-pub use tcp::{TcpTransport, TcpStream};
-pub use socket::{SocketConfig, bind_socket};
-pub use buffer::{PacketBuffer, BufferPool};
+pub use buffer::{BufferPool, PacketBuffer};
+pub use socket::{bind_socket, SocketConfig};
+pub use tcp::{TcpStream, TcpTransport};
+pub use udp::{UdpSocket, UdpTransport};
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -70,13 +70,27 @@ pub struct TransportConfig {
     pub tcp_fast_open: bool,
 }
 
-fn default_send_buffer() -> usize { 2 * 1024 * 1024 } // 2 MB
-fn default_recv_buffer() -> usize { 2 * 1024 * 1024 } // 2 MB
-fn default_connect_timeout() -> Duration { Duration::from_secs(10) }
-fn default_io_timeout() -> Duration { Duration::from_secs(30) }
-fn default_keepalive() -> Duration { Duration::from_secs(30) }
-fn default_nodelay() -> bool { true }
-fn default_reuse_addr() -> bool { true }
+fn default_send_buffer() -> usize {
+    2 * 1024 * 1024
+} // 2 MB
+fn default_recv_buffer() -> usize {
+    2 * 1024 * 1024
+} // 2 MB
+fn default_connect_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+fn default_io_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+fn default_keepalive() -> Duration {
+    Duration::from_secs(30)
+}
+fn default_nodelay() -> bool {
+    true
+}
+fn default_reuse_addr() -> bool {
+    true
+}
 
 impl Default for TransportConfig {
     fn default() -> Self {

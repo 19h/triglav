@@ -7,16 +7,15 @@
 //! - Key derivation (HKDF-SHA256)
 //! - Secure hashing (BLAKE3)
 
+mod kdf;
 mod keys;
 mod noise;
 mod symmetric;
-mod kdf;
 
-pub use keys::{KeyPair, PublicKey, SecretKey, SigningKeyPair};
-pub use noise::{NoiseSession, NoiseState, HandshakeRole};
-pub use symmetric::{encrypt, decrypt, EncryptedPacket};
 pub use kdf::KeySchedule;
-
+pub use keys::{KeyPair, PublicKey, SecretKey, SigningKeyPair};
+pub use noise::{HandshakeRole, NoiseSession, NoiseState};
+pub use symmetric::{decrypt, encrypt, EncryptedPacket};
 
 /// Hash data using BLAKE3.
 pub fn hash(data: &[u8]) -> [u8; 32] {

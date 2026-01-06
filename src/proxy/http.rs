@@ -4,8 +4,8 @@
 //! through the multipath connection.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -57,12 +57,17 @@ impl HttpProxyServer {
     pub async fn run(&self) -> Result<()> {
         let listener = TcpListener::bind(self.config.listen_addr)
             .await
-            .map_err(|e| Error::Transport(crate::error::TransportError::BindFailed {
-                addr: self.config.listen_addr,
-                reason: e.to_string(),
-            }))?;
+            .map_err(|e| {
+                Error::Transport(crate::error::TransportError::BindFailed {
+                    addr: self.config.listen_addr,
+                    reason: e.to_string(),
+                })
+            })?;
 
-        info!("HTTP CONNECT proxy listening on {}", self.config.listen_addr);
+        info!(
+            "HTTP CONNECT proxy listening on {}",
+            self.config.listen_addr
+        );
 
         loop {
             match listener.accept().await {
@@ -102,12 +107,17 @@ impl HttpProxyServer {
 
         // Read the first line (request line)
         let mut request_line = String::new();
-        reader.read_line(&mut request_line).await.map_err(Error::Io)?;
+        reader
+            .read_line(&mut request_line)
+            .await
+            .map_err(Error::Io)?;
 
         let parts: Vec<&str> = request_line.split_whitespace().collect();
         if parts.len() < 3 {
             Self::send_error(&mut writer, 400, "Bad Request").await?;
-            return Err(Error::Protocol(crate::error::ProtocolError::MalformedHeader));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedHeader,
+            ));
         }
 
         let method = parts[0];
@@ -116,20 +126,24 @@ impl HttpProxyServer {
         // Only handle CONNECT method
         if method != "CONNECT" {
             Self::send_error(&mut writer, 405, "Method Not Allowed").await?;
-            return Err(Error::Protocol(crate::error::ProtocolError::InvalidMessageType(0)));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::InvalidMessageType(0),
+            ));
         }
 
         // Parse target (host:port)
         let target_parts: Vec<&str> = target.split(':').collect();
         if target_parts.len() != 2 {
             Self::send_error(&mut writer, 400, "Bad Request").await?;
-            return Err(Error::Protocol(crate::error::ProtocolError::MalformedHeader));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedHeader,
+            ));
         }
 
         let host = target_parts[0];
-        let port: u16 = target_parts[1].parse().map_err(|_| {
-            Error::Protocol(crate::error::ProtocolError::MalformedHeader)
-        })?;
+        let port: u16 = target_parts[1]
+            .parse()
+            .map_err(|_| Error::Protocol(crate::error::ProtocolError::MalformedHeader))?;
 
         // Read and discard remaining headers until empty line
         loop {
@@ -226,10 +240,12 @@ impl HttpProxyServer {
         code: u16,
         message: &str,
     ) -> Result<()> {
-        let response = format!(
-            "HTTP/1.1 {code} {message}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        writer.write_all(response.as_bytes()).await.map_err(Error::Io)?;
+        let response =
+            format!("HTTP/1.1 {code} {message}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        writer
+            .write_all(response.as_bytes())
+            .await
+            .map_err(Error::Io)?;
         writer.flush().await.map_err(Error::Io)?;
         Ok(())
     }

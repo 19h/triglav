@@ -53,7 +53,10 @@ impl PacketType {
 
     /// Check if this packet type requires reliable delivery.
     pub fn is_reliable(self) -> bool {
-        matches!(self, Self::Data | Self::Control | Self::Handshake | Self::Close)
+        matches!(
+            self,
+            Self::Data | Self::Control | Self::Handshake | Self::Close
+        )
     }
 
     /// Check if this is a control packet.
@@ -236,8 +239,8 @@ impl PacketHeader {
             .into());
         }
 
-        let packet_type = PacketType::from_u8(buf[1])
-            .ok_or(ProtocolError::InvalidMessageType(buf[1]))?;
+        let packet_type =
+            PacketType::from_u8(buf[1]).ok_or(ProtocolError::InvalidMessageType(buf[1]))?;
 
         let flags = PacketFlags::new(BigEndian::read_u16(&buf[2..4]));
         let sequence = SequenceNumber(BigEndian::read_u64(&buf[4..12]));
@@ -407,13 +410,7 @@ mod tests {
     #[test]
     fn test_header_encode_decode() {
         let session_id = SessionId::generate();
-        let header = PacketHeader::new(
-            PacketType::Data,
-            SequenceNumber(42),
-            session_id,
-            1,
-            100,
-        );
+        let header = PacketHeader::new(PacketType::Data, SequenceNumber(42), session_id, 1, 100);
 
         let mut buf = [0u8; HEADER_SIZE];
         header.encode(&mut buf).unwrap();
@@ -431,12 +428,7 @@ mod tests {
         let session_id = SessionId::generate();
         let payload = b"hello world".to_vec();
 
-        let packet = Packet::data(
-            SequenceNumber(1),
-            session_id,
-            0,
-            payload.clone(),
-        ).unwrap();
+        let packet = Packet::data(SequenceNumber(1), session_id, 0, payload.clone()).unwrap();
 
         let encoded = packet.encode().unwrap();
         let decoded = Packet::decode(&encoded).unwrap();
@@ -448,12 +440,7 @@ mod tests {
     #[test]
     fn test_checksum_validation() {
         let session_id = SessionId::generate();
-        let packet = Packet::data(
-            SequenceNumber(1),
-            session_id,
-            0,
-            b"test".to_vec(),
-        ).unwrap();
+        let packet = Packet::data(SequenceNumber(1), session_id, 0, b"test".to_vec()).unwrap();
 
         let mut encoded = packet.encode().unwrap();
 

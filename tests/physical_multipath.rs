@@ -228,14 +228,14 @@ impl PhysicalTestResults {
         println!("\n╔══════════════════════════════════════════════════════════╗");
         println!("║              PHYSICAL TEST RESULTS                       ║");
         println!("╠══════════════════════════════════════════════════════════╣");
-        println!("║ Interfaces Used: {:40} ║", self.interfaces_used.join(", "));
+        println!(
+            "║ Interfaces Used: {:40} ║",
+            self.interfaces_used.join(", ")
+        );
         println!("║ Packets Sent:    {:40} ║", self.packets_sent);
         println!("║ Packets Received:{:40} ║", self.packets_received);
         println!("║ Unique Paths:    {:40} ║", self.unique_paths);
-        println!(
-            "║ Avg Latency:     {:37.2} ms ║",
-            self.avg_latency_ms()
-        );
+        println!("║ Avg Latency:     {:37.2} ms ║", self.avg_latency_ms());
         println!("║ Throughput:      {:34.2} Mbps ║", self.throughput_mbps);
         if let Some(failover) = self.failover_time_ms {
             println!("║ Failover Time:   {:37.2} ms ║", failover);
@@ -696,7 +696,10 @@ async fn test_latency_distribution() {
     // Cleanup
     server_arc.shutdown();
 
-    assert!(!results.is_empty(), "Should measure latency on at least one interface");
+    assert!(
+        !results.is_empty(),
+        "Should measure latency on at least one interface"
+    );
     println!("[PASS] Latency distribution measured");
 }
 
@@ -727,7 +730,10 @@ async fn test_concurrent_traffic() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    println!("Sending concurrent traffic from {} interfaces...\n", interfaces.len());
+    println!(
+        "Sending concurrent traffic from {} interfaces...\n",
+        interfaces.len()
+    );
 
     // Spawn concurrent senders
     let mut handles = Vec::new();
@@ -819,7 +825,10 @@ async fn test_external_connectivity() {
     // Using Cloudflare's DNS as a simple external endpoint
     let external_addr: SocketAddr = "1.1.1.1:53".parse().unwrap();
 
-    println!("Testing external connectivity to {} from each interface:\n", external_addr);
+    println!(
+        "Testing external connectivity to {} from each interface:\n",
+        external_addr
+    );
 
     for (name, ip) in &interfaces {
         let local_addr = SocketAddr::new(*ip, 0);
@@ -846,10 +855,7 @@ async fn test_external_connectivity() {
                     match timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await {
                         Ok(Ok((len, _from))) => {
                             let latency = start.elapsed().as_secs_f64() * 1000.0;
-                            println!(
-                                "  {} ({}): OK - {} bytes, {:.2} ms",
-                                name, ip, len, latency
-                            );
+                            println!("  {} ({}): OK - {} bytes, {:.2} ms", name, ip, len, latency);
                         }
                         Ok(Err(e)) => {
                             println!("  {} ({}): Error - {}", name, ip, e);

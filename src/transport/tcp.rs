@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream as TokioTcpStream};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use super::{Transport, TransportConfig, SocketConfig};
+use super::{SocketConfig, Transport, TransportConfig};
 use crate::error::{Result, TransportError};
 
 /// TCP transport for reliable communication.
@@ -36,13 +36,15 @@ impl TcpTransport {
         let std_socket = super::socket::create_tcp_socket(addr, &socket_config)?;
 
         // Set to non-blocking and convert to tokio
-        std_socket.set_nonblocking(true)
+        std_socket
+            .set_nonblocking(true)
             .map_err(|e| TransportError::BindFailed {
                 addr,
                 reason: e.to_string(),
             })?;
 
-        std_socket.listen(1024)
+        std_socket
+            .listen(1024)
             .map_err(|e| TransportError::BindFailed {
                 addr,
                 reason: e.to_string(),
@@ -50,13 +52,14 @@ impl TcpTransport {
 
         // Convert socket2::Socket to std::net::TcpListener then to tokio
         let std_listener: std::net::TcpListener = std_socket.into();
-        let listener = TcpListener::from_std(std_listener)
-            .map_err(|e| TransportError::BindFailed {
+        let listener =
+            TcpListener::from_std(std_listener).map_err(|e| TransportError::BindFailed {
                 addr,
                 reason: e.to_string(),
             })?;
 
-        let local_addr = listener.local_addr()
+        let local_addr = listener
+            .local_addr()
             .map_err(|e| TransportError::SocketError(e.to_string()))?;
 
         Ok(Self {
@@ -87,20 +90,24 @@ impl TcpTransport {
             tokio::net::TcpSocket::new_v6()
         } else {
             tokio::net::TcpSocket::new_v4()
-        }.map_err(|e| TransportError::Tcp(e.to_string()))?;
+        }
+        .map_err(|e| TransportError::Tcp(e.to_string()))?;
 
         // Apply socket options
-        tokio_socket.set_reuseaddr(config.reuse_addr)
+        tokio_socket
+            .set_reuseaddr(config.reuse_addr)
             .map_err(|e| TransportError::Tcp(e.to_string()))?;
 
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         if config.reuse_port {
-            tokio_socket.set_reuseport(true)
+            tokio_socket
+                .set_reuseport(true)
                 .map_err(|e| TransportError::Tcp(e.to_string()))?;
         }
 
         // Bind
-        tokio_socket.bind(bind)
+        tokio_socket
+            .bind(bind)
             .map_err(|e| TransportError::BindFailed {
                 addr: bind,
                 reason: e.to_string(),
@@ -117,11 +124,13 @@ impl TcpTransport {
 
         // Apply TCP options
         if config.tcp_nodelay {
-            stream.set_nodelay(true)
+            stream
+                .set_nodelay(true)
                 .map_err(|e| TransportError::Tcp(e.to_string()))?;
         }
 
-        let local_addr = stream.local_addr()
+        let local_addr = stream
+            .local_addr()
             .map_err(|e| TransportError::SocketError(e.to_string()))?;
 
         Ok(Self {
@@ -135,7 +144,9 @@ impl TcpTransport {
 
     /// Accept a new connection (server mode).
     pub async fn accept(&self) -> Result<(TcpStream, SocketAddr)> {
-        let listener = self.listener.as_ref()
+        let listener = self
+            .listener
+            .as_ref()
             .ok_or_else(|| TransportError::Tcp("not in listen mode".into()))?;
 
         let (stream, addr) = listener
@@ -145,7 +156,8 @@ impl TcpTransport {
 
         // Apply TCP options
         if self.config.tcp_nodelay {
-            stream.set_nodelay(true)
+            stream
+                .set_nodelay(true)
                 .map_err(|e| TransportError::Tcp(e.to_string()))?;
         }
 
@@ -174,22 +186,28 @@ impl Transport for TcpTransport {
     }
 
     async fn send(&self, data: &[u8]) -> Result<usize> {
-        let stream = self.stream.read().clone()
+        let stream = self
+            .stream
+            .read()
+            .clone()
             .ok_or_else(|| TransportError::SendFailed("not connected".into()))?;
 
         let mut guard = stream.lock().await;
 
         // Write length prefix (4 bytes, big-endian) then data
         let len = data.len() as u32;
-        guard.write_all(&len.to_be_bytes())
+        guard
+            .write_all(&len.to_be_bytes())
             .await
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
-        guard.write_all(data)
+        guard
+            .write_all(data)
             .await
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
-        guard.flush()
+        guard
+            .flush()
             .await
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
@@ -203,26 +221,34 @@ impl Transport for TcpTransport {
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        let stream = self.stream.read().clone()
+        let stream = self
+            .stream
+            .read()
+            .clone()
             .ok_or_else(|| TransportError::ReceiveFailed("not connected".into()))?;
 
         let mut guard = stream.lock().await;
 
         // Read length prefix
         let mut len_buf = [0u8; 4];
-        guard.read_exact(&mut len_buf)
+        guard
+            .read_exact(&mut len_buf)
             .await
             .map_err(|e| TransportError::ReceiveFailed(e.to_string()))?;
 
         let len = u32::from_be_bytes(len_buf) as usize;
 
         if len > buf.len() {
-            return Err(TransportError::ReceiveFailed(
-                format!("message too large: {} > {}", len, buf.len())
-            ).into());
+            return Err(TransportError::ReceiveFailed(format!(
+                "message too large: {} > {}",
+                len,
+                buf.len()
+            ))
+            .into());
         }
 
-        guard.read_exact(&mut buf[..len])
+        guard
+            .read_exact(&mut buf[..len])
             .await
             .map_err(|e| TransportError::ReceiveFailed(e.to_string()))?;
 
@@ -282,15 +308,18 @@ impl TcpStream {
     /// Send a length-prefixed message.
     pub async fn send(&mut self, data: &[u8]) -> Result<usize> {
         let len = data.len() as u32;
-        self.inner.write_all(&len.to_be_bytes())
+        self.inner
+            .write_all(&len.to_be_bytes())
             .await
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
-        self.inner.write_all(data)
+        self.inner
+            .write_all(data)
             .await
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
-        self.inner.flush()
+        self.inner
+            .flush()
             .await
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
@@ -300,19 +329,24 @@ impl TcpStream {
     /// Receive a length-prefixed message.
     pub async fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
         let mut len_buf = [0u8; 4];
-        self.inner.read_exact(&mut len_buf)
+        self.inner
+            .read_exact(&mut len_buf)
             .await
             .map_err(|e| TransportError::ReceiveFailed(e.to_string()))?;
 
         let len = u32::from_be_bytes(len_buf) as usize;
 
         if len > buf.len() {
-            return Err(TransportError::ReceiveFailed(
-                format!("message too large: {} > {}", len, buf.len())
-            ).into());
+            return Err(TransportError::ReceiveFailed(format!(
+                "message too large: {} > {}",
+                len,
+                buf.len()
+            ))
+            .into());
         }
 
-        self.inner.read_exact(&mut buf[..len])
+        self.inner
+            .read_exact(&mut buf[..len])
             .await
             .map_err(|e| TransportError::ReceiveFailed(e.to_string()))?;
 
@@ -321,7 +355,8 @@ impl TcpStream {
 
     /// Shutdown the stream.
     pub async fn shutdown(&mut self) -> Result<()> {
-        self.inner.shutdown()
+        self.inner
+            .shutdown()
             .await
             .map_err(|e| TransportError::Tcp(e.to_string()).into())
     }

@@ -104,7 +104,7 @@ impl Route {
 pub struct RouteManager {
     /// Configuration.
     config: RouteConfig,
-    
+
     /// TUN interface name.
     interface: String,
 
@@ -210,7 +210,12 @@ impl RouteManager {
     }
 
     /// Add a route via a specific gateway.
-    pub fn add_route_via_gateway(&mut self, destination: &str, gateway: IpAddr, interface: &str) -> Result<()> {
+    pub fn add_route_via_gateway(
+        &mut self,
+        destination: &str,
+        gateway: IpAddr,
+        interface: &str,
+    ) -> Result<()> {
         let route = Route::via_gateway(destination, gateway, interface);
         self.add_route_impl(&route)?;
         self.added_routes.push(route);
@@ -237,7 +242,9 @@ impl RouteManager {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            Err(Error::Config("Full tunnel not supported on this platform".into()))
+            Err(Error::Config(
+                "Full tunnel not supported on this platform".into(),
+            ))
         }
     }
 
@@ -248,14 +255,25 @@ impl RouteManager {
 
         // Add default route to our table
         let output = Command::new("ip")
-            .args(["route", "add", "default", "dev", &self.interface, "table", &table])
+            .args([
+                "route",
+                "add",
+                "default",
+                "dev",
+                &self.interface,
+                "table",
+                &table,
+            ])
             .output()
             .map_err(|e| Error::Io(e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("File exists") {
-                return Err(Error::Config(format!("Failed to add default route: {}", stderr)));
+                return Err(Error::Config(format!(
+                    "Failed to add default route: {}",
+                    stderr
+                )));
             }
         }
 
@@ -269,20 +287,28 @@ impl RouteManager {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stderr.contains("File exists") {
-                    return Err(Error::Config(format!("Failed to add routing rule: {}", stderr)));
+                    return Err(Error::Config(format!(
+                        "Failed to add routing rule: {}",
+                        stderr
+                    )));
                 }
             }
         } else {
             // Use from all rule
             let output = Command::new("ip")
-                .args(["rule", "add", "from", "all", "table", &table, "priority", "100"])
+                .args([
+                    "rule", "add", "from", "all", "table", &table, "priority", "100",
+                ])
                 .output()
                 .map_err(|e| Error::Io(e))?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stderr.contains("File exists") {
-                    return Err(Error::Config(format!("Failed to add routing rule: {}", stderr)));
+                    return Err(Error::Config(format!(
+                        "Failed to add routing rule: {}",
+                        stderr
+                    )));
                 }
             }
         }
@@ -307,36 +333,58 @@ impl RouteManager {
     fn setup_full_tunnel_macos(&mut self) -> Result<()> {
         // On macOS, use two /1 routes to override default without replacing it
         // This is the standard VPN technique: 0.0.0.0/1 and 128.0.0.0/1
-        
+
         // Route for 0.0.0.0/1 (lower half)
         let output = Command::new("route")
-            .args(["-n", "add", "-net", "0.0.0.0/1", "-interface", &self.interface])
+            .args([
+                "-n",
+                "add",
+                "-net",
+                "0.0.0.0/1",
+                "-interface",
+                &self.interface,
+            ])
             .output()
             .map_err(|e| Error::Io(e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("File exists") {
-                return Err(Error::Config(format!("Failed to add route 0.0.0.0/1: {}", stderr)));
+                return Err(Error::Config(format!(
+                    "Failed to add route 0.0.0.0/1: {}",
+                    stderr
+                )));
             }
         }
 
-        self.added_routes.push(Route::via_interface("0.0.0.0/1", &self.interface));
+        self.added_routes
+            .push(Route::via_interface("0.0.0.0/1", &self.interface));
 
         // Route for 128.0.0.0/1 (upper half)
         let output = Command::new("route")
-            .args(["-n", "add", "-net", "128.0.0.0/1", "-interface", &self.interface])
+            .args([
+                "-n",
+                "add",
+                "-net",
+                "128.0.0.0/1",
+                "-interface",
+                &self.interface,
+            ])
             .output()
             .map_err(|e| Error::Io(e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("File exists") {
-                return Err(Error::Config(format!("Failed to add route 128.0.0.0/1: {}", stderr)));
+                return Err(Error::Config(format!(
+                    "Failed to add route 128.0.0.0/1: {}",
+                    stderr
+                )));
             }
         }
 
-        self.added_routes.push(Route::via_interface("128.0.0.0/1", &self.interface));
+        self.added_routes
+            .push(Route::via_interface("128.0.0.0/1", &self.interface));
 
         tracing::info!(
             interface = %self.interface,
@@ -365,19 +413,23 @@ impl RouteManager {
 
     #[cfg(target_os = "linux")]
     fn add_route_linux(&self, route: &Route) -> Result<()> {
+        // Pre-convert values to strings so they live long enough for args references
+        let gw_str = route.gateway.map(|gw| gw.to_string());
+        let metric_str = route.metric.map(|m| m.to_string());
+
         let mut args = vec!["route", "add", &route.destination];
 
-        if let Some(gw) = route.gateway {
+        if let Some(ref gw) = gw_str {
             args.push("via");
-            args.push(&gw.to_string());
+            args.push(gw);
         }
 
         args.push("dev");
         args.push(&route.interface);
 
-        if let Some(metric) = route.metric {
+        if let Some(ref metric) = metric_str {
             args.push("metric");
-            args.push(&metric.to_string());
+            args.push(metric);
         }
 
         let output = Command::new("ip")
@@ -614,9 +666,10 @@ mod tests {
         let route = Route::via_gateway(
             "192.168.0.0/16",
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            "eth0"
-        ).with_metric(100);
-        
+            "eth0",
+        )
+        .with_metric(100);
+
         assert!(route.gateway.is_some());
         assert_eq!(route.metric, Some(100));
     }

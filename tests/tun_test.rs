@@ -9,7 +9,7 @@
 use std::process::Command;
 use std::time::Duration;
 
-use triglav::tun::{TunDevice, TunConfig};
+use triglav::tun::{TunConfig, TunDevice};
 
 fn check_root() -> bool {
     unsafe { libc::getuid() == 0 }
@@ -27,7 +27,7 @@ async fn main() {
     }
 
     println!("[1/6] Creating TUN device...");
-    
+
     let config = TunConfig {
         name: "utun".to_string(), // macOS will assign a number
         mtu: 1420,
@@ -73,7 +73,7 @@ async fn main() {
         .arg(tun.name())
         .output()
         .expect("Failed to run ifconfig");
-    
+
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         println!("   SUCCESS: Interface found in system");
@@ -88,46 +88,46 @@ async fn main() {
     }
 
     println!("\n[5/6] Testing packet read/write...");
-    
+
     // We'll ping the TUN interface IP from the system
     // and try to read the ICMP packet from the TUN device
-    
+
     let handle = tun.handle();
-    
+
     // Spawn a task to read from TUN
     let read_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 1500];
-        
+
         // Set a timeout for reading
         match tokio::time::timeout(Duration::from_secs(3), handle.read(&mut buf)).await {
             Ok(Ok(len)) => {
                 println!("   SUCCESS: Read {} bytes from TUN", len);
-                
+
                 // Parse IP version
                 if len > 0 {
                     let version = (buf[0] >> 4) & 0x0f;
-                    let protocol = if version == 4 && len >= 20 {
-                        buf[9]
-                    } else {
-                        0
-                    };
-                    
+                    let protocol = if version == 4 && len >= 20 { buf[9] } else { 0 };
+
                     let proto_name = match protocol {
                         1 => "ICMP",
                         6 => "TCP",
                         17 => "UDP",
                         _ => "Other",
                     };
-                    
-                    println!("   Packet: IPv{}, Protocol: {} ({})", version, protocol, proto_name);
-                    
+
+                    println!(
+                        "   Packet: IPv{}, Protocol: {} ({})",
+                        version, protocol, proto_name
+                    );
+
                     // Show first 40 bytes hex
-                    let hex: Vec<String> = buf[..len.min(40)].iter()
+                    let hex: Vec<String> = buf[..len.min(40)]
+                        .iter()
                         .map(|b| format!("{:02x}", b))
                         .collect();
                     println!("   Hex: {}", hex.join(" "));
                 }
-                
+
                 true
             }
             Ok(Err(e)) => {
@@ -150,7 +150,7 @@ async fn main() {
     let ping_output = Command::new("ping")
         .args(["-c", "1", "-t", "1", "10.0.85.1"])
         .output();
-    
+
     match ping_output {
         Ok(o) => {
             if o.status.success() {
@@ -173,16 +173,16 @@ async fn main() {
         Ok(_) => println!("   SUCCESS: Interface brought down"),
         Err(e) => println!("   Warning: Failed to bring down interface: {}", e),
     }
-    
+
     // Interface is automatically removed when tun is dropped
     drop(tun);
-    
+
     // Verify it's gone
     tokio::time::sleep(Duration::from_millis(500)).await;
     let verify = Command::new("ifconfig")
         .arg("utun99") // Won't exist
         .output();
-    
+
     println!("   Device cleaned up");
 
     println!("\n=== All tests passed! ===");

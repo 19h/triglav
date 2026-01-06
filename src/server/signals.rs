@@ -55,7 +55,7 @@ impl SignalHandler {
     /// Create a new signal handler.
     pub fn new() -> Self {
         let (signal_tx, _) = broadcast::channel(16);
-        
+
         Self {
             shutdown: Arc::new(RwLock::new(false)),
             signal_tx,
@@ -90,7 +90,7 @@ impl SignalHandler {
     /// Handle a signal.
     fn handle_signal(&self, signal: Signal) {
         info!("Received signal: {}", signal);
-        
+
         match signal {
             Signal::Terminate | Signal::Interrupt => {
                 info!("Initiating graceful shutdown");
@@ -115,17 +115,17 @@ impl SignalHandler {
                 debug!("SIGCHLD received");
             }
         }
-        
+
         let _ = self.signal_tx.send(signal);
     }
 
     /// Start listening for signals (Unix).
     #[cfg(unix)]
     pub async fn listen(&self) {
+        use futures::StreamExt;
         use signal_hook::consts::signal::*;
         use signal_hook_tokio::Signals;
-        use futures::StreamExt;
-        
+
         let signals = match Signals::new(&[SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGUSR2]) {
             Ok(s) => s,
             Err(e) => {
@@ -133,11 +133,11 @@ impl SignalHandler {
                 return;
             }
         };
-        
+
         let mut signals = signals.fuse();
-        
+
         info!("Signal handler started");
-        
+
         while let Some(signal) = signals.next().await {
             let sig = match signal {
                 SIGTERM => Signal::Terminate,
@@ -148,15 +148,15 @@ impl SignalHandler {
                 SIGCHLD => Signal::Child,
                 _ => continue,
             };
-            
+
             self.handle_signal(sig);
-            
+
             // Exit loop on termination signals
             if sig == Signal::Terminate || sig == Signal::Interrupt {
                 break;
             }
         }
-        
+
         info!("Signal handler stopped");
     }
 
@@ -201,7 +201,7 @@ impl ShutdownSignal {
         if *self.shutdown.read() {
             return;
         }
-        
+
         loop {
             match self.rx.recv().await {
                 Ok(Signal::Terminate) | Ok(Signal::Interrupt) => {
@@ -225,12 +225,10 @@ impl std::future::Future for ShutdownSignal {
         if *self.shutdown.read() {
             return std::task::Poll::Ready(());
         }
-        
+
         // Try to receive without blocking
         match self.rx.try_recv() {
-            Ok(Signal::Terminate) | Ok(Signal::Interrupt) => {
-                std::task::Poll::Ready(())
-            }
+            Ok(Signal::Terminate) | Ok(Signal::Interrupt) => std::task::Poll::Ready(()),
             Ok(_) => {
                 cx.waker().wake_by_ref();
                 std::task::Poll::Pending
@@ -243,9 +241,7 @@ impl std::future::Future for ShutdownSignal {
                 cx.waker().wake_by_ref();
                 std::task::Poll::Pending
             }
-            Err(broadcast::error::TryRecvError::Closed) => {
-                std::task::Poll::Ready(())
-            }
+            Err(broadcast::error::TryRecvError::Closed) => std::task::Poll::Ready(()),
         }
     }
 }
@@ -260,13 +256,13 @@ pub async fn wait_for_shutdown() {
 pub fn setup_signal_handlers() -> (Arc<SignalHandler>, broadcast::Receiver<Signal>) {
     let handler = Arc::new(SignalHandler::new());
     let rx = handler.subscribe();
-    
+
     // Start listening in background
     let handler_clone = Arc::clone(&handler);
     tokio::spawn(async move {
         handler_clone.listen().await;
     });
-    
+
     (handler, rx)
 }
 
@@ -284,7 +280,7 @@ mod tests {
     #[test]
     fn test_signal_handler_shutdown() {
         let handler = SignalHandler::new();
-        
+
         assert!(!handler.is_shutdown());
         handler.request_shutdown();
         assert!(handler.is_shutdown());
@@ -293,17 +289,17 @@ mod tests {
     #[test]
     fn test_reload_callback() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        
+
         let handler = SignalHandler::new();
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = Arc::clone(&called);
-        
+
         handler.set_reload_callback(move || {
             called_clone.store(true, Ordering::SeqCst);
         });
-        
+
         handler.handle_signal(Signal::Hangup);
-        
+
         assert!(called.load(Ordering::SeqCst));
     }
 
@@ -311,19 +307,18 @@ mod tests {
     async fn test_shutdown_signal() {
         let handler = SignalHandler::new();
         let mut shutdown = handler.shutdown_signal();
-        
+
         // Request shutdown in background
         let handler_clone = handler.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             handler_clone.request_shutdown();
         });
-        
+
         // Wait for shutdown
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            shutdown.wait()
-        ).await.expect("Shutdown should complete");
+        tokio::time::timeout(std::time::Duration::from_millis(100), shutdown.wait())
+            .await
+            .expect("Shutdown should complete");
     }
 }
 

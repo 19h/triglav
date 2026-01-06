@@ -90,7 +90,8 @@ impl KeySchedule {
 
     /// Derive uplink-specific key for per-path encryption (optional layer).
     pub fn uplink_key(session_key: &[u8; 32], uplink_id: &str) -> [u8; 32] {
-        let mut info = Vec::with_capacity(Self::DOMAIN.len() + b"uplink-key/".len() + uplink_id.len());
+        let mut info =
+            Vec::with_capacity(Self::DOMAIN.len() + b"uplink-key/".len() + uplink_id.len());
         info.extend_from_slice(Self::DOMAIN);
         info.extend_from_slice(b"uplink-key/");
         info.extend_from_slice(uplink_id.as_bytes());

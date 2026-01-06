@@ -51,10 +51,7 @@ pub struct DnsConfig {
 }
 
 fn default_upstream_dns() -> Vec<SocketAddr> {
-    vec![
-        "1.1.1.1:53".parse().unwrap(),
-        "8.8.8.8:53".parse().unwrap(),
-    ]
+    vec!["1.1.1.1:53".parse().unwrap(), "8.8.8.8:53".parse().unwrap()]
 }
 
 fn default_cache_enabled() -> bool {
@@ -108,10 +105,10 @@ impl CacheEntry {
 /// DNS interceptor and resolver.
 pub struct DnsInterceptor {
     config: DnsConfig,
-    
+
     /// DNS cache.
     cache: RwLock<HashMap<String, CacheEntry>>,
-    
+
     /// Statistics.
     stats: RwLock<DnsStats>,
 }
@@ -154,9 +151,9 @@ impl DnsInterceptor {
             Some(d) => d,
             None => {
                 self.stats.write().queries_failed += 1;
-                return Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                    "Invalid DNS query".into()
-                )));
+                return Err(Error::Protocol(
+                    crate::error::ProtocolError::MalformedPacket("Invalid DNS query".into()),
+                ));
             }
         };
 
@@ -199,20 +196,21 @@ impl DnsInterceptor {
 
     /// Forward a DNS query to upstream servers.
     async fn forward_query(&self, query: &[u8]) -> Result<Vec<u8>> {
-        let socket = UdpSocket::bind("0.0.0.0:0").await
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
             .map_err(|e| Error::Io(e))?;
 
         // Try each upstream server
         for server in &self.config.upstream_servers {
-            socket.send_to(query, server).await
+            socket
+                .send_to(query, server)
+                .await
                 .map_err(|e| Error::Io(e))?;
 
             let mut buf = vec![0u8; 4096];
-            
-            match tokio::time::timeout(
-                self.config.query_timeout,
-                socket.recv_from(&mut buf)
-            ).await {
+
+            match tokio::time::timeout(self.config.query_timeout, socket.recv_from(&mut buf)).await
+            {
                 Ok(Ok((len, _))) => {
                     buf.truncate(len);
                     return Ok(buf);
@@ -237,7 +235,8 @@ impl DnsInterceptor {
             None => return Ok(()),
         };
 
-        let socket = UdpSocket::bind(listen_addr).await
+        let socket = UdpSocket::bind(listen_addr)
+            .await
             .map_err(|e| Error::Io(e))?;
 
         tracing::info!(addr = %listen_addr, "DNS interceptor listening");
@@ -245,8 +244,7 @@ impl DnsInterceptor {
         let mut buf = vec![0u8; 4096];
 
         loop {
-            let (len, from) = socket.recv_from(&mut buf).await
-                .map_err(|e| Error::Io(e))?;
+            let (len, from) = socket.recv_from(&mut buf).await.map_err(|e| Error::Io(e))?;
 
             let query = buf[..len].to_vec();
 
@@ -301,7 +299,7 @@ impl DnsInterceptor {
             if len > 63 || pos + 1 + len > query.len() {
                 return None;
             }
-            
+
             if let Ok(label) = std::str::from_utf8(&query[pos + 1..pos + 1 + len]) {
                 domain_parts.push(label.to_lowercase());
             }
@@ -317,13 +315,13 @@ impl DnsInterceptor {
 
     fn is_blocked(&self, domain: &str) -> bool {
         let domain_lower = domain.to_lowercase();
-        
+
         for blocked in &self.config.blocked_domains {
             if domain_lower == *blocked || domain_lower.ends_with(&format!(".{}", blocked)) {
                 return true;
             }
         }
-        
+
         false
     }
 
@@ -350,9 +348,9 @@ impl DnsInterceptor {
         }
 
         // Hash the question part (skip ID)
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
-        
+        use std::hash::{Hash, Hasher};
+
         let mut hasher = DefaultHasher::new();
         query[2..pos].hash(&mut hasher);
         format!("{:016x}", hasher.finish())
@@ -373,26 +371,30 @@ impl DnsInterceptor {
         let ttl = self.extract_ttl(response).unwrap_or(self.config.cache_ttl);
 
         let mut cache = self.cache.write();
-        
+
         // Evict if at capacity
         if cache.len() >= self.config.cache_size {
             // Simple eviction: remove oldest expired, or first entry
-            let to_remove: Vec<_> = cache.iter()
+            let to_remove: Vec<_> = cache
+                .iter()
                 .filter(|(_, e)| e.is_expired())
                 .map(|(k, _)| k.clone())
                 .take(self.config.cache_size / 10)
                 .collect();
-            
+
             for key in to_remove {
                 cache.remove(&key);
             }
         }
 
-        cache.insert(key.to_string(), CacheEntry {
-            response: response.to_vec(),
-            cached_at: Instant::now(),
-            ttl,
-        });
+        cache.insert(
+            key.to_string(),
+            CacheEntry {
+                response: response.to_vec(),
+                cached_at: Instant::now(),
+                ttl,
+            },
+        );
     }
 
     fn extract_ttl(&self, response: &[u8]) -> Option<Duration> {
@@ -403,7 +405,7 @@ impl DnsInterceptor {
 
         // Skip header (12 bytes) and question section
         let mut pos = 12;
-        
+
         // Skip question
         while pos < response.len() && response[pos] != 0 {
             let len = response[pos] as usize;
@@ -425,7 +427,7 @@ impl DnsInterceptor {
         if pos >= response.len() {
             return None;
         }
-        
+
         if response[pos] & 0xc0 == 0xc0 {
             pos += 2; // Compressed name
         } else {
@@ -455,17 +457,17 @@ impl DnsInterceptor {
     fn create_nxdomain_response(&self, query: &[u8]) -> Result<Vec<u8>> {
         // Create a minimal NXDOMAIN response
         if query.len() < 12 {
-            return Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                "Query too short".into()
-            )));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedPacket("Query too short".into()),
+            ));
         }
 
         let mut response = query.to_vec();
-        
+
         // Set QR bit (response) and RCODE = 3 (NXDOMAIN)
         response[2] = 0x81; // QR=1, RD=1
         response[3] = 0x03; // RCODE=3 (NXDOMAIN)
-        
+
         // Clear answer, authority, additional counts
         response[6] = 0;
         response[7] = 0;
@@ -479,21 +481,21 @@ impl DnsInterceptor {
 
     fn create_override_response(&self, query: &[u8], ip: IpAddr) -> Result<Vec<u8>> {
         if query.len() < 12 {
-            return Err(Error::Protocol(crate::error::ProtocolError::MalformedPacket(
-                "Query too short".into()
-            )));
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::MalformedPacket("Query too short".into()),
+            ));
         }
 
         let mut response = query.to_vec();
-        
+
         // Set QR bit (response), RCODE = 0
         response[2] = 0x81; // QR=1, RD=1
         response[3] = 0x80; // RA=1
-        
+
         // Set ANCOUNT = 1
         response[6] = 0;
         response[7] = 1;
-        
+
         // Clear authority, additional
         response[8] = 0;
         response[9] = 0;
@@ -503,7 +505,7 @@ impl DnsInterceptor {
         // Add answer record
         // Name pointer to question
         response.extend_from_slice(&[0xc0, 0x0c]);
-        
+
         match ip {
             IpAddr::V4(ipv4) => {
                 // TYPE A
@@ -550,9 +552,9 @@ mod tests {
     fn test_is_blocked() {
         let mut config = DnsConfig::default();
         config.blocked_domains = vec!["ads.example.com".to_string()];
-        
+
         let interceptor = DnsInterceptor::new(config);
-        
+
         assert!(interceptor.is_blocked("ads.example.com"));
         assert!(interceptor.is_blocked("sub.ads.example.com"));
         assert!(!interceptor.is_blocked("example.com"));
@@ -561,7 +563,7 @@ mod tests {
     #[test]
     fn test_cache_key() {
         let interceptor = DnsInterceptor::new(DnsConfig::default());
-        
+
         // Sample DNS query for example.com A record
         let query = vec![
             0x00, 0x01, // ID
@@ -576,15 +578,15 @@ mod tests {
             0x00, 0x01, // QTYPE A
             0x00, 0x01, // QCLASS IN
         ];
-        
+
         let key = interceptor.make_cache_key(&query);
         assert!(!key.is_empty());
-        
+
         // Same query with different ID should produce same cache key
         let mut query2 = query.clone();
         query2[0] = 0xff;
         query2[1] = 0xff;
-        
+
         let key2 = interceptor.make_cache_key(&query2);
         assert_eq!(key, key2);
     }

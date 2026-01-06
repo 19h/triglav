@@ -142,11 +142,14 @@ impl QualityPredictor {
     /// Generate recommendation.
     fn recommend(&self, predicted_rtt_ms: f64, degrading: bool) -> PredictionRecommendation {
         // Check recent loss rate
-        let recent_loss: f64 = self.samples.iter()
+        let recent_loss: f64 = self
+            .samples
+            .iter()
             .rev()
             .take(5)
             .map(|s| s.loss)
-            .sum::<f64>() / 5.0;
+            .sum::<f64>()
+            / 5.0;
 
         if recent_loss > 0.2 || predicted_rtt_ms > 1000.0 {
             PredictionRecommendation::Failover

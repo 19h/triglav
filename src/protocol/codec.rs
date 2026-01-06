@@ -45,7 +45,10 @@ impl Decoder for PacketCodec {
     type Item = Packet;
     type Error = crate::Error;
 
-    fn decode(&mut self, src: &mut BytesMut) -> std::result::Result<Option<Self::Item>, Self::Error> {
+    fn decode(
+        &mut self,
+        src: &mut BytesMut,
+    ) -> std::result::Result<Option<Self::Item>, Self::Error> {
         // Need at least header to determine packet size
         if src.len() < HEADER_SIZE {
             return Ok(None);
@@ -101,9 +104,9 @@ impl Encoder<Packet> for PacketCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::{Buf, BufMut};
     use crate::error::ProtocolError;
     use crate::types::{SequenceNumber, SessionId};
+    use bytes::{Buf, BufMut};
 
     /// Framing codec for length-prefixed messages (TCP).
     struct LengthPrefixedCodec {
@@ -120,7 +123,10 @@ mod tests {
         type Item = Vec<u8>;
         type Error = crate::Error;
 
-        fn decode(&mut self, src: &mut BytesMut) -> std::result::Result<Option<Self::Item>, Self::Error> {
+        fn decode(
+            &mut self,
+            src: &mut BytesMut,
+        ) -> std::result::Result<Option<Self::Item>, Self::Error> {
             if src.len() < 4 {
                 return Ok(None);
             }
@@ -152,7 +158,11 @@ mod tests {
     impl Encoder<Vec<u8>> for LengthPrefixedCodec {
         type Error = crate::Error;
 
-        fn encode(&mut self, item: Vec<u8>, dst: &mut BytesMut) -> std::result::Result<(), Self::Error> {
+        fn encode(
+            &mut self,
+            item: Vec<u8>,
+            dst: &mut BytesMut,
+        ) -> std::result::Result<(), Self::Error> {
             if item.len() > self.max_message_size {
                 return Err(ProtocolError::PayloadTooLarge {
                     size: item.len(),
@@ -174,12 +184,7 @@ mod tests {
         let mut codec = PacketCodec::new();
         let session_id = SessionId::generate();
 
-        let packet = Packet::data(
-            SequenceNumber(1),
-            session_id,
-            0,
-            b"hello".to_vec(),
-        ).unwrap();
+        let packet = Packet::data(SequenceNumber(1), session_id, 0, b"hello".to_vec()).unwrap();
 
         let mut buf = BytesMut::new();
         codec.encode(packet.clone(), &mut buf).unwrap();

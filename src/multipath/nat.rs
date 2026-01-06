@@ -232,9 +232,10 @@ impl NatDetectionState {
         }
 
         let nat_detected = hop > 0
-            && self.hop_nat_ids.get(hop - 1).is_some_and(|prev| {
-                prev.is_some_and(|prev_id| prev_id != nat_id)
-            });
+            && self
+                .hop_nat_ids
+                .get(hop - 1)
+                .is_some_and(|prev| prev.is_some_and(|prev_id| prev_id != nat_id));
 
         if nat_detected && !self.nat_locations.contains(&hop) {
             self.nat_locations.push(hop);
@@ -332,14 +333,14 @@ impl ProbeMatcher {
         let now = Instant::now();
         let timeout = self.timeout;
 
-        self.probes_by_ip_id.retain(|_, probe| {
-            now.duration_since(probe.sent_at) < timeout
-        });
+        self.probes_by_ip_id
+            .retain(|_, probe| now.duration_since(probe.sent_at) < timeout);
 
         // Rebuild checksum index
         self.probes_by_checksum.clear();
         for probe in self.probes_by_ip_id.values() {
-            self.probes_by_checksum.insert(probe.marker.udp_checksum, probe.marker.ip_id);
+            self.probes_by_checksum
+                .insert(probe.marker.udp_checksum, probe.marker.ip_id);
         }
     }
 
@@ -518,7 +519,11 @@ pub fn compute_udp_checksum(
     }
 
     let checksum = !sum as u16;
-    if checksum == 0 { 0xffff } else { checksum }
+    if checksum == 0 {
+        0xffff
+    } else {
+        checksum
+    }
 }
 
 #[cfg(test)]

@@ -61,7 +61,11 @@ impl EncryptedPacket {
 ///
 /// # Returns
 /// Encrypted packet containing nonce and ciphertext with auth tag.
-pub fn encrypt(key: &[u8; KEY_SIZE], plaintext: &[u8], aad: Option<&[u8]>) -> Result<EncryptedPacket, CryptoError> {
+pub fn encrypt(
+    key: &[u8; KEY_SIZE],
+    plaintext: &[u8],
+    aad: Option<&[u8]>,
+) -> Result<EncryptedPacket, CryptoError> {
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| CryptoError::EncryptionFailed(format!("cipher init: {e}")))?;
 
@@ -71,10 +75,13 @@ pub fn encrypt(key: &[u8; KEY_SIZE], plaintext: &[u8], aad: Option<&[u8]>) -> Re
 
     let ciphertext = if let Some(aad_data) = aad {
         cipher
-            .encrypt(xnonce, chacha20poly1305::aead::Payload {
-                msg: plaintext,
-                aad: aad_data,
-            })
+            .encrypt(
+                xnonce,
+                chacha20poly1305::aead::Payload {
+                    msg: plaintext,
+                    aad: aad_data,
+                },
+            )
             .map_err(|e| CryptoError::EncryptionFailed(format!("encrypt: {e}")))?
     } else {
         cipher
@@ -94,7 +101,11 @@ pub fn encrypt(key: &[u8; KEY_SIZE], plaintext: &[u8], aad: Option<&[u8]>) -> Re
 ///
 /// # Returns
 /// Decrypted plaintext.
-pub fn decrypt(key: &[u8; KEY_SIZE], packet: &EncryptedPacket, aad: Option<&[u8]>) -> Result<Vec<u8>, CryptoError> {
+pub fn decrypt(
+    key: &[u8; KEY_SIZE],
+    packet: &EncryptedPacket,
+    aad: Option<&[u8]>,
+) -> Result<Vec<u8>, CryptoError> {
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| CryptoError::DecryptionFailed(format!("cipher init: {e}")))?;
 
@@ -102,10 +113,13 @@ pub fn decrypt(key: &[u8; KEY_SIZE], packet: &EncryptedPacket, aad: Option<&[u8]
 
     let plaintext = if let Some(aad_data) = aad {
         cipher
-            .decrypt(xnonce, chacha20poly1305::aead::Payload {
-                msg: packet.ciphertext.as_slice(),
-                aad: aad_data,
-            })
+            .decrypt(
+                xnonce,
+                chacha20poly1305::aead::Payload {
+                    msg: packet.ciphertext.as_slice(),
+                    aad: aad_data,
+                },
+            )
             .map_err(|_| CryptoError::DecryptionFailed("authentication failed".into()))?
     } else {
         cipher

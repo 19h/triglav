@@ -2,10 +2,10 @@
 
 use std::fmt;
 
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::CryptoError;
@@ -43,7 +43,9 @@ impl PublicKey {
             .decode(s)
             .map_err(|e| CryptoError::KeyDerivationFailed(format!("invalid base64: {e}")))?;
         if bytes.len() != 32 {
-            return Err(CryptoError::KeyDerivationFailed("invalid key length".into()));
+            return Err(CryptoError::KeyDerivationFailed(
+                "invalid key length".into(),
+            ));
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
@@ -135,7 +137,9 @@ impl SecretKey {
             .decode(s)
             .map_err(|e| CryptoError::KeyDerivationFailed(format!("invalid base64: {e}")))?;
         if bytes.len() != 32 {
-            return Err(CryptoError::KeyDerivationFailed("invalid key length".into()));
+            return Err(CryptoError::KeyDerivationFailed(
+                "invalid key length".into(),
+            ));
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);

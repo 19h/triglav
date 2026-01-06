@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use tokio::net::UdpSocket as TokioUdpSocket;
 
-use super::{Transport, TransportConfig, SocketConfig};
+use super::{SocketConfig, Transport, TransportConfig};
 use crate::error::{Result, TransportError};
 
 /// High-performance UDP transport.
@@ -28,11 +28,12 @@ impl UdpTransport {
         let socket_config = SocketConfig::from_transport_config(config);
         let std_socket = super::socket::create_udp_socket(addr, &socket_config)?;
 
-        let socket = TokioUdpSocket::from_std(std_socket.into())
-            .map_err(|e| TransportError::BindFailed {
+        let socket = TokioUdpSocket::from_std(std_socket.into()).map_err(|e| {
+            TransportError::BindFailed {
                 addr,
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         Ok(Self {
             socket: Arc::new(socket),
@@ -59,11 +60,12 @@ impl UdpTransport {
         let socket_config = SocketConfig::from_transport_config(config);
         let std_socket = super::socket::create_udp_socket(bind, &socket_config)?;
 
-        let socket = TokioUdpSocket::from_std(std_socket.into())
-            .map_err(|e| TransportError::BindFailed {
+        let socket = TokioUdpSocket::from_std(std_socket.into()).map_err(|e| {
+            TransportError::BindFailed {
                 addr: bind,
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         // Connect the socket
         socket

@@ -112,17 +112,17 @@ impl ServerSession {
     pub fn is_expired(&self, idle_timeout: Duration, absolute_timeout: Duration) -> bool {
         let now = Instant::now();
         let last_activity = *self.last_activity.read();
-        
+
         // Check idle timeout
         if now.duration_since(last_activity) > idle_timeout {
             return true;
         }
-        
+
         // Check absolute timeout
         if now.duration_since(self.created_at) > absolute_timeout {
             return true;
         }
-        
+
         false
     }
 
@@ -180,7 +180,10 @@ pub enum SessionEvent {
     /// Session created.
     Created(SessionId),
     /// Session authenticated.
-    Authenticated { session_id: SessionId, user_id: String },
+    Authenticated {
+        session_id: SessionId,
+        user_id: String,
+    },
     /// Session closed.
     Closed(SessionId),
     /// Session expired.
@@ -206,7 +209,7 @@ impl SessionManager {
     /// Create a new session manager.
     pub fn new(config: SessionConfig) -> Self {
         let (event_tx, _) = broadcast::channel(256);
-        
+
         Self {
             config,
             sessions: DashMap::new(),
@@ -226,12 +229,13 @@ impl SessionManager {
     pub fn create_session(&self) -> Arc<ServerSession> {
         let id = SessionId::generate();
         let session = Arc::new(ServerSession::new(id));
-        
+
         self.sessions.insert(id, Arc::clone(&session));
-        self.total_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        
+        self.total_sessions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let _ = self.event_tx.send(SessionEvent::Created(id));
-        
+
         debug!("Created session {}", id);
         session
     }
@@ -239,36 +243,40 @@ impl SessionManager {
     /// Create a session for an authorized key (with limit checking).
     pub fn create_session_for_key(&self, key: &AuthorizedKey) -> Option<Arc<ServerSession>> {
         // Check session limit
-        let current_sessions = self.sessions_by_user
+        let current_sessions = self
+            .sessions_by_user
             .get(&key.public_key)
             .map(|v| v.len())
             .unwrap_or(0);
-        
+
         if current_sessions as u32 >= key.max_connections {
             warn!(
                 "Key {} has reached session limit ({}/{})",
-                key.short_id(), current_sessions, key.max_connections
+                key.short_id(),
+                current_sessions,
+                key.max_connections
             );
             return None;
         }
-        
+
         let id = SessionId::generate();
         let session = Arc::new(ServerSession::with_key(id, key.clone()));
-        
+
         self.sessions.insert(id, Arc::clone(&session));
         self.sessions_by_user
             .entry(key.public_key.clone())
             .or_default()
             .push(id);
-        
-        self.total_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        
+
+        self.total_sessions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let _ = self.event_tx.send(SessionEvent::Created(id));
         let _ = self.event_tx.send(SessionEvent::Authenticated {
             session_id: id,
             user_id: key.public_key.clone(),
         });
-        
+
         debug!("Created session {} for key {}", id, key.short_id());
         Some(session)
     }
@@ -297,18 +305,18 @@ impl SessionManager {
         if let Some(_session) = self.sessions.get_mut(&session_id) {
             // This is a workaround since we can't mutate through Arc
             // In a real implementation, you'd use interior mutability
-            
+
             // Track by key
             self.sessions_by_user
                 .entry(key.public_key.clone())
                 .or_default()
                 .push(session_id);
-            
+
             let _ = self.event_tx.send(SessionEvent::Authenticated {
                 session_id,
                 user_id: key.public_key.clone(),
             });
-            
+
             true
         } else {
             false
@@ -322,16 +330,16 @@ impl SessionManager {
             for addr in session.remote_addrs.read().iter() {
                 self.sessions_by_addr.remove(addr);
             }
-            
+
             // Remove from key map
             if let Some(key) = &session.key {
                 if let Some(mut sessions) = self.sessions_by_user.get_mut(&key.public_key) {
                     sessions.retain(|s| *s != id);
                 }
             }
-            
+
             let _ = self.event_tx.send(SessionEvent::Closed(id));
-            
+
             debug!("Closed session {}", id);
         }
     }
@@ -343,52 +351,52 @@ impl SessionManager {
 
     /// Get total sessions created.
     pub fn total_count(&self) -> u64 {
-        self.total_sessions.load(std::sync::atomic::Ordering::Relaxed)
+        self.total_sessions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get sessions for a user.
     pub fn get_user_sessions(&self, user_id: &str) -> Vec<Arc<ServerSession>> {
         self.sessions_by_user
             .get(user_id)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.get_session(*id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.get_session(*id)).collect())
             .unwrap_or_default()
     }
 
     /// Cleanup expired sessions.
     pub fn cleanup_expired(&self) -> usize {
         let mut expired = Vec::new();
-        
+
         for entry in self.sessions.iter() {
-            if entry.value().is_expired(self.config.idle_timeout, self.config.absolute_timeout) {
+            if entry
+                .value()
+                .is_expired(self.config.idle_timeout, self.config.absolute_timeout)
+            {
                 expired.push(*entry.key());
             }
         }
-        
+
         let count = expired.len();
-        
+
         for id in expired {
             let _ = self.event_tx.send(SessionEvent::Expired(id));
             self.close_session(id);
         }
-        
+
         if count > 0 {
             info!("Cleaned up {} expired sessions", count);
         }
-        
+
         count
     }
 
     /// Start the cleanup task.
     pub fn start_cleanup_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let interval = self.config.cleanup_interval;
-        
+
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
-            
+
             loop {
                 ticker.tick().await;
                 self.cleanup_expired();
@@ -404,7 +412,7 @@ impl SessionManager {
     /// Get aggregate statistics.
     pub fn aggregate_stats(&self) -> TrafficStats {
         let mut total = TrafficStats::default();
-        
+
         for session in self.sessions.iter() {
             let stats = session.stats.read();
             total.bytes_sent += stats.bytes_sent;
@@ -414,7 +422,7 @@ impl SessionManager {
             total.packets_dropped += stats.packets_dropped;
             total.packets_retransmitted += stats.packets_retransmitted;
         }
-        
+
         total
     }
 }
@@ -426,7 +434,7 @@ mod tests {
     #[test]
     fn test_session_creation() {
         let manager = SessionManager::new(SessionConfig::default());
-        
+
         let session = manager.create_session();
         assert!(!session.is_active());
         assert_eq!(manager.active_count(), 1);
@@ -435,12 +443,12 @@ mod tests {
     #[test]
     fn test_session_by_addr() {
         let manager = SessionManager::new(SessionConfig::default());
-        
+
         let session = manager.create_session();
         let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        
+
         manager.associate_addr(session.id, addr);
-        
+
         let found = manager.get_session_by_addr(addr);
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, session.id);
@@ -453,30 +461,29 @@ mod tests {
             absolute_timeout: Duration::from_secs(3600),
             ..Default::default()
         };
-        
+
         let manager = SessionManager::new(config);
         let session = manager.create_session();
-        
+
         // Wait for timeout
         std::thread::sleep(Duration::from_millis(20));
-        
+
         assert!(session.is_expired(Duration::from_millis(10), Duration::from_secs(3600)));
     }
 
     #[test]
     fn test_key_session_limit() {
         let manager = SessionManager::new(SessionConfig::default());
-        
-        let key = super::AuthorizedKey::new("test_key_base64")
-            .with_max_connections(2);
-        
+
+        let key = super::AuthorizedKey::new("test_key_base64").with_max_connections(2);
+
         // Create sessions up to limit
         let s1 = manager.create_session_for_key(&key);
         assert!(s1.is_some());
-        
+
         let s2 = manager.create_session_for_key(&key);
         assert!(s2.is_some());
-        
+
         // Should fail - at limit
         let s3 = manager.create_session_for_key(&key);
         assert!(s3.is_none());

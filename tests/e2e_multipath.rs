@@ -7,8 +7,8 @@
 //! 4. Response path back through the multi-path connection
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -19,10 +19,10 @@ use tokio::sync::{broadcast, RwLock as TokioRwLock};
 
 use triglav::crypto::{KeyPair, NoiseSession};
 use triglav::error::Result;
-use triglav::multipath::{MultipathManager, MultipathConfig, UplinkConfig};
-use triglav::protocol::{Packet, PacketType, PacketFlags, HEADER_SIZE};
+use triglav::multipath::{MultipathConfig, MultipathManager, UplinkConfig};
+use triglav::protocol::{Packet, PacketFlags, PacketType, HEADER_SIZE};
 use triglav::transport::TransportProtocol;
-use triglav::types::{SessionId, SequenceNumber, UplinkId};
+use triglav::types::{SequenceNumber, SessionId, UplinkId};
 
 /// Real remote endpoint that sits BEYOND the exit destination.
 /// This proves true forwarding: Client -> Server -> ExitDestination -> RemoteEndpoint
@@ -215,7 +215,12 @@ impl ForwardingExit {
 
                     // Get response from remote
                     let mut response_buf = vec![0u8; 4096];
-                    match tokio::time::timeout(Duration::from_secs(1), remote_stream.read(&mut response_buf)).await {
+                    match tokio::time::timeout(
+                        Duration::from_secs(1),
+                        remote_stream.read(&mut response_buf),
+                    )
+                    .await
+                    {
                         Ok(Ok(rn)) if rn > 0 => {
                             let response = response_buf[..rn].to_vec();
                             responses.write().push(response.clone());
@@ -308,7 +313,10 @@ impl ExitDestination {
         Ok(())
     }
 
-    async fn handle_connection(mut stream: TcpStream, received: Arc<RwLock<Vec<Vec<u8>>>>) -> Result<()> {
+    async fn handle_connection(
+        mut stream: TcpStream,
+        received: Arc<RwLock<Vec<Vec<u8>>>>,
+    ) -> Result<()> {
         let mut buf = vec![0u8; 4096];
 
         loop {
@@ -325,7 +333,7 @@ impl ExitDestination {
                 }
                 Err(e) => {
                     return Err(triglav::error::Error::Transport(
-                        triglav::error::TransportError::ReceiveFailed(e.to_string())
+                        triglav::error::TransportError::ReceiveFailed(e.to_string()),
                     ));
                 }
             }
@@ -459,7 +467,10 @@ impl ForwardingServer {
     /// Get stats for a specific uplink address
     fn uplink_stats(&self, addr: &SocketAddr) -> Option<(u64, u64)> {
         self.uplink_stats.get(addr).map(|s| {
-            (s.packets_received.load(Ordering::SeqCst), s.bytes_received.load(Ordering::SeqCst))
+            (
+                s.packets_received.load(Ordering::SeqCst),
+                s.bytes_received.load(Ordering::SeqCst),
+            )
         })
     }
 
@@ -475,14 +486,18 @@ impl ForwardingServer {
 
     /// Get all unique source addresses that sent data
     fn get_data_source_addresses(&self) -> Vec<SocketAddr> {
-        self.data_tracker.data_by_source.iter()
+        self.data_tracker
+            .data_by_source
+            .iter()
             .map(|r| *r.key())
             .collect()
     }
 
     /// Get payloads received from a specific source address
     fn get_data_from_source(&self, addr: &SocketAddr) -> Vec<Vec<u8>> {
-        self.data_tracker.data_by_source.get(addr)
+        self.data_tracker
+            .data_by_source
+            .get(addr)
             .map(|r| r.value().clone())
             .unwrap_or_default()
     }
@@ -499,7 +514,9 @@ impl ForwardingServer {
 
     /// Get count of payloads received per source address
     fn get_payload_counts_by_source(&self) -> Vec<(SocketAddr, usize)> {
-        self.data_tracker.data_by_source.iter()
+        self.data_tracker
+            .data_by_source
+            .iter()
             .map(|r| (*r.key(), r.value().len()))
             .collect()
     }
@@ -521,7 +538,10 @@ impl ForwardingServer {
 
     /// Get cross-session decryption attempts (for crypto isolation testing)
     fn get_cross_session_decrypt_attempts(&self) -> Vec<(SocketAddr, SocketAddr, bool)> {
-        self.data_tracker.cross_session_decrypt_attempts.read().clone()
+        self.data_tracker
+            .cross_session_decrypt_attempts
+            .read()
+            .clone()
     }
 
     /// Calculate encryption overhead from events
@@ -552,7 +572,9 @@ impl ForwardingServer {
 
     /// Get handshake events per source address
     fn get_handshake_events(&self) -> Vec<(SocketAddr, Vec<String>)> {
-        self.data_tracker.handshake_events.iter()
+        self.data_tracker
+            .handshake_events
+            .iter()
             .map(|r| (*r.key(), r.value().clone()))
             .collect()
     }
@@ -561,28 +583,45 @@ impl ForwardingServer {
     fn verify_encryption_path(&self, addr: &SocketAddr) -> bool {
         // Must have handshake, decryption, and response for this address
         let has_handshake = self.data_tracker.handshake_events.contains_key(addr);
-        let has_decryption = self.data_tracker.decryption_events.read()
+        let has_decryption = self
+            .data_tracker
+            .decryption_events
+            .read()
             .iter()
             .any(|(a, success, _, _)| a == addr && *success);
-        let has_response = self.data_tracker.response_events.read()
+        let has_response = self
+            .data_tracker
+            .response_events
+            .read()
             .iter()
             .any(|(a, _)| a == addr);
         // Also verify UDP response was actually sent back
-        let has_udp_sent = self.data_tracker.udp_responses_sent.read()
+        let has_udp_sent = self
+            .data_tracker
+            .udp_responses_sent
+            .read()
             .iter()
             .any(|(a, _, _)| a == addr);
         has_handshake && has_decryption && has_response && has_udp_sent
     }
 
     /// Test crypto isolation by attempting to decrypt with wrong uplink's session
-    fn test_crypto_isolation(&self, session_id: SessionId, data: &[u8], from_addr: SocketAddr, try_addr: SocketAddr) -> bool {
+    fn test_crypto_isolation(
+        &self,
+        session_id: SessionId,
+        data: &[u8],
+        from_addr: SocketAddr,
+        try_addr: SocketAddr,
+    ) -> bool {
         if let Some(session) = self.sessions.get(&session_id) {
             // Try to decrypt data from from_addr using try_addr's noise session
             if let Some(mut noise_ref) = session.noise_by_addr.get_mut(&try_addr) {
                 if noise_ref.is_transport() {
                     let result = noise_ref.decrypt(data);
                     let success = result.is_ok();
-                    self.data_tracker.cross_session_decrypt_attempts.write()
+                    self.data_tracker
+                        .cross_session_decrypt_attempts
+                        .write()
                         .push((from_addr, try_addr, success));
                     return success;
                 }
@@ -593,7 +632,8 @@ impl ForwardingServer {
 
     /// Get distinct noise sessions count (proves separate crypto state per uplink)
     fn get_noise_session_count(&self, session_id: SessionId) -> usize {
-        self.sessions.get(&session_id)
+        self.sessions
+            .get(&session_id)
             .map(|s| s.noise_by_addr.len())
             .unwrap_or(0)
     }
@@ -669,13 +709,19 @@ impl ForwardingServer {
         Ok(())
     }
 
-    async fn handle_handshake(&self, session: &ForwardingSession, packet: &Packet, addr: SocketAddr) -> Result<()> {
+    async fn handle_handshake(
+        &self,
+        session: &ForwardingSession,
+        packet: &Packet,
+        addr: SocketAddr,
+    ) -> Result<()> {
         let mut noise = NoiseSession::new_responder(&self.keypair.secret)?;
         let _ = noise.read_handshake(&packet.payload)?;
         let response = noise.write_handshake(&[])?;
 
         // Track handshake event - proves distinct Noise session established for this uplink
-        self.data_tracker.handshake_events
+        self.data_tracker
+            .handshake_events
             .entry(addr)
             .or_default()
             .push(format!("handshake_complete_session_{}", session.id));
@@ -713,7 +759,12 @@ impl ForwardingServer {
         Ok(())
     }
 
-    async fn handle_data(&self, session: &ForwardingSession, packet: &Packet, addr: SocketAddr) -> Result<()> {
+    async fn handle_data(
+        &self,
+        session: &ForwardingSession,
+        packet: &Packet,
+        addr: SocketAddr,
+    ) -> Result<()> {
         // Decrypt using the noise session for this specific uplink address
         let encrypted_len = packet.payload.len();
         let (payload, _was_encrypted) = if packet.header.flags.has(PacketFlags::ENCRYPTED) {
@@ -721,15 +772,21 @@ impl ForwardingServer {
                 if noise_ref.is_transport() {
                     let decrypted = noise_ref.decrypt(&packet.payload)?;
                     // Track successful decryption with both sizes - proves Noise crypto path works per-uplink
-                    self.data_tracker.decryption_events.write()
-                        .push((addr, true, encrypted_len, decrypted.len()));
+                    self.data_tracker.decryption_events.write().push((
+                        addr,
+                        true,
+                        encrypted_len,
+                        decrypted.len(),
+                    ));
                     (decrypted, true)
                 } else {
                     (packet.payload.clone(), false)
                 }
             } else {
                 // Track decryption failure
-                self.data_tracker.decryption_events.write()
+                self.data_tracker
+                    .decryption_events
+                    .write()
                     .push((addr, false, encrypted_len, 0));
                 return Ok(());
             }
@@ -739,7 +796,8 @@ impl ForwardingServer {
 
         // CRITICAL: Track which source address sent this payload
         // This proves that data from specific NICs actually reaches the server
-        self.data_tracker.data_by_source
+        self.data_tracker
+            .data_by_source
             .entry(addr)
             .or_default()
             .push(payload.clone());
@@ -749,13 +807,18 @@ impl ForwardingServer {
             let mut guard = session.exit_stream.write().await;
             if let Some(ref mut stream) = *guard {
                 // Track data being forwarded to exit
-                self.data_tracker.forwarded_to_exit.write().push((addr, payload.clone()));
+                self.data_tracker
+                    .forwarded_to_exit
+                    .write()
+                    .push((addr, payload.clone()));
 
                 stream.write_all(&payload).await.ok();
 
                 // Read response from exit
                 let mut response_buf = vec![0u8; 4096];
-                match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut response_buf)).await {
+                match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut response_buf))
+                    .await
+                {
                     Ok(Ok(n)) if n > 0 => Some(response_buf[..n].to_vec()),
                     _ => None,
                 }
@@ -769,38 +832,47 @@ impl ForwardingServer {
         // CRITICAL: Response goes back through SAME uplink address (return path)
         if let Some(response_data) = response {
             // Track response event - proves return path uses same uplink
-            self.data_tracker.response_events.write()
+            self.data_tracker
+                .response_events
+                .write()
                 .push((addr, response_data.len()));
-            self.send_data(session, &response_data, packet.header.uplink_id, addr).await?;
+            self.send_data(session, &response_data, packet.header.uplink_id, addr)
+                .await?;
         }
 
         Ok(())
     }
 
-    async fn send_data(&self, session: &ForwardingSession, payload: &[u8], uplink_id: u16, addr: SocketAddr) -> Result<()> {
+    async fn send_data(
+        &self,
+        session: &ForwardingSession,
+        payload: &[u8],
+        uplink_id: u16,
+        addr: SocketAddr,
+    ) -> Result<()> {
         // Encrypt using the noise session for this specific uplink address
         let plaintext_len = payload.len();
-        let (encrypted, is_encrypted) = if let Some(mut noise_ref) = session.noise_by_addr.get_mut(&addr) {
-            if noise_ref.is_transport() {
-                let encrypted_data = noise_ref.encrypt(payload)?;
-                let encrypted_len = encrypted_data.len();
-                // Track encryption event with both sizes - proves response encryption uses per-uplink crypto
-                self.data_tracker.encryption_events.write()
-                    .push((addr, true, plaintext_len, encrypted_len));
-                (encrypted_data, true)
+        let (encrypted, is_encrypted) =
+            if let Some(mut noise_ref) = session.noise_by_addr.get_mut(&addr) {
+                if noise_ref.is_transport() {
+                    let encrypted_data = noise_ref.encrypt(payload)?;
+                    let encrypted_len = encrypted_data.len();
+                    // Track encryption event with both sizes - proves response encryption uses per-uplink crypto
+                    self.data_tracker.encryption_events.write().push((
+                        addr,
+                        true,
+                        plaintext_len,
+                        encrypted_len,
+                    ));
+                    (encrypted_data, true)
+                } else {
+                    (payload.to_vec(), false)
+                }
             } else {
                 (payload.to_vec(), false)
-            }
-        } else {
-            (payload.to_vec(), false)
-        };
+            };
 
-        let mut response = Packet::data(
-            self.next_sequence(),
-            session.id,
-            uplink_id,
-            encrypted,
-        )?;
+        let mut response = Packet::data(self.next_sequence(), session.id, uplink_id, encrypted)?;
 
         if is_encrypted {
             response.set_flag(PacketFlags::ENCRYPTED);
@@ -809,7 +881,12 @@ impl ForwardingServer {
         self.send_packet(&response, addr).await
     }
 
-    async fn handle_ping(&self, session: &ForwardingSession, packet: &Packet, addr: SocketAddr) -> Result<()> {
+    async fn handle_ping(
+        &self,
+        session: &ForwardingSession,
+        packet: &Packet,
+        addr: SocketAddr,
+    ) -> Result<()> {
         let pong = Packet::pong(
             packet.header.sequence.next(),
             session.id,
@@ -828,12 +905,16 @@ impl ForwardingServer {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        self.data_tracker.udp_responses_sent.write()
+        self.data_tracker
+            .udp_responses_sent
+            .write()
             .push((addr, data.len(), timestamp));
 
         if let Some(stats) = self.uplink_stats.get(&addr) {
             stats.packets_sent.fetch_add(1, Ordering::SeqCst);
-            stats.bytes_sent.fetch_add(data.len() as u64, Ordering::SeqCst);
+            stats
+                .bytes_sent
+                .fetch_add(data.len() as u64, Ordering::SeqCst);
         }
 
         Ok(())
@@ -932,7 +1013,11 @@ async fn test_multi_uplink_aggregation() {
     // 2. Verify each source address sent actual data
     let payload_counts = server.get_payload_counts_by_source();
     for (addr, count) in &payload_counts {
-        assert!(*count > 0, "Source {} should have sent data, but count is 0", addr);
+        assert!(
+            *count > 0,
+            "Source {} should have sent data, but count is 0",
+            addr
+        );
     }
     println!("Payload counts by source: {:?}", payload_counts);
 
@@ -952,32 +1037,51 @@ async fn test_multi_uplink_aggregation() {
             }
         }
     }
-    assert!(found_uplink1_data, "CRITICAL: Data from uplink 1 must reach server from a distinct source");
-    assert!(found_uplink2_data, "CRITICAL: Data from uplink 2 must reach server from a distinct source");
+    assert!(
+        found_uplink1_data,
+        "CRITICAL: Data from uplink 1 must reach server from a distinct source"
+    );
+    assert!(
+        found_uplink2_data,
+        "CRITICAL: Data from uplink 2 must reach server from a distinct source"
+    );
 
     // 4. Verify data was forwarded to exit from both sources
     let forwarded = server.get_forwarded_data();
-    assert!(forwarded.len() >= 2, "At least 2 payloads should be forwarded to exit");
+    assert!(
+        forwarded.len() >= 2,
+        "At least 2 payloads should be forwarded to exit"
+    );
 
     // Collect unique source addresses that forwarded data
-    let forwarded_sources: std::collections::HashSet<_> = forwarded.iter().map(|(addr, _)| *addr).collect();
+    let forwarded_sources: std::collections::HashSet<_> =
+        forwarded.iter().map(|(addr, _)| *addr).collect();
     assert!(forwarded_sources.len() >= 2,
         "CRITICAL: Data forwarded to exit must come from at least 2 distinct source addresses. Got: {}",
         forwarded_sources.len());
 
     // 5. Verify exit destination received the data
     let received = exit.received_data();
-    assert!(received.len() >= 2, "Exit should have received at least 2 messages");
+    assert!(
+        received.len() >= 2,
+        "Exit should have received at least 2 messages"
+    );
 
     // Verify data content at exit
     let all_received: Vec<u8> = received.iter().flatten().cloned().collect();
-    assert!(all_received.windows(data1.len()).any(|w| w == data1),
-        "Exit should receive data originally sent through uplink 1");
-    assert!(all_received.windows(data2.len()).any(|w| w == data2),
-        "Exit should receive data originally sent through uplink 2");
+    assert!(
+        all_received.windows(data1.len()).any(|w| w == data1),
+        "Exit should receive data originally sent through uplink 1"
+    );
+    assert!(
+        all_received.windows(data2.len()).any(|w| w == data2),
+        "Exit should receive data originally sent through uplink 2"
+    );
 
-    println!("SUCCESS: Verified data from 2 distinct NICs reached exit via {} source addresses",
-        source_addresses.len());
+    println!(
+        "SUCCESS: Verified data from 2 distinct NICs reached exit via {} source addresses",
+        source_addresses.len()
+    );
 
     server.shutdown();
     exit.shutdown();
@@ -1034,21 +1138,33 @@ async fn test_flow_stickiness_through_exit() {
 
     // Send first message to establish binding (binding is created lazily)
     let msg0 = "Sticky message 0";
-    manager.send_on_flow(Some(flow_id), msg0.as_bytes()).await.unwrap();
+    manager
+        .send_on_flow(Some(flow_id), msg0.as_bytes())
+        .await
+        .unwrap();
 
     // Now get the initial binding (created during first send)
     let initial_binding = manager.get_flow_binding(flow_id);
-    assert!(initial_binding.is_some(), "Binding should be created after first send");
+    assert!(
+        initial_binding.is_some(),
+        "Binding should be created after first send"
+    );
 
     // Send more messages on the same flow
     for i in 1..10 {
         let msg = format!("Sticky message {}", i);
-        manager.send_on_flow(Some(flow_id), msg.as_bytes()).await.unwrap();
+        manager
+            .send_on_flow(Some(flow_id), msg.as_bytes())
+            .await
+            .unwrap();
 
         // Verify binding didn't change
         let current_binding = manager.get_flow_binding(flow_id);
-        assert_eq!(initial_binding, current_binding,
-            "Flow binding should remain sticky on message {}", i);
+        assert_eq!(
+            initial_binding, current_binding,
+            "Flow binding should remain sticky on message {}",
+            i
+        );
     }
 
     // Wait for all messages to be processed
@@ -1056,14 +1172,18 @@ async fn test_flow_stickiness_through_exit() {
 
     // Verify exit received all messages
     let received = exit.received_data();
-    assert_eq!(received.len(), 10, "Exit should have received all 10 messages");
+    assert_eq!(
+        received.len(),
+        10,
+        "Exit should have received all 10 messages"
+    );
 
     // Verify all messages arrived (content check)
     for i in 0..10 {
         let expected = format!("Sticky message {}", i);
-        let found = received.iter().any(|r| {
-            String::from_utf8_lossy(r).contains(&expected)
-        });
+        let found = received
+            .iter()
+            .any(|r| String::from_utf8_lossy(r).contains(&expected));
         assert!(found, "Should find message {}", i);
     }
 
@@ -1124,10 +1244,15 @@ async fn test_complete_data_path() {
         Ok(Ok((response, _uplink_id))) => {
             // Response should have EXIT: prefix from the exit destination
             let response_str = String::from_utf8_lossy(&response);
-            assert!(response_str.starts_with("EXIT:"),
-                "Response should have EXIT prefix, got: {}", response_str);
-            assert!(response_str.contains("Test data for exit"),
-                "Response should contain original data");
+            assert!(
+                response_str.starts_with("EXIT:"),
+                "Response should have EXIT prefix, got: {}",
+                response_str
+            );
+            assert!(
+                response_str.contains("Test data for exit"),
+                "Response should contain original data"
+            );
             println!("Complete path verified: {}", response_str);
         }
         Ok(Err(e)) => panic!("Receive error: {}", e),
@@ -1136,8 +1261,14 @@ async fn test_complete_data_path() {
 
     // Verify exit destination saw the data
     let received = exit.received_data();
-    assert!(!received.is_empty(), "Exit destination should have received data");
-    assert_eq!(received[0], test_data, "Exit should receive exact data sent");
+    assert!(
+        !received.is_empty(),
+        "Exit destination should have received data"
+    );
+    assert_eq!(
+        received[0], test_data,
+        "Exit should receive exact data sent"
+    );
 
     server.shutdown();
     exit.shutdown();
@@ -1205,7 +1336,10 @@ async fn test_parallel_flows_different_uplinks() {
     let task_a = tokio::spawn(async move {
         for i in 0..5 {
             let msg = format!("Flow-A message {}", i);
-            manager_a.send_on_flow(Some(flow_a), msg.as_bytes()).await.unwrap();
+            manager_a
+                .send_on_flow(Some(flow_a), msg.as_bytes())
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     });
@@ -1213,7 +1347,10 @@ async fn test_parallel_flows_different_uplinks() {
     let task_b = tokio::spawn(async move {
         for i in 0..5 {
             let msg = format!("Flow-B message {}", i);
-            manager_b.send_on_flow(Some(flow_b), msg.as_bytes()).await.unwrap();
+            manager_b
+                .send_on_flow(Some(flow_b), msg.as_bytes())
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     });
@@ -1225,16 +1362,27 @@ async fn test_parallel_flows_different_uplinks() {
 
     // Verify exit received all messages
     let received = exit.received_data();
-    assert_eq!(received.len(), 10, "Exit should have received all 10 messages");
+    assert_eq!(
+        received.len(),
+        10,
+        "Exit should have received all 10 messages"
+    );
 
     // Verify messages from both flows arrived
-    let all_text: String = received.iter()
+    let all_text: String = received
+        .iter()
         .map(|r| String::from_utf8_lossy(r).to_string())
         .collect::<Vec<_>>()
         .join("");
 
-    assert!(all_text.contains("Flow-A"), "Should contain Flow-A messages");
-    assert!(all_text.contains("Flow-B"), "Should contain Flow-B messages");
+    assert!(
+        all_text.contains("Flow-A"),
+        "Should contain Flow-A messages"
+    );
+    assert!(
+        all_text.contains("Flow-B"),
+        "Should contain Flow-B messages"
+    );
 
     // Verify bindings remained stable
     assert_eq!(manager.get_flow_binding(flow_a), Some(uplink1_id));
@@ -1300,7 +1448,10 @@ async fn test_uplink_failover() {
     assert_eq!(manager.get_flow_binding(flow_id), Some(uplink1_id));
 
     // Send first message through uplink 1
-    manager.send_on_flow(Some(flow_id), b"Before failover").await.unwrap();
+    manager
+        .send_on_flow(Some(flow_id), b"Before failover")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Remove uplink 1 (simulate failure)
@@ -1315,13 +1466,20 @@ async fn test_uplink_failover() {
 
     // Verify binding updated to uplink 2
     let new_binding = manager.get_flow_binding(flow_id);
-    assert_eq!(new_binding, Some(uplink2_id), "Flow should fail over to uplink 2");
+    assert_eq!(
+        new_binding,
+        Some(uplink2_id),
+        "Flow should fail over to uplink 2"
+    );
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Verify exit received both messages
     let received = exit.received_data();
-    assert!(received.len() >= 2, "Exit should have received messages before and after failover");
+    assert!(
+        received.len() >= 2,
+        "Exit should have received messages before and after failover"
+    );
 
     server.shutdown();
     exit.shutdown();
@@ -1379,12 +1537,17 @@ async fn test_data_through_multipath() {
     match result {
         Ok(Ok((response, _))) => {
             // Response should contain EXIT: prefix
-            assert!(response.starts_with(b"EXIT:"),
-                "Response should start with EXIT:");
+            assert!(
+                response.starts_with(b"EXIT:"),
+                "Response should start with EXIT:"
+            );
             // Rest should be our data
             let data_portion = &response[5..];
-            assert_eq!(data_portion, &large_data[..],
-                "Data should match through exit");
+            assert_eq!(
+                data_portion,
+                &large_data[..],
+                "Data should match through exit"
+            );
             println!("Large data transfer verified: {} bytes", large_data.len());
         }
         Ok(Err(e)) => panic!("Receive error: {}", e),
@@ -1454,11 +1617,19 @@ async fn test_session_aggregates_uplinks() {
 
     // Due to how we route traffic, at least one uplink should be used
     assert!(uplink_count.is_some(), "Session should exist");
-    println!("Session {} has {} uplinks", session_id, uplink_count.unwrap());
+    println!(
+        "Session {} has {} uplinks",
+        session_id,
+        uplink_count.unwrap()
+    );
 
     // Verify exit received all messages
     let received = exit.received_data();
-    assert_eq!(received.len(), 6, "Exit should have received all 6 messages");
+    assert_eq!(
+        received.len(),
+        6,
+        "Exit should have received all 6 messages"
+    );
 
     server.shutdown();
     exit.shutdown();
@@ -1530,11 +1701,17 @@ async fn test_bandwidth_aggregation() {
     let data2_clone = data2.clone();
 
     let task1 = tokio::spawn(async move {
-        manager1.send_on_flow(Some(flow1), &data1_clone).await.unwrap();
+        manager1
+            .send_on_flow(Some(flow1), &data1_clone)
+            .await
+            .unwrap();
     });
 
     let task2 = tokio::spawn(async move {
-        manager2.send_on_flow(Some(flow2), &data2_clone).await.unwrap();
+        manager2
+            .send_on_flow(Some(flow2), &data2_clone)
+            .await
+            .unwrap();
     });
 
     let _ = tokio::join!(task1, task2);
@@ -1544,9 +1721,11 @@ async fn test_bandwidth_aggregation() {
 
     // 1. Verify data came from 2 distinct source addresses
     let source_addresses = server.get_data_source_addresses();
-    assert!(source_addresses.len() >= 2,
+    assert!(
+        source_addresses.len() >= 2,
         "CRITICAL: Bandwidth must come from at least 2 distinct source addresses (NICs). Got: {}",
-        source_addresses.len());
+        source_addresses.len()
+    );
 
     // 2. Verify each source contributed data
     let payload_counts = server.get_payload_counts_by_source();
@@ -1557,8 +1736,11 @@ async fn test_bandwidth_aggregation() {
             println!("Source {} contributed {} payloads", addr, count);
         }
     }
-    assert!(sources_with_data >= 2,
-        "CRITICAL: At least 2 sources must contribute data. Got: {}", sources_with_data);
+    assert!(
+        sources_with_data >= 2,
+        "CRITICAL: At least 2 sources must contribute data. Got: {}",
+        sources_with_data
+    );
 
     // 3. Verify the specific data patterns from each source
     let mut found_data_a = false;
@@ -1576,15 +1758,24 @@ async fn test_bandwidth_aggregation() {
             }
         }
     }
-    assert!(found_data_a, "CRITICAL: Data from uplink 1 (all 'A' bytes) must reach server");
-    assert!(found_data_b, "CRITICAL: Data from uplink 2 (all 'B' bytes) must reach server");
+    assert!(
+        found_data_a,
+        "CRITICAL: Data from uplink 1 (all 'A' bytes) must reach server"
+    );
+    assert!(
+        found_data_b,
+        "CRITICAL: Data from uplink 2 (all 'B' bytes) must reach server"
+    );
 
     // 4. Verify forwarded data came from both sources
     let forwarded = server.get_forwarded_data();
-    let forwarded_sources: std::collections::HashSet<_> = forwarded.iter().map(|(addr, _)| *addr).collect();
-    assert!(forwarded_sources.len() >= 2,
+    let forwarded_sources: std::collections::HashSet<_> =
+        forwarded.iter().map(|(addr, _)| *addr).collect();
+    assert!(
+        forwarded_sources.len() >= 2,
         "CRITICAL: Forwarded data must come from at least 2 distinct sources. Got: {}",
-        forwarded_sources.len());
+        forwarded_sources.len()
+    );
 
     // 5. Verify exit received total data from both uplinks
     let received = exit.received_data();
@@ -1598,11 +1789,21 @@ async fn test_bandwidth_aggregation() {
     let all_exit_data: Vec<u8> = received.iter().flatten().cloned().collect();
     let count_a = all_exit_data.iter().filter(|&&b| b == b'A').count();
     let count_b = all_exit_data.iter().filter(|&&b| b == b'B').count();
-    assert_eq!(count_a, data_size, "Exit should receive {} 'A' bytes from uplink 1", data_size);
-    assert_eq!(count_b, data_size, "Exit should receive {} 'B' bytes from uplink 2", data_size);
+    assert_eq!(
+        count_a, data_size,
+        "Exit should receive {} 'A' bytes from uplink 1",
+        data_size
+    );
+    assert_eq!(
+        count_b, data_size,
+        "Exit should receive {} 'B' bytes from uplink 2",
+        data_size
+    );
 
-    println!("SUCCESS: Bandwidth aggregation verified - {} bytes from 2 NICs reached exit",
-        total_bytes);
+    println!(
+        "SUCCESS: Bandwidth aggregation verified - {} bytes from 2 NICs reached exit",
+        total_bytes
+    );
 
     server.shutdown();
     exit.shutdown();
@@ -1688,12 +1889,16 @@ async fn test_ecmp_flow_hash_consistency() {
         80,
         6,
     );
-    assert_eq!(flow_hash_1, flow_hash_1_again,
-        "ECMP: Same flow must produce same hash (Dublin Traceroute consistency)");
+    assert_eq!(
+        flow_hash_1, flow_hash_1_again,
+        "ECMP: Same flow must produce same hash (Dublin Traceroute consistency)"
+    );
 
     // Verify different flows produce different hashes
-    assert_ne!(flow_hash_1, flow_hash_2,
-        "ECMP: Different flows should produce different hashes");
+    assert_ne!(
+        flow_hash_1, flow_hash_2,
+        "ECMP: Different flows should produce different hashes"
+    );
 
     // 2. Allocate flows on specific uplinks and verify binding consistency
     let flow_a = manager.allocate_flow_on_uplink(uplink1_id).unwrap();
@@ -1704,34 +1909,53 @@ async fn test_ecmp_flow_hash_consistency() {
         let msg_a = format!("Flow-A-{}", i);
         let msg_b = format!("Flow-B-{}", i);
 
-        manager.send_on_flow(Some(flow_a), msg_a.as_bytes()).await.unwrap();
-        manager.send_on_flow(Some(flow_b), msg_b.as_bytes()).await.unwrap();
+        manager
+            .send_on_flow(Some(flow_a), msg_a.as_bytes())
+            .await
+            .unwrap();
+        manager
+            .send_on_flow(Some(flow_b), msg_b.as_bytes())
+            .await
+            .unwrap();
 
         // Verify bindings remain consistent (ECMP path stickiness)
         let binding_a = manager.get_flow_binding(flow_a);
         let binding_b = manager.get_flow_binding(flow_b);
 
-        assert_eq!(binding_a, Some(uplink1_id),
-            "ECMP: Flow A must remain bound to uplink 1 (message {})", i);
-        assert_eq!(binding_b, Some(uplink2_id),
-            "ECMP: Flow B must remain bound to uplink 2 (message {})", i);
+        assert_eq!(
+            binding_a,
+            Some(uplink1_id),
+            "ECMP: Flow A must remain bound to uplink 1 (message {})",
+            i
+        );
+        assert_eq!(
+            binding_b,
+            Some(uplink2_id),
+            "ECMP: Flow B must remain bound to uplink 2 (message {})",
+            i
+        );
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 3. Verify server received data from both source addresses
     let source_addresses = server.get_data_source_addresses();
-    assert!(source_addresses.len() >= 2,
-        "ECMP: Server must see traffic from at least 2 distinct source addresses");
+    assert!(
+        source_addresses.len() >= 2,
+        "ECMP: Server must see traffic from at least 2 distinct source addresses"
+    );
 
     // 4. Verify each uplink contributed data (proving ECMP split worked)
     let payload_counts = server.get_payload_counts_by_source();
-    let sources_with_data: Vec<_> = payload_counts.iter()
+    let sources_with_data: Vec<_> = payload_counts
+        .iter()
         .filter(|(_, count)| *count > 0)
         .collect();
-    assert!(sources_with_data.len() >= 2,
+    assert!(
+        sources_with_data.len() >= 2,
         "ECMP: At least 2 sources must have contributed data, got: {}",
-        sources_with_data.len());
+        sources_with_data.len()
+    );
 
     // 5. Verify Flow-A messages came from one source and Flow-B from another
     let mut flow_a_source: Option<SocketAddr> = None;
@@ -1743,16 +1967,20 @@ async fn test_ecmp_flow_hash_consistency() {
             let payload_str = String::from_utf8_lossy(payload);
             if payload_str.starts_with("Flow-A") {
                 if let Some(existing) = flow_a_source {
-                    assert_eq!(existing, *addr,
-                        "ECMP: All Flow-A messages must come from same source (path consistency)");
+                    assert_eq!(
+                        existing, *addr,
+                        "ECMP: All Flow-A messages must come from same source (path consistency)"
+                    );
                 } else {
                     flow_a_source = Some(*addr);
                 }
             }
             if payload_str.starts_with("Flow-B") {
                 if let Some(existing) = flow_b_source {
-                    assert_eq!(existing, *addr,
-                        "ECMP: All Flow-B messages must come from same source (path consistency)");
+                    assert_eq!(
+                        existing, *addr,
+                        "ECMP: All Flow-B messages must come from same source (path consistency)"
+                    );
                 } else {
                     flow_b_source = Some(*addr);
                 }
@@ -1760,10 +1988,18 @@ async fn test_ecmp_flow_hash_consistency() {
         }
     }
 
-    assert!(flow_a_source.is_some(), "ECMP: Flow-A messages must have a source");
-    assert!(flow_b_source.is_some(), "ECMP: Flow-B messages must have a source");
-    assert_ne!(flow_a_source, flow_b_source,
-        "ECMP: Flow-A and Flow-B must use different sources (uplinks)");
+    assert!(
+        flow_a_source.is_some(),
+        "ECMP: Flow-A messages must have a source"
+    );
+    assert!(
+        flow_b_source.is_some(),
+        "ECMP: Flow-B messages must have a source"
+    );
+    assert_ne!(
+        flow_a_source, flow_b_source,
+        "ECMP: Flow-A and Flow-B must use different sources (uplinks)"
+    );
 
     println!("SUCCESS: ECMP flow hash consistency verified");
     println!("  Flow-A source: {:?}", flow_a_source);
@@ -1830,15 +2066,20 @@ async fn test_noise_encryption_per_uplink() {
 
     // VERIFY: Handshakes occurred for each uplink
     let handshake_events = server.get_handshake_events();
-    assert!(handshake_events.len() >= 2,
+    assert!(
+        handshake_events.len() >= 2,
         "CRYPTO: Must have handshake events from at least 2 uplink addresses. Got: {}",
-        handshake_events.len());
+        handshake_events.len()
+    );
 
     println!("Handshake events:");
     for (addr, events) in &handshake_events {
         println!("  {}: {:?}", addr, events);
-        assert!(!events.is_empty(),
-            "CRYPTO: Uplink {} must have completed handshake", addr);
+        assert!(
+            !events.is_empty(),
+            "CRYPTO: Uplink {} must have completed handshake",
+            addr
+        );
     }
 
     // Allocate flows on specific uplinks
@@ -1866,15 +2107,24 @@ async fn test_noise_encryption_per_uplink() {
         decryption_by_addr.entry(*addr).or_default().push(*success);
     }
 
-    assert!(decryption_by_addr.len() >= 2,
+    assert!(
+        decryption_by_addr.len() >= 2,
         "CRYPTO: Must have decryption events from at least 2 uplink addresses. Got: {}",
-        decryption_by_addr.len());
+        decryption_by_addr.len()
+    );
 
     for (addr, results) in &decryption_by_addr {
         let all_successful = results.iter().all(|&s| s);
-        assert!(all_successful,
-            "CRYPTO: All decryptions from {} must succeed. Results: {:?}", addr, results);
-        println!("  Uplink {}: {} successful decryptions", addr, results.len());
+        assert!(
+            all_successful,
+            "CRYPTO: All decryptions from {} must succeed. Results: {:?}",
+            addr, results
+        );
+        println!(
+            "  Uplink {}: {} successful decryptions",
+            addr,
+            results.len()
+        );
     }
 
     // VERIFY: Encryption events for responses (per uplink)
@@ -1887,44 +2137,70 @@ async fn test_noise_encryption_per_uplink() {
         encryption_by_addr.entry(*addr).or_default().push(*success);
     }
 
-    assert!(encryption_by_addr.len() >= 2,
+    assert!(
+        encryption_by_addr.len() >= 2,
         "CRYPTO: Must have encryption events from at least 2 uplink addresses. Got: {}",
-        encryption_by_addr.len());
+        encryption_by_addr.len()
+    );
 
     for (addr, results) in &encryption_by_addr {
         let all_successful = results.iter().all(|&s| s);
-        assert!(all_successful,
-            "CRYPTO: All encryptions to {} must succeed. Results: {:?}", addr, results);
-        println!("  Uplink {}: {} successful encryptions", addr, results.len());
+        assert!(
+            all_successful,
+            "CRYPTO: All encryptions to {} must succeed. Results: {:?}",
+            addr, results
+        );
+        println!(
+            "  Uplink {}: {} successful encryptions",
+            addr,
+            results.len()
+        );
     }
 
     // VERIFY: UDP responses were actually sent back through the network
     let udp_responses = server.get_udp_responses_sent();
-    let udp_response_addrs: std::collections::HashSet<_> = udp_responses.iter()
-        .map(|(addr, _, _)| *addr)
-        .collect();
-    assert!(udp_response_addrs.len() >= 2,
+    let udp_response_addrs: std::collections::HashSet<_> =
+        udp_responses.iter().map(|(addr, _, _)| *addr).collect();
+    assert!(
+        udp_response_addrs.len() >= 2,
         "CRYPTO: UDP responses must be sent to at least 2 distinct uplink addresses. Got: {}",
-        udp_response_addrs.len());
-    println!("UDP responses sent to {} distinct addresses", udp_response_addrs.len());
+        udp_response_addrs.len()
+    );
+    println!(
+        "UDP responses sent to {} distinct addresses",
+        udp_response_addrs.len()
+    );
 
     // VERIFY: Encryption overhead is reasonable (Noise adds ~16 bytes for AEAD tag)
     if let Some((total_plain, total_enc, overhead)) = server.calculate_encryption_overhead() {
         let overhead_per_message = (total_enc - total_plain) / encryption_events.len();
-        println!("Encryption overhead: {} bytes plaintext -> {} bytes encrypted ({:.2}x), ~{} bytes/msg",
-            total_plain, total_enc, overhead, overhead_per_message);
-        assert!(overhead >= 1.0, "Encrypted data must be at least as large as plaintext");
-        assert!(overhead < 2.0, "Encryption overhead should be reasonable (< 2x)");
+        println!(
+            "Encryption overhead: {} bytes plaintext -> {} bytes encrypted ({:.2}x), ~{} bytes/msg",
+            total_plain, total_enc, overhead, overhead_per_message
+        );
+        assert!(
+            overhead >= 1.0,
+            "Encrypted data must be at least as large as plaintext"
+        );
+        assert!(
+            overhead < 2.0,
+            "Encryption overhead should be reasonable (< 2x)"
+        );
     }
 
     // VERIFY: Session has distinct Noise sessions per uplink
     let session_id = manager.session_id();
     let noise_session_count = server.get_noise_session_count(session_id);
-    assert!(noise_session_count >= 2,
+    assert!(
+        noise_session_count >= 2,
         "CRYPTO: Session must have at least 2 distinct Noise sessions (one per uplink). Got: {}",
-        noise_session_count);
+        noise_session_count
+    );
 
-    println!("SUCCESS: Noise encryption verified for {} uplinks", noise_session_count);
+    println!(
+        "SUCCESS: Noise encryption verified for {} uplinks",
+        noise_session_count
+    );
 
     server.shutdown();
     exit.shutdown();
@@ -1996,39 +2272,67 @@ async fn test_return_path_validation() {
     let result1 = tokio::time::timeout(Duration::from_secs(2), manager.recv()).await;
     let (response1, recv_uplink1) = match result1 {
         Ok(Ok((data, uplink_id))) => (data, uplink_id),
-        Ok(Err(e)) => panic!("BIDIRECTIONAL: Failed to receive response for uplink 1: {}", e),
+        Ok(Err(e)) => panic!(
+            "BIDIRECTIONAL: Failed to receive response for uplink 1: {}",
+            e
+        ),
         Err(_) => panic!("BIDIRECTIONAL: Timeout receiving response for uplink 1"),
     };
-    println!("Received response 1 ({} bytes) via uplink {:?}", response1.len(), recv_uplink1);
+    println!(
+        "Received response 1 ({} bytes) via uplink {:?}",
+        response1.len(),
+        recv_uplink1
+    );
 
     // Verify response 1 contains EXIT: prefix and original data
-    assert!(response1.starts_with(b"EXIT:"),
-        "BIDIRECTIONAL: Response 1 should have EXIT: prefix");
-    assert!(response1.windows(data1.len()).any(|w| w == data1),
-        "BIDIRECTIONAL: Response 1 should contain original data");
+    assert!(
+        response1.starts_with(b"EXIT:"),
+        "BIDIRECTIONAL: Response 1 should have EXIT: prefix"
+    );
+    assert!(
+        response1.windows(data1.len()).any(|w| w == data1),
+        "BIDIRECTIONAL: Response 1 should contain original data"
+    );
 
     // Send through uplink 2 and receive response
     manager.send_on_flow(Some(flow2), data2).await.unwrap();
     let result2 = tokio::time::timeout(Duration::from_secs(2), manager.recv()).await;
     let (response2, recv_uplink2) = match result2 {
         Ok(Ok((data, uplink_id))) => (data, uplink_id),
-        Ok(Err(e)) => panic!("BIDIRECTIONAL: Failed to receive response for uplink 2: {}", e),
+        Ok(Err(e)) => panic!(
+            "BIDIRECTIONAL: Failed to receive response for uplink 2: {}",
+            e
+        ),
         Err(_) => panic!("BIDIRECTIONAL: Timeout receiving response for uplink 2"),
     };
-    println!("Received response 2 ({} bytes) via uplink {:?}", response2.len(), recv_uplink2);
+    println!(
+        "Received response 2 ({} bytes) via uplink {:?}",
+        response2.len(),
+        recv_uplink2
+    );
 
     // Verify response 2 contains EXIT: prefix and original data
-    assert!(response2.starts_with(b"EXIT:"),
-        "BIDIRECTIONAL: Response 2 should have EXIT: prefix");
-    assert!(response2.windows(data2.len()).any(|w| w == data2),
-        "BIDIRECTIONAL: Response 2 should contain original data");
+    assert!(
+        response2.starts_with(b"EXIT:"),
+        "BIDIRECTIONAL: Response 2 should have EXIT: prefix"
+    );
+    assert!(
+        response2.windows(data2.len()).any(|w| w == data2),
+        "BIDIRECTIONAL: Response 2 should contain original data"
+    );
 
     // VERIFY: Responses came back through the SAME uplinks that sent them
     // (This proves return path stickiness)
-    assert_eq!(recv_uplink1, uplink1_id,
-        "RETURN PATH: Response 1 must come back through uplink 1. Got: {}", recv_uplink1);
-    assert_eq!(recv_uplink2, uplink2_id,
-        "RETURN PATH: Response 2 must come back through uplink 2. Got: {}", recv_uplink2);
+    assert_eq!(
+        recv_uplink1, uplink1_id,
+        "RETURN PATH: Response 1 must come back through uplink 1. Got: {}",
+        recv_uplink1
+    );
+    assert_eq!(
+        recv_uplink2, uplink2_id,
+        "RETURN PATH: Response 2 must come back through uplink 2. Got: {}",
+        recv_uplink2
+    );
 
     // Get all events for analysis
     let decryption_events = server.get_decryption_events();
@@ -2042,39 +2346,53 @@ async fn test_return_path_validation() {
     println!("UDP responses sent: {:?}", udp_responses);
 
     // VERIFY: Response events came from at least 2 distinct uplink addresses
-    let response_addrs: std::collections::HashSet<_> = response_events.iter()
-        .map(|(addr, _)| *addr)
-        .collect();
-    assert!(response_addrs.len() >= 2,
+    let response_addrs: std::collections::HashSet<_> =
+        response_events.iter().map(|(addr, _)| *addr).collect();
+    assert!(
+        response_addrs.len() >= 2,
         "RETURN PATH: Responses must be tracked from at least 2 uplink addresses. Got: {}",
-        response_addrs.len());
+        response_addrs.len()
+    );
 
     // VERIFY: UDP responses were actually sent to at least 2 distinct addresses
-    let udp_addrs: std::collections::HashSet<_> = udp_responses.iter()
-        .map(|(addr, _, _)| *addr)
-        .collect();
-    assert!(udp_addrs.len() >= 2,
+    let udp_addrs: std::collections::HashSet<_> =
+        udp_responses.iter().map(|(addr, _, _)| *addr).collect();
+    assert!(
+        udp_addrs.len() >= 2,
         "RETURN PATH: UDP responses must be sent to at least 2 distinct addresses. Got: {}",
-        udp_addrs.len());
+        udp_addrs.len()
+    );
 
     // VERIFY: For each uplink that decrypted data, a response was sent back through same uplink
-    let decryption_addrs: std::collections::HashSet<_> = decryption_events.iter()
+    let decryption_addrs: std::collections::HashSet<_> = decryption_events
+        .iter()
         .filter(|(_, success, _, _)| *success)
         .map(|(addr, _, _, _)| *addr)
         .collect();
 
     for addr in &decryption_addrs {
         let has_response = response_events.iter().any(|(r_addr, _)| r_addr == addr);
-        assert!(has_response,
-            "RETURN PATH: Uplink {} received data but no response was sent back through it", addr);
+        assert!(
+            has_response,
+            "RETURN PATH: Uplink {} received data but no response was sent back through it",
+            addr
+        );
 
-        let has_encryption = encryption_events.iter().any(|(e_addr, success, _, _)| e_addr == addr && *success);
-        assert!(has_encryption,
-            "RETURN PATH: Response to uplink {} must be encrypted", addr);
+        let has_encryption = encryption_events
+            .iter()
+            .any(|(e_addr, success, _, _)| e_addr == addr && *success);
+        assert!(
+            has_encryption,
+            "RETURN PATH: Response to uplink {} must be encrypted",
+            addr
+        );
 
         let has_udp = udp_responses.iter().any(|(u_addr, _, _)| u_addr == addr);
-        assert!(has_udp,
-            "RETURN PATH: UDP packet must be sent to uplink {}", addr);
+        assert!(
+            has_udp,
+            "RETURN PATH: UDP packet must be sent to uplink {}",
+            addr
+        );
     }
 
     // VERIFY: Each uplink has complete request-response cycle
@@ -2085,7 +2403,10 @@ async fn test_return_path_validation() {
         println!("  Uplink {}: complete return path verified", addr);
     }
 
-    println!("SUCCESS: Bidirectional return path validation passed for {} uplinks", decryption_addrs.len());
+    println!(
+        "SUCCESS: Bidirectional return path validation passed for {} uplinks",
+        decryption_addrs.len()
+    );
 
     server.shutdown();
     exit.shutdown();
@@ -2162,9 +2483,18 @@ async fn test_session_state_consistency() {
 
     // Send data through each uplink
     for i in 0..3 {
-        manager.send_on_flow(Some(flow1), format!("Uplink1-{}", i).as_bytes()).await.unwrap();
-        manager.send_on_flow(Some(flow2), format!("Uplink2-{}", i).as_bytes()).await.unwrap();
-        manager.send_on_flow(Some(flow3), format!("Uplink3-{}", i).as_bytes()).await.unwrap();
+        manager
+            .send_on_flow(Some(flow1), format!("Uplink1-{}", i).as_bytes())
+            .await
+            .unwrap();
+        manager
+            .send_on_flow(Some(flow2), format!("Uplink2-{}", i).as_bytes())
+            .await
+            .unwrap();
+        manager
+            .send_on_flow(Some(flow3), format!("Uplink3-{}", i).as_bytes())
+            .await
+            .unwrap();
     }
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2172,34 +2502,44 @@ async fn test_session_state_consistency() {
     // VERIFY: All traffic belongs to same session
     let uplinks_in_session = server.session_uplink_count(session_id);
     assert!(uplinks_in_session.is_some(), "Session must exist");
-    assert!(uplinks_in_session.unwrap() >= 3,
+    assert!(
+        uplinks_in_session.unwrap() >= 3,
         "SESSION STATE: Session must track at least 3 uplinks. Got: {}",
-        uplinks_in_session.unwrap());
+        uplinks_in_session.unwrap()
+    );
 
     // VERIFY: Each uplink has its own Noise state but same session
     let noise_count = server.get_noise_session_count(session_id);
-    assert!(noise_count >= 3,
-        "SESSION STATE: Session must have 3 distinct Noise sessions. Got: {}", noise_count);
+    assert!(
+        noise_count >= 3,
+        "SESSION STATE: Session must have 3 distinct Noise sessions. Got: {}",
+        noise_count
+    );
 
     // VERIFY: All handshakes reference same session
     let handshake_events = server.get_handshake_events();
     let expected_session_marker = format!("session_{}", session_id);
     for (addr, events) in &handshake_events {
         for event in events {
-            assert!(event.contains(&expected_session_marker),
+            assert!(
+                event.contains(&expected_session_marker),
                 "SESSION STATE: Handshake from {} must reference session {}. Event: {}",
-                addr, session_id, event);
+                addr,
+                session_id,
+                event
+            );
         }
     }
 
     // VERIFY: Data from all uplinks was forwarded to exit
     let forwarded = server.get_forwarded_data();
-    let forwarded_sources: std::collections::HashSet<_> = forwarded.iter()
-        .map(|(addr, _)| *addr)
-        .collect();
-    assert!(forwarded_sources.len() >= 3,
+    let forwarded_sources: std::collections::HashSet<_> =
+        forwarded.iter().map(|(addr, _)| *addr).collect();
+    assert!(
+        forwarded_sources.len() >= 3,
         "SESSION STATE: Forwarded data must come from at least 3 sources. Got: {}",
-        forwarded_sources.len());
+        forwarded_sources.len()
+    );
 
     // VERIFY: Exit received data from all uplinks (proving session consistency)
     let received = exit.received_data();
@@ -2209,17 +2549,32 @@ async fn test_session_state_consistency() {
 
     for data in &received {
         let text = String::from_utf8_lossy(data);
-        if text.contains("Uplink1") { uplink1_count += 1; }
-        if text.contains("Uplink2") { uplink2_count += 1; }
-        if text.contains("Uplink3") { uplink3_count += 1; }
+        if text.contains("Uplink1") {
+            uplink1_count += 1;
+        }
+        if text.contains("Uplink2") {
+            uplink2_count += 1;
+        }
+        if text.contains("Uplink3") {
+            uplink3_count += 1;
+        }
     }
 
-    assert_eq!(uplink1_count, 3,
-        "SESSION STATE: Exit should receive 3 messages from uplink 1. Got: {}", uplink1_count);
-    assert_eq!(uplink2_count, 3,
-        "SESSION STATE: Exit should receive 3 messages from uplink 2. Got: {}", uplink2_count);
-    assert_eq!(uplink3_count, 3,
-        "SESSION STATE: Exit should receive 3 messages from uplink 3. Got: {}", uplink3_count);
+    assert_eq!(
+        uplink1_count, 3,
+        "SESSION STATE: Exit should receive 3 messages from uplink 1. Got: {}",
+        uplink1_count
+    );
+    assert_eq!(
+        uplink2_count, 3,
+        "SESSION STATE: Exit should receive 3 messages from uplink 2. Got: {}",
+        uplink2_count
+    );
+    assert_eq!(
+        uplink3_count, 3,
+        "SESSION STATE: Exit should receive 3 messages from uplink 3. Got: {}",
+        uplink3_count
+    );
 
     println!("SUCCESS: Session state consistency verified");
     println!("  Session ID: {}", session_id);
@@ -2293,7 +2648,10 @@ async fn test_uplink_failover_with_rerouting() {
     // Send messages through uplink 1
     for i in 0..3 {
         let msg = format!("Pre-failover-{}", i);
-        manager.send_on_flow(Some(flow_id), msg.as_bytes()).await.unwrap();
+        manager
+            .send_on_flow(Some(flow_id), msg.as_bytes())
+            .await
+            .unwrap();
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -2306,7 +2664,10 @@ async fn test_uplink_failover_with_rerouting() {
         let mut found = None;
         for addr in &pre_failover_sources {
             let payloads = server.get_data_from_source(addr);
-            if payloads.iter().any(|p| String::from_utf8_lossy(p).contains("Pre-failover")) {
+            if payloads
+                .iter()
+                .any(|p| String::from_utf8_lossy(p).contains("Pre-failover"))
+            {
                 found = Some(*addr);
                 break;
             }
@@ -2322,14 +2683,21 @@ async fn test_uplink_failover_with_rerouting() {
     for i in 0..3 {
         let msg = format!("Post-failover-{}", i);
         let result = manager.send_on_flow(Some(flow_id), msg.as_bytes()).await;
-        assert!(result.is_ok(), "Should be able to send after failover: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Should be able to send after failover: {:?}",
+            result
+        );
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // VERIFY: Flow binding changed to uplink 2
     let new_binding = manager.get_flow_binding(flow_id);
-    assert_eq!(new_binding, Some(uplink2_id),
-        "FAILOVER: Flow must be rebound to uplink 2 after uplink 1 removal");
+    assert_eq!(
+        new_binding,
+        Some(uplink2_id),
+        "FAILOVER: Flow must be rebound to uplink 2 after uplink 1 removal"
+    );
 
     // VERIFY: Post-failover messages came from different source address
     let post_failover_sources = server.get_data_source_addresses();
@@ -2340,7 +2708,10 @@ async fn test_uplink_failover_with_rerouting() {
         let mut found = None;
         for addr in &post_failover_sources {
             let payloads = server.get_data_from_source(addr);
-            if payloads.iter().any(|p| String::from_utf8_lossy(p).contains("Post-failover")) {
+            if payloads
+                .iter()
+                .any(|p| String::from_utf8_lossy(p).contains("Post-failover"))
+            {
                 found = Some(*addr);
                 break;
             }
@@ -2350,9 +2721,12 @@ async fn test_uplink_failover_with_rerouting() {
     println!("Uplink 2 source address: {}", uplink2_source);
 
     // VERIFY: Traffic actually rerouted (different source)
-    assert_ne!(uplink1_source, uplink2_source,
+    assert_ne!(
+        uplink1_source, uplink2_source,
         "FAILOVER: Post-failover traffic must come from different source address. \
-         Pre: {}, Post: {}", uplink1_source, uplink2_source);
+         Pre: {}, Post: {}",
+        uplink1_source, uplink2_source
+    );
 
     // VERIFY: All messages reached exit
     let received = exit.received_data();
@@ -2360,14 +2734,24 @@ async fn test_uplink_failover_with_rerouting() {
     let mut post_count = 0;
     for data in &received {
         let text = String::from_utf8_lossy(data);
-        if text.contains("Pre-failover") { pre_count += 1; }
-        if text.contains("Post-failover") { post_count += 1; }
+        if text.contains("Pre-failover") {
+            pre_count += 1;
+        }
+        if text.contains("Post-failover") {
+            post_count += 1;
+        }
     }
 
-    assert_eq!(pre_count, 3,
-        "FAILOVER: Exit should receive 3 pre-failover messages. Got: {}", pre_count);
-    assert_eq!(post_count, 3,
-        "FAILOVER: Exit should receive 3 post-failover messages. Got: {}", post_count);
+    assert_eq!(
+        pre_count, 3,
+        "FAILOVER: Exit should receive 3 pre-failover messages. Got: {}",
+        pre_count
+    );
+    assert_eq!(
+        post_count, 3,
+        "FAILOVER: Exit should receive 3 post-failover messages. Got: {}",
+        post_count
+    );
 
     println!("SUCCESS: Uplink failover with rerouting verified");
     println!("  Pre-failover source: {}", uplink1_source);
@@ -2446,25 +2830,40 @@ async fn test_distinct_local_addresses() {
     let flow3 = manager.allocate_flow_on_uplink(uplink3_id).unwrap();
 
     // Send data through each uplink
-    manager.send_on_flow(Some(flow1), b"From uplink 1").await.unwrap();
-    manager.send_on_flow(Some(flow2), b"From uplink 2").await.unwrap();
-    manager.send_on_flow(Some(flow3), b"From uplink 3").await.unwrap();
+    manager
+        .send_on_flow(Some(flow1), b"From uplink 1")
+        .await
+        .unwrap();
+    manager
+        .send_on_flow(Some(flow2), b"From uplink 2")
+        .await
+        .unwrap();
+    manager
+        .send_on_flow(Some(flow3), b"From uplink 3")
+        .await
+        .unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // VERIFY: Server received traffic from 3 distinct local addresses
     let source_addresses = server.get_data_source_addresses();
-    assert!(source_addresses.len() >= 3,
+    assert!(
+        source_addresses.len() >= 3,
         "DISTINCT ADDRESSES: Must receive from at least 3 distinct local addresses. Got: {}",
-        source_addresses.len());
+        source_addresses.len()
+    );
 
     // VERIFY: Each source address has distinct port (simulating different NICs)
-    let ports: std::collections::HashSet<_> = source_addresses.iter()
-        .map(|addr| addr.port())
-        .collect();
-    assert_eq!(ports.len(), source_addresses.len(),
+    let ports: std::collections::HashSet<_> =
+        source_addresses.iter().map(|addr| addr.port()).collect();
+    assert_eq!(
+        ports.len(),
+        source_addresses.len(),
         "DISTINCT ADDRESSES: Each uplink must use a different local port. \
-         Addresses: {:?}, Unique ports: {}", source_addresses, ports.len());
+         Addresses: {:?}, Unique ports: {}",
+        source_addresses,
+        ports.len()
+    );
 
     // VERIFY: Each uplink's data came from a distinct address
     let mut address_to_uplink: std::collections::HashMap<SocketAddr, &str> =
@@ -2476,39 +2875,60 @@ async fn test_distinct_local_addresses() {
             let text = String::from_utf8_lossy(payload);
             if text.contains("uplink 1") {
                 if let Some(existing) = address_to_uplink.get(addr) {
-                    assert_eq!(*existing, "uplink1",
-                        "DISTINCT ADDRESSES: Address {} used by multiple uplinks", addr);
+                    assert_eq!(
+                        *existing, "uplink1",
+                        "DISTINCT ADDRESSES: Address {} used by multiple uplinks",
+                        addr
+                    );
                 }
                 address_to_uplink.insert(*addr, "uplink1");
             }
             if text.contains("uplink 2") {
                 if let Some(existing) = address_to_uplink.get(addr) {
-                    assert_eq!(*existing, "uplink2",
-                        "DISTINCT ADDRESSES: Address {} used by multiple uplinks", addr);
+                    assert_eq!(
+                        *existing, "uplink2",
+                        "DISTINCT ADDRESSES: Address {} used by multiple uplinks",
+                        addr
+                    );
                 }
                 address_to_uplink.insert(*addr, "uplink2");
             }
             if text.contains("uplink 3") {
                 if let Some(existing) = address_to_uplink.get(addr) {
-                    assert_eq!(*existing, "uplink3",
-                        "DISTINCT ADDRESSES: Address {} used by multiple uplinks", addr);
+                    assert_eq!(
+                        *existing, "uplink3",
+                        "DISTINCT ADDRESSES: Address {} used by multiple uplinks",
+                        addr
+                    );
                 }
                 address_to_uplink.insert(*addr, "uplink3");
             }
         }
     }
 
-    assert_eq!(address_to_uplink.len(), 3,
+    assert_eq!(
+        address_to_uplink.len(),
+        3,
         "DISTINCT ADDRESSES: Must have 3 distinct address-to-uplink mappings. Got: {:?}",
-        address_to_uplink);
+        address_to_uplink
+    );
 
     // VERIFY: All 3 uplinks contributed data (fix for validation gap)
     let has_uplink1 = address_to_uplink.values().any(|v| *v == "uplink1");
     let has_uplink2 = address_to_uplink.values().any(|v| *v == "uplink2");
     let has_uplink3 = address_to_uplink.values().any(|v| *v == "uplink3");
-    assert!(has_uplink1, "DISTINCT ADDRESSES: Uplink 1 must contribute data");
-    assert!(has_uplink2, "DISTINCT ADDRESSES: Uplink 2 must contribute data");
-    assert!(has_uplink3, "DISTINCT ADDRESSES: Uplink 3 must contribute data");
+    assert!(
+        has_uplink1,
+        "DISTINCT ADDRESSES: Uplink 1 must contribute data"
+    );
+    assert!(
+        has_uplink2,
+        "DISTINCT ADDRESSES: Uplink 2 must contribute data"
+    );
+    assert!(
+        has_uplink3,
+        "DISTINCT ADDRESSES: Uplink 3 must contribute data"
+    );
 
     println!("SUCCESS: Distinct local addresses verified");
     for (addr, uplink) in &address_to_uplink {
@@ -2596,51 +3016,76 @@ async fn test_real_remote_endpoint_forwarding() {
     let result2 = tokio::time::timeout(Duration::from_secs(2), manager.recv()).await;
 
     // VERIFY: Client received responses
-    assert!(result1.is_ok() && result1.as_ref().unwrap().is_ok(),
-        "FORWARDING: Client must receive response 1");
-    assert!(result2.is_ok() && result2.as_ref().unwrap().is_ok(),
-        "FORWARDING: Client must receive response 2");
+    assert!(
+        result1.is_ok() && result1.as_ref().unwrap().is_ok(),
+        "FORWARDING: Client must receive response 1"
+    );
+    assert!(
+        result2.is_ok() && result2.as_ref().unwrap().is_ok(),
+        "FORWARDING: Client must receive response 2"
+    );
 
     let (response1, _) = result1.unwrap().unwrap();
     let (response2, _) = result2.unwrap().unwrap();
 
     // VERIFY: Responses contain REMOTE: prefix (proving they went through remote endpoint)
-    assert!(response1.starts_with(b"REMOTE:") || response2.starts_with(b"REMOTE:"),
-        "FORWARDING: At least one response must have REMOTE: prefix from real endpoint");
+    assert!(
+        response1.starts_with(b"REMOTE:") || response2.starts_with(b"REMOTE:"),
+        "FORWARDING: At least one response must have REMOTE: prefix from real endpoint"
+    );
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // VERIFY: Exit received data from server
     let exit_received = exit.received_data();
-    assert!(exit_received.len() >= 2,
-        "FORWARDING: Exit must receive at least 2 data packets. Got: {}", exit_received.len());
+    assert!(
+        exit_received.len() >= 2,
+        "FORWARDING: Exit must receive at least 2 data packets. Got: {}",
+        exit_received.len()
+    );
 
     // VERIFY: Exit FORWARDED data to remote
     let exit_forwarded = exit.forwarded_to_remote();
-    assert!(exit_forwarded.len() >= 2,
-        "FORWARDING: Exit must forward at least 2 data packets to remote. Got: {}", exit_forwarded.len());
+    assert!(
+        exit_forwarded.len() >= 2,
+        "FORWARDING: Exit must forward at least 2 data packets to remote. Got: {}",
+        exit_forwarded.len()
+    );
 
     // VERIFY: Remote endpoint actually received the data
     let remote_received = remote.received_data();
-    assert!(remote_received.len() >= 2,
-        "FORWARDING: Remote endpoint must receive at least 2 data packets. Got: {}", remote_received.len());
+    assert!(
+        remote_received.len() >= 2,
+        "FORWARDING: Remote endpoint must receive at least 2 data packets. Got: {}",
+        remote_received.len()
+    );
 
     // VERIFY: Remote received the exact data that was sent
     let all_remote_data: Vec<u8> = remote_received.iter().flatten().cloned().collect();
-    assert!(all_remote_data.windows(data1.len()).any(|w| w == data1),
-        "FORWARDING: Remote must receive exact data from uplink 1");
-    assert!(all_remote_data.windows(data2.len()).any(|w| w == data2),
-        "FORWARDING: Remote must receive exact data from uplink 2");
+    assert!(
+        all_remote_data.windows(data1.len()).any(|w| w == data1),
+        "FORWARDING: Remote must receive exact data from uplink 1"
+    );
+    assert!(
+        all_remote_data.windows(data2.len()).any(|w| w == data2),
+        "FORWARDING: Remote must receive exact data from uplink 2"
+    );
 
     // VERIFY: Exit received responses from remote
     let exit_responses = exit.responses_from_remote();
-    assert!(exit_responses.len() >= 2,
-        "FORWARDING: Exit must receive at least 2 responses from remote. Got: {}", exit_responses.len());
+    assert!(
+        exit_responses.len() >= 2,
+        "FORWARDING: Exit must receive at least 2 responses from remote. Got: {}",
+        exit_responses.len()
+    );
 
     // VERIFY: Remote sent responses
     let remote_responses = remote.forwarded_responses();
-    assert!(remote_responses.len() >= 2,
-        "FORWARDING: Remote must send at least 2 responses. Got: {}", remote_responses.len());
+    assert!(
+        remote_responses.len() >= 2,
+        "FORWARDING: Remote must send at least 2 responses. Got: {}",
+        remote_responses.len()
+    );
 
     println!("SUCCESS: Real remote endpoint forwarding verified");
     println!("  Exit received: {} packets", exit_received.len());
@@ -2732,20 +3177,29 @@ async fn test_data_consistency_across_uplinks() {
 
     // VERIFY: Exit received all messages
     let received = exit.received_data();
-    assert_eq!(received.len(), 5,
-        "CONSISTENCY: Exit must receive exactly 5 messages. Got: {}", received.len());
+    assert_eq!(
+        received.len(),
+        5,
+        "CONSISTENCY: Exit must receive exactly 5 messages. Got: {}",
+        received.len()
+    );
 
     // VERIFY: Each message is exactly as sent (byte-perfect)
     for (seq, data) in &messages {
         let found = received.iter().any(|r| r.as_slice() == *data);
-        assert!(found,
-            "CONSISTENCY: Message {} must be received exactly as sent", seq);
+        assert!(
+            found,
+            "CONSISTENCY: Message {} must be received exactly as sent",
+            seq
+        );
     }
 
     // VERIFY: Data from each uplink is complete
     let source_addresses = server.get_data_source_addresses();
-    assert!(source_addresses.len() >= 2,
-        "CONSISTENCY: Must have at least 2 source addresses");
+    assert!(
+        source_addresses.len() >= 2,
+        "CONSISTENCY: Must have at least 2 source addresses"
+    );
 
     // Count messages per uplink
     let mut uplink1_messages = 0;
@@ -2763,10 +3217,16 @@ async fn test_data_consistency_across_uplinks() {
         }
     }
 
-    assert_eq!(uplink1_messages, 3,
-        "CONSISTENCY: Uplink 1 should have 3 messages. Got: {}", uplink1_messages);
-    assert_eq!(uplink2_messages, 2,
-        "CONSISTENCY: Uplink 2 should have 2 messages. Got: {}", uplink2_messages);
+    assert_eq!(
+        uplink1_messages, 3,
+        "CONSISTENCY: Uplink 1 should have 3 messages. Got: {}",
+        uplink1_messages
+    );
+    assert_eq!(
+        uplink2_messages, 2,
+        "CONSISTENCY: Uplink 2 should have 2 messages. Got: {}",
+        uplink2_messages
+    );
 
     println!("SUCCESS: Data consistency verified");
     println!("  Total messages at exit: {}", received.len());
@@ -2858,16 +3318,27 @@ async fn test_ecmp_flow_distribution() {
 
     // VERIFY: Distribution should be roughly balanced (within 70-30 at worst for 20 samples)
     let min_per_bucket = num_flows / 5; // At least 20% per bucket
-    assert!(bucket0_count >= min_per_bucket,
-        "ECMP DISTRIBUTION: Bucket 0 should have at least {} flows. Got: {}", min_per_bucket, bucket0_count);
-    assert!(bucket1_count >= min_per_bucket,
-        "ECMP DISTRIBUTION: Bucket 1 should have at least {} flows. Got: {}", min_per_bucket, bucket1_count);
+    assert!(
+        bucket0_count >= min_per_bucket,
+        "ECMP DISTRIBUTION: Bucket 0 should have at least {} flows. Got: {}",
+        min_per_bucket,
+        bucket0_count
+    );
+    assert!(
+        bucket1_count >= min_per_bucket,
+        "ECMP DISTRIBUTION: Bucket 1 should have at least {} flows. Got: {}",
+        min_per_bucket,
+        bucket1_count
+    );
 
     // Send data through automatically-allocated flows to test actual distribution
     for i in 0..10 {
         let flow_id = manager.allocate_flow();
         let msg = format!("Auto-flow-{}", i);
-        manager.send_on_flow(Some(flow_id), msg.as_bytes()).await.unwrap();
+        manager
+            .send_on_flow(Some(flow_id), msg.as_bytes())
+            .await
+            .unwrap();
     }
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2877,7 +3348,8 @@ async fn test_ecmp_flow_distribution() {
     let payload_counts = server.get_payload_counts_by_source();
 
     // At least some traffic should go to each uplink (may not be exactly even due to flow hashing)
-    let sources_with_data: Vec<_> = payload_counts.iter()
+    let sources_with_data: Vec<_> = payload_counts
+        .iter()
         .filter(|(_, count)| *count > 0)
         .collect();
 
@@ -2890,8 +3362,10 @@ async fn test_ecmp_flow_distribution() {
     }
 
     // VERIFY: Multiple sources received data (distribution working)
-    assert!(source_addresses.len() >= 1,
-        "ECMP: At least 1 source must receive data");
+    assert!(
+        source_addresses.len() >= 1,
+        "ECMP: At least 1 source must receive data"
+    );
 
     server.shutdown();
     exit.shutdown();
@@ -2952,10 +3426,14 @@ async fn test_encryption_overhead_validation() {
     let decryption_events = server.get_decryption_events();
     let encryption_events = server.get_encryption_events();
 
-    assert!(!decryption_events.is_empty(),
-        "OVERHEAD: Must have decryption events");
-    assert!(!encryption_events.is_empty(),
-        "OVERHEAD: Must have encryption events");
+    assert!(
+        !decryption_events.is_empty(),
+        "OVERHEAD: Must have decryption events"
+    );
+    assert!(
+        !encryption_events.is_empty(),
+        "OVERHEAD: Must have encryption events"
+    );
 
     // Calculate and verify overhead
     println!("Encryption Overhead Analysis:");
@@ -2965,14 +3443,21 @@ async fn test_encryption_overhead_validation() {
         if *success && *dec_len > 0 {
             let overhead_bytes = enc_len - dec_len;
             let overhead_pct = (*enc_len as f64 / *dec_len as f64 - 1.0) * 100.0;
-            println!("  Decrypt @ {}: {} encrypted -> {} decrypted ({} bytes overhead, {:.1}%)",
-                addr, enc_len, dec_len, overhead_bytes, overhead_pct);
+            println!(
+                "  Decrypt @ {}: {} encrypted -> {} decrypted ({} bytes overhead, {:.1}%)",
+                addr, enc_len, dec_len, overhead_bytes, overhead_pct
+            );
 
             // Noise protocol AEAD adds 16 bytes for authentication tag
-            assert!(*enc_len >= *dec_len,
-                "OVERHEAD: Encrypted must be >= decrypted");
-            assert!(overhead_bytes <= 32,
-                "OVERHEAD: Decryption overhead should be <= 32 bytes. Got: {}", overhead_bytes);
+            assert!(
+                *enc_len >= *dec_len,
+                "OVERHEAD: Encrypted must be >= decrypted"
+            );
+            assert!(
+                overhead_bytes <= 32,
+                "OVERHEAD: Decryption overhead should be <= 32 bytes. Got: {}",
+                overhead_bytes
+            );
         }
     }
 
@@ -2981,22 +3466,34 @@ async fn test_encryption_overhead_validation() {
         if *success && *plain_len > 0 {
             let overhead_bytes = enc_len - plain_len;
             let overhead_pct = (*enc_len as f64 / *plain_len as f64 - 1.0) * 100.0;
-            println!("  Encrypt @ {}: {} plaintext -> {} encrypted ({} bytes overhead, {:.1}%)",
-                addr, plain_len, enc_len, overhead_bytes, overhead_pct);
+            println!(
+                "  Encrypt @ {}: {} plaintext -> {} encrypted ({} bytes overhead, {:.1}%)",
+                addr, plain_len, enc_len, overhead_bytes, overhead_pct
+            );
 
-            assert!(*enc_len >= *plain_len,
-                "OVERHEAD: Encrypted must be >= plaintext");
-            assert!(overhead_bytes <= 32,
-                "OVERHEAD: Encryption overhead should be <= 32 bytes. Got: {}", overhead_bytes);
+            assert!(
+                *enc_len >= *plain_len,
+                "OVERHEAD: Encrypted must be >= plaintext"
+            );
+            assert!(
+                overhead_bytes <= 32,
+                "OVERHEAD: Encryption overhead should be <= 32 bytes. Got: {}",
+                overhead_bytes
+            );
         }
     }
 
     // Verify overall overhead calculation
     if let Some((total_plain, total_enc, overhead_ratio)) = server.calculate_encryption_overhead() {
-        println!("Overall: {} plaintext -> {} encrypted ({:.2}x overhead)",
-            total_plain, total_enc, overhead_ratio);
-        assert!(overhead_ratio >= 1.0 && overhead_ratio < 1.5,
-            "OVERHEAD: Overall ratio should be between 1.0 and 1.5. Got: {:.2}", overhead_ratio);
+        println!(
+            "Overall: {} plaintext -> {} encrypted ({:.2}x overhead)",
+            total_plain, total_enc, overhead_ratio
+        );
+        assert!(
+            overhead_ratio >= 1.0 && overhead_ratio < 1.5,
+            "OVERHEAD: Overall ratio should be between 1.0 and 1.5. Got: {:.2}",
+            overhead_ratio
+        );
     }
 
     println!("SUCCESS: Encryption overhead validated");
@@ -3080,7 +3577,8 @@ async fn test_crypto_isolation() {
 
     // VERIFY: Server received data from both clients
     let decryption_events = server.get_decryption_events();
-    let successful_decryptions: Vec<_> = decryption_events.iter()
+    let successful_decryptions: Vec<_> = decryption_events
+        .iter()
         .filter(|(_, success, _, _)| *success)
         .collect();
 
@@ -3089,7 +3587,8 @@ async fn test_crypto_isolation() {
         successful_decryptions.len());
 
     // VERIFY: Decryptions came from different source addresses (different sessions)
-    let decrypt_addrs: std::collections::HashSet<_> = successful_decryptions.iter()
+    let decrypt_addrs: std::collections::HashSet<_> = successful_decryptions
+        .iter()
         .map(|(addr, _, _, _)| *addr)
         .collect();
 
@@ -3101,10 +3600,14 @@ async fn test_crypto_isolation() {
     let exit_data = exit.received_data();
     let all_exit_data: Vec<u8> = exit_data.iter().flatten().cloned().collect();
 
-    assert!(all_exit_data.windows(data1.len()).any(|w| w == data1),
-        "CRYPTO ISOLATION: Exit must receive client 1's data");
-    assert!(all_exit_data.windows(data2.len()).any(|w| w == data2),
-        "CRYPTO ISOLATION: Exit must receive client 2's data");
+    assert!(
+        all_exit_data.windows(data1.len()).any(|w| w == data1),
+        "CRYPTO ISOLATION: Exit must receive client 1's data"
+    );
+    assert!(
+        all_exit_data.windows(data2.len()).any(|w| w == data2),
+        "CRYPTO ISOLATION: Exit must receive client 2's data"
+    );
 
     // VERIFY: Cross-client recv must NOT work
     // Client 1 should NOT receive client 2's response and vice versa
@@ -3112,21 +3615,29 @@ async fn test_crypto_isolation() {
     let result2 = tokio::time::timeout(Duration::from_secs(2), manager2.recv()).await;
 
     // Each client should receive a response
-    assert!(result1.is_ok() && result1.as_ref().unwrap().is_ok(),
-        "CRYPTO ISOLATION: Client 1 must receive its own response");
-    assert!(result2.is_ok() && result2.as_ref().unwrap().is_ok(),
-        "CRYPTO ISOLATION: Client 2 must receive its own response");
+    assert!(
+        result1.is_ok() && result1.as_ref().unwrap().is_ok(),
+        "CRYPTO ISOLATION: Client 1 must receive its own response"
+    );
+    assert!(
+        result2.is_ok() && result2.as_ref().unwrap().is_ok(),
+        "CRYPTO ISOLATION: Client 2 must receive its own response"
+    );
 
     let (response1, _) = result1.unwrap().unwrap();
     let (response2, _) = result2.unwrap().unwrap();
 
     // Responses should contain the original data (proves correct session routing)
-    assert!(response1.windows(data1.len()).any(|w| w == data1) ||
-            response1.windows(5).any(|w| w == b"EXIT:"),
-        "CRYPTO ISOLATION: Client 1's response should relate to client 1's data");
-    assert!(response2.windows(data2.len()).any(|w| w == data2) ||
-            response2.windows(5).any(|w| w == b"EXIT:"),
-        "CRYPTO ISOLATION: Client 2's response should relate to client 2's data");
+    assert!(
+        response1.windows(data1.len()).any(|w| w == data1)
+            || response1.windows(5).any(|w| w == b"EXIT:"),
+        "CRYPTO ISOLATION: Client 1's response should relate to client 1's data"
+    );
+    assert!(
+        response2.windows(data2.len()).any(|w| w == data2)
+            || response2.windows(5).any(|w| w == b"EXIT:"),
+        "CRYPTO ISOLATION: Client 2's response should relate to client 2's data"
+    );
 
     // VERIFY: Responses don't contain OTHER client's data (proves isolation)
     // Response 1 should not contain client 2's unique data
@@ -3231,31 +3742,47 @@ async fn test_out_of_order_packet_handling() {
 
     // VERIFY: All packets were received (regardless of order)
     let exit_received = exit.received_data();
-    assert_eq!(exit_received.len(), 6,
-        "OUT-OF-ORDER: Exit must receive all 6 packets. Got: {}", exit_received.len());
+    assert_eq!(
+        exit_received.len(),
+        6,
+        "OUT-OF-ORDER: Exit must receive all 6 packets. Got: {}",
+        exit_received.len()
+    );
 
     // VERIFY: Each unique packet was received exactly once
     for (_, data) in &packets {
-        let count = exit_received.iter()
+        let count = exit_received
+            .iter()
             .filter(|r| r.as_slice() == *data)
             .count();
-        assert_eq!(count, 1,
+        assert_eq!(
+            count,
+            1,
             "OUT-OF-ORDER: Packet {:?} must appear exactly once. Got: {}",
-            String::from_utf8_lossy(data), count);
+            String::from_utf8_lossy(data),
+            count
+        );
     }
 
     // VERIFY: Server correctly processed all packets from all uplinks
     let source_addresses = server.get_data_source_addresses();
-    assert!(source_addresses.len() >= 3,
-        "OUT-OF-ORDER: Must receive from at least 3 uplinks. Got: {}", source_addresses.len());
+    assert!(
+        source_addresses.len() >= 3,
+        "OUT-OF-ORDER: Must receive from at least 3 uplinks. Got: {}",
+        source_addresses.len()
+    );
 
     // Count decryption events - all should succeed
     let decryption_events = server.get_decryption_events();
-    let successful_decryptions = decryption_events.iter()
+    let successful_decryptions = decryption_events
+        .iter()
         .filter(|(_, success, _, _)| *success)
         .count();
-    assert!(successful_decryptions >= 6,
-        "OUT-OF-ORDER: Must have at least 6 successful decryptions. Got: {}", successful_decryptions);
+    assert!(
+        successful_decryptions >= 6,
+        "OUT-OF-ORDER: Must have at least 6 successful decryptions. Got: {}",
+        successful_decryptions
+    );
 
     // VERIFY: Responses are received (may be in different order)
     let mut responses_received = 0;
@@ -3266,8 +3793,11 @@ async fn test_out_of_order_packet_handling() {
         }
     }
 
-    assert!(responses_received >= 6,
-        "OUT-OF-ORDER: Client must receive all 6 responses. Got: {}", responses_received);
+    assert!(
+        responses_received >= 6,
+        "OUT-OF-ORDER: Client must receive all 6 responses. Got: {}",
+        responses_received
+    );
 
     println!("SUCCESS: Out-of-order packet handling verified");
     println!("  Packets sent: {}", packets.len());
@@ -3341,7 +3871,10 @@ async fn test_failover_timing_and_latency() {
     for i in 0..5 {
         let msg = format!("Pre-failover-{}", i);
         let start = Instant::now();
-        manager.send_on_flow(Some(flow_id), msg.as_bytes()).await.unwrap();
+        manager
+            .send_on_flow(Some(flow_id), msg.as_bytes())
+            .await
+            .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), manager.recv()).await;
         let latency = start.elapsed();
 
@@ -3350,11 +3883,13 @@ async fn test_failover_timing_and_latency() {
         }
     }
 
-    assert!(!pre_failover_latencies.is_empty(),
-        "FAILOVER TIMING: Must have baseline latency measurements");
+    assert!(
+        !pre_failover_latencies.is_empty(),
+        "FAILOVER TIMING: Must have baseline latency measurements"
+    );
 
-    let avg_pre_latency: Duration = pre_failover_latencies.iter().sum::<Duration>()
-        / pre_failover_latencies.len() as u32;
+    let avg_pre_latency: Duration =
+        pre_failover_latencies.iter().sum::<Duration>() / pre_failover_latencies.len() as u32;
 
     println!("Pre-failover latencies: {:?}", pre_failover_latencies);
     println!("Average pre-failover latency: {:?}", avg_pre_latency);
@@ -3369,28 +3904,40 @@ async fn test_failover_timing_and_latency() {
     let result = manager.send_on_flow(Some(flow_id), failover_msg).await;
     let failover_send_time = send_start.elapsed();
 
-    assert!(result.is_ok(), "FAILOVER TIMING: Send must succeed after failover");
+    assert!(
+        result.is_ok(),
+        "FAILOVER TIMING: Send must succeed after failover"
+    );
 
     // Verify binding changed
     let new_binding = manager.get_flow_binding(flow_id);
     let failover_duration = failover_start.elapsed();
 
-    assert_eq!(new_binding, Some(uplink2_id),
-        "FAILOVER TIMING: Flow must rebind to uplink 2");
+    assert_eq!(
+        new_binding,
+        Some(uplink2_id),
+        "FAILOVER TIMING: Flow must rebind to uplink 2"
+    );
 
     println!("Failover completed in: {:?}", failover_duration);
     println!("First send after failover took: {:?}", failover_send_time);
 
     // VERIFY: Failover should be fast (under 100ms for local test)
-    assert!(failover_duration < Duration::from_millis(500),
-        "FAILOVER TIMING: Failover should complete within 500ms. Took: {:?}", failover_duration);
+    assert!(
+        failover_duration < Duration::from_millis(500),
+        "FAILOVER TIMING: Failover should complete within 500ms. Took: {:?}",
+        failover_duration
+    );
 
     // MEASURE: Post-failover latency
     let mut post_failover_latencies: Vec<Duration> = Vec::new();
     for i in 0..5 {
         let msg = format!("Post-failover-{}", i);
         let start = Instant::now();
-        manager.send_on_flow(Some(flow_id), msg.as_bytes()).await.unwrap();
+        manager
+            .send_on_flow(Some(flow_id), msg.as_bytes())
+            .await
+            .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), manager.recv()).await;
         let latency = start.elapsed();
 
@@ -3399,11 +3946,13 @@ async fn test_failover_timing_and_latency() {
         }
     }
 
-    assert!(!post_failover_latencies.is_empty(),
-        "FAILOVER TIMING: Must have post-failover latency measurements");
+    assert!(
+        !post_failover_latencies.is_empty(),
+        "FAILOVER TIMING: Must have post-failover latency measurements"
+    );
 
-    let avg_post_latency: Duration = post_failover_latencies.iter().sum::<Duration>()
-        / post_failover_latencies.len() as u32;
+    let avg_post_latency: Duration =
+        post_failover_latencies.iter().sum::<Duration>() / post_failover_latencies.len() as u32;
 
     println!("Post-failover latencies: {:?}", post_failover_latencies);
     println!("Average post-failover latency: {:?}", avg_post_latency);
@@ -3411,23 +3960,31 @@ async fn test_failover_timing_and_latency() {
     // VERIFY: Post-failover latency should be comparable to pre-failover
     // Allow up to 3x degradation for the first few messages after failover
     let max_acceptable_latency = avg_pre_latency * 5;
-    assert!(avg_post_latency < max_acceptable_latency,
+    assert!(
+        avg_post_latency < max_acceptable_latency,
         "FAILOVER TIMING: Post-failover latency ({:?}) should be within 5x of pre-failover ({:?})",
-        avg_post_latency, avg_pre_latency);
+        avg_post_latency,
+        avg_pre_latency
+    );
 
     // VERIFY: Exit received all messages
     tokio::time::sleep(Duration::from_millis(100)).await;
     let received = exit.received_data();
     // 5 pre + 1 failover + 5 post = 11 messages
-    assert!(received.len() >= 10,
-        "FAILOVER TIMING: Exit should receive at least 10 messages. Got: {}", received.len());
+    assert!(
+        received.len() >= 10,
+        "FAILOVER TIMING: Exit should receive at least 10 messages. Got: {}",
+        received.len()
+    );
 
     println!("SUCCESS: Failover timing and latency validated");
     println!("  Pre-failover avg latency: {:?}", avg_pre_latency);
     println!("  Failover duration: {:?}", failover_duration);
     println!("  Post-failover avg latency: {:?}", avg_post_latency);
-    println!("  Latency ratio (post/pre): {:.2}x",
-        avg_post_latency.as_micros() as f64 / avg_pre_latency.as_micros() as f64);
+    println!(
+        "  Latency ratio (post/pre): {:.2}x",
+        avg_post_latency.as_micros() as f64 / avg_pre_latency.as_micros() as f64
+    );
 
     server.shutdown();
     exit.shutdown();

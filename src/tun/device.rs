@@ -141,7 +141,9 @@ impl TunDevice {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
-            Err(Error::Config("TUN devices not supported on this platform".into()))
+            Err(Error::Config(
+                "TUN devices not supported on this platform".into(),
+            ))
         }
     }
 
@@ -214,10 +216,10 @@ impl TunDevice {
 
     #[cfg(target_os = "linux")]
     fn create_linux(config: TunConfig) -> Result<Self> {
-        use std::os::unix::io::AsRawFd;
-        use nix::sys::socket::{socket, AddressFamily, SockType, SockFlag};
+        use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
         use std::fs::OpenOptions;
         use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
 
         // Open /dev/net/tun
         let tun_fd = OpenOptions::new()
@@ -229,7 +231,7 @@ impl TunDevice {
 
         // Set up the interface using ioctl
         let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-        
+
         // Copy name (max 15 chars + null terminator)
         let name_bytes = config.name.as_bytes();
         let name_len = name_bytes.len().min(15);
@@ -246,9 +248,7 @@ impl TunDevice {
 
         // TUNSETIFF ioctl
         const TUNSETIFF: libc::c_ulong = 0x400454ca;
-        let ret = unsafe {
-            libc::ioctl(tun_fd.as_raw_fd(), TUNSETIFF, &mut ifr)
-        };
+        let ret = unsafe { libc::ioctl(tun_fd.as_raw_fd(), TUNSETIFF, &mut ifr) };
 
         if ret < 0 {
             return Err(Error::Io(io::Error::last_os_error()));
@@ -294,9 +294,7 @@ impl TunDevice {
 
         // Create utun socket
         // PF_SYSTEM = 32, SYSPROTO_CONTROL = 2
-        let fd = unsafe {
-            libc::socket(32, libc::SOCK_DGRAM, 2)
-        };
+        let fd = unsafe { libc::socket(32, libc::SOCK_DGRAM, 2) };
 
         if fd < 0 {
             return Err(Error::Io(io::Error::last_os_error()));
@@ -364,7 +362,7 @@ impl TunDevice {
         // Get the actual interface name
         let mut name_buf = [0u8; 256];
         let mut name_len: libc::socklen_t = 256;
-        
+
         // UTUN_OPT_IFNAME = 2
         let ret = unsafe {
             libc::getsockopt(
@@ -415,14 +413,16 @@ impl TunDevice {
     fn create_windows(config: TunConfig) -> Result<Self> {
         // Windows implementation using WinTUN
         // This is a placeholder - full implementation requires wintun crate
-        Err(Error::Config("Windows TUN support requires WinTUN driver".into()))
+        Err(Error::Config(
+            "Windows TUN support requires WinTUN driver".into(),
+        ))
     }
 
     fn set_mtu(&self, mtu: u16) -> Result<()> {
         #[cfg(unix)]
         {
             use std::process::Command;
-            
+
             let output = Command::new("ifconfig")
                 .args([&self.name, "mtu", &mtu.to_string()])
                 .output()
@@ -440,7 +440,7 @@ impl TunDevice {
         #[cfg(unix)]
         {
             use std::process::Command;
-            
+
             let flag = if up { "up" } else { "down" };
             let output = Command::new("ifconfig")
                 .args([&self.name, flag])
@@ -449,7 +449,10 @@ impl TunDevice {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(Error::Config(format!("Failed to set interface {}: {}", flag, stderr)));
+                return Err(Error::Config(format!(
+                    "Failed to set interface {}: {}",
+                    flag, stderr
+                )));
             }
         }
         Ok(())
@@ -459,7 +462,7 @@ impl TunDevice {
         #[cfg(target_os = "linux")]
         {
             use std::process::Command;
-            
+
             let cidr = format!("{}/{}", addr, netmask);
             let output = Command::new("ip")
                 .args(["addr", "add", &cidr, "dev", &self.name])
@@ -470,7 +473,10 @@ impl TunDevice {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 // Ignore "already exists" errors
                 if !stderr.contains("File exists") {
-                    return Err(Error::Config(format!("Failed to add IPv4 address: {}", stderr)));
+                    return Err(Error::Config(format!(
+                        "Failed to add IPv4 address: {}",
+                        stderr
+                    )));
                 }
             }
         }
@@ -478,12 +484,10 @@ impl TunDevice {
         #[cfg(target_os = "macos")]
         {
             use std::process::Command;
-            
+
             // macOS uses different syntax: ifconfig utun0 inet 10.0.85.1 10.0.85.1 netmask 255.255.255.0
-            let netmask_addr = Ipv4Addr::from(
-                !((1u32 << (32 - netmask)) - 1)
-            );
-            
+            let netmask_addr = Ipv4Addr::from(!((1u32 << (32 - netmask)) - 1));
+
             let output = Command::new("ifconfig")
                 .args([
                     &self.name,
@@ -498,7 +502,10 @@ impl TunDevice {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(Error::Config(format!("Failed to add IPv4 address: {}", stderr)));
+                return Err(Error::Config(format!(
+                    "Failed to add IPv4 address: {}",
+                    stderr
+                )));
             }
         }
 
@@ -509,7 +516,7 @@ impl TunDevice {
         #[cfg(target_os = "linux")]
         {
             use std::process::Command;
-            
+
             let cidr = format!("{}/{}", addr, prefix);
             let output = Command::new("ip")
                 .args(["-6", "addr", "add", &cidr, "dev", &self.name])
@@ -519,7 +526,10 @@ impl TunDevice {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stderr.contains("File exists") {
-                    return Err(Error::Config(format!("Failed to add IPv6 address: {}", stderr)));
+                    return Err(Error::Config(format!(
+                        "Failed to add IPv6 address: {}",
+                        stderr
+                    )));
                 }
             }
         }
@@ -527,19 +537,18 @@ impl TunDevice {
         #[cfg(target_os = "macos")]
         {
             use std::process::Command;
-            
+
             let output = Command::new("ifconfig")
-                .args([
-                    &self.name,
-                    "inet6",
-                    &format!("{}/{}", addr, prefix),
-                ])
+                .args([&self.name, "inet6", &format!("{}/{}", addr, prefix)])
                 .output()
                 .map_err(|e| Error::Io(e))?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(Error::Config(format!("Failed to add IPv6 address: {}", stderr)));
+                return Err(Error::Config(format!(
+                    "Failed to add IPv6 address: {}",
+                    stderr
+                )));
             }
         }
 
@@ -579,18 +588,14 @@ struct LinuxTunHandle {
 impl LinuxTunHandle {
     async fn read(&self, buf: &mut [u8]) -> Result<usize> {
         use tokio::io::unix::AsyncFd;
-        
-        let async_fd = AsyncFd::new(self.fd)
-            .map_err(|e| Error::Io(e))?;
-        
+
+        let async_fd = AsyncFd::new(self.fd).map_err(|e| Error::Io(e))?;
+
         loop {
-            let mut guard = async_fd.readable().await
-                .map_err(|e| Error::Io(e))?;
-            
+            let mut guard = async_fd.readable().await.map_err(|e| Error::Io(e))?;
+
             match guard.try_io(|_| {
-                let ret = unsafe {
-                    libc::read(self.fd, buf.as_mut_ptr() as *mut _, buf.len())
-                };
+                let ret = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                 if ret < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -605,18 +610,14 @@ impl LinuxTunHandle {
 
     async fn write(&self, buf: &[u8]) -> Result<usize> {
         use tokio::io::unix::AsyncFd;
-        
-        let async_fd = AsyncFd::new(self.fd)
-            .map_err(|e| Error::Io(e))?;
-        
+
+        let async_fd = AsyncFd::new(self.fd).map_err(|e| Error::Io(e))?;
+
         loop {
-            let mut guard = async_fd.writable().await
-                .map_err(|e| Error::Io(e))?;
-            
+            let mut guard = async_fd.writable().await.map_err(|e| Error::Io(e))?;
+
             match guard.try_io(|_| {
-                let ret = unsafe {
-                    libc::write(self.fd, buf.as_ptr() as *const _, buf.len())
-                };
+                let ret = unsafe { libc::write(self.fd, buf.as_ptr() as *const _, buf.len()) };
                 if ret < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -648,22 +649,19 @@ impl Drop for MacOsTunHandle {
 impl MacOsTunHandle {
     async fn read(&self, buf: &mut [u8]) -> Result<usize> {
         use tokio::io::unix::AsyncFd;
-        
+
         // macOS utun prepends a 4-byte header (AF_INET/AF_INET6)
         // We need to strip this when reading
         let mut full_buf = vec![0u8; buf.len() + 4];
-        
-        let async_fd = unsafe { AsyncFd::new(self.fd) }
-            .map_err(|e| Error::Io(e))?;
-        
+
+        let async_fd = unsafe { AsyncFd::new(self.fd) }.map_err(|e| Error::Io(e))?;
+
         loop {
-            let mut guard = async_fd.readable().await
-                .map_err(|e| Error::Io(e))?;
-            
+            let mut guard = async_fd.readable().await.map_err(|e| Error::Io(e))?;
+
             match guard.try_io(|_| {
-                let ret = unsafe {
-                    libc::read(self.fd, full_buf.as_mut_ptr() as *mut _, full_buf.len())
-                };
+                let ret =
+                    unsafe { libc::read(self.fd, full_buf.as_mut_ptr() as *mut _, full_buf.len()) };
                 if ret < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -685,7 +683,7 @@ impl MacOsTunHandle {
 
     async fn write(&self, buf: &[u8]) -> Result<usize> {
         use tokio::io::unix::AsyncFd;
-        
+
         // macOS utun requires a 4-byte header
         // Determine AF from IP version
         let af: u32 = if !buf.is_empty() {
@@ -697,22 +695,19 @@ impl MacOsTunHandle {
         } else {
             2
         };
-        
+
         let mut full_buf = vec![0u8; buf.len() + 4];
         full_buf[..4].copy_from_slice(&af.to_be_bytes());
         full_buf[4..].copy_from_slice(buf);
-        
-        let async_fd = unsafe { AsyncFd::new(self.fd) }
-            .map_err(|e| Error::Io(e))?;
-        
+
+        let async_fd = unsafe { AsyncFd::new(self.fd) }.map_err(|e| Error::Io(e))?;
+
         loop {
-            let mut guard = async_fd.writable().await
-                .map_err(|e| Error::Io(e))?;
-            
+            let mut guard = async_fd.writable().await.map_err(|e| Error::Io(e))?;
+
             match guard.try_io(|_| {
-                let ret = unsafe {
-                    libc::write(self.fd, full_buf.as_ptr() as *const _, full_buf.len())
-                };
+                let ret =
+                    unsafe { libc::write(self.fd, full_buf.as_ptr() as *const _, full_buf.len()) };
                 if ret < 0 {
                     Err(io::Error::last_os_error())
                 } else {

@@ -4,8 +4,8 @@
 //! and the multipath manager to provide a complete VPN tunnel.
 
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -174,7 +174,10 @@ impl TunnelRunner {
         let keypair = KeyPair::generate();
 
         // Create multipath manager
-        let manager = Arc::new(MultipathManager::new(config.multipath.clone(), keypair.clone()));
+        let manager = Arc::new(MultipathManager::new(
+            config.multipath.clone(),
+            keypair.clone(),
+        ));
 
         let (event_tx, _) = broadcast::channel(256);
 
@@ -511,11 +514,11 @@ impl TunnelBuilder {
     /// Build the tunnel runner.
     pub fn build(self) -> Result<TunnelRunner> {
         let mut runner = TunnelRunner::new(self.config)?;
-        
+
         for uplink in self.uplinks {
             runner.add_uplink(uplink)?;
         }
-        
+
         Ok(runner)
     }
 }
@@ -542,9 +545,13 @@ mod tests {
             .tun_name("tg0")
             .full_tunnel(true)
             .route("10.0.0.0/8");
-        
+
         assert_eq!(builder.config.tun.name, "tg0");
         assert!(builder.config.routing.full_tunnel);
-        assert!(builder.config.routing.include_routes.contains(&"10.0.0.0/8".to_string()));
+        assert!(builder
+            .config
+            .routing
+            .include_routes
+            .contains(&"10.0.0.0/8".to_string()));
     }
 }

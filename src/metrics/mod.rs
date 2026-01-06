@@ -8,24 +8,23 @@
 //! - Prometheus metrics export
 //! - HTTP health endpoints
 
-mod quality;
+#[cfg(feature = "metrics")]
+mod http_server;
 mod predictor;
 #[cfg(feature = "metrics")]
 mod prometheus_export;
-#[cfg(feature = "metrics")]
-mod http_server;
+mod quality;
 
-pub use quality::QualityMetrics;
-pub use predictor::{QualityPredictor, Prediction};
-#[cfg(feature = "metrics")]
-pub use prometheus_export::*;
 #[cfg(feature = "metrics")]
 pub use http_server::*;
+pub use predictor::{Prediction, QualityPredictor};
+#[cfg(feature = "metrics")]
+pub use prometheus_export::*;
+pub use quality::QualityMetrics;
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-
 
 /// Metrics configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,13 +62,27 @@ pub struct MetricsConfig {
     pub per_user_metrics: bool,
 }
 
-fn default_sample_window() -> Duration { Duration::from_secs(10) }
-fn default_history_retention() -> Duration { Duration::from_secs(3600) }
-fn default_anomaly_threshold() -> f64 { 3.0 }
-fn default_prediction() -> bool { true }
-fn default_prediction_horizon() -> Duration { Duration::from_secs(60) }
-fn default_prometheus() -> bool { true }
-fn default_http_bind() -> String { "0.0.0.0:9090".to_string() }
+fn default_sample_window() -> Duration {
+    Duration::from_secs(10)
+}
+fn default_history_retention() -> Duration {
+    Duration::from_secs(3600)
+}
+fn default_anomaly_threshold() -> f64 {
+    3.0
+}
+fn default_prediction() -> bool {
+    true
+}
+fn default_prediction_horizon() -> Duration {
+    Duration::from_secs(60)
+}
+fn default_prometheus() -> bool {
+    true
+}
+fn default_http_bind() -> String {
+    "0.0.0.0:9090".to_string()
+}
 
 impl Default for MetricsConfig {
     fn default() -> Self {

@@ -470,10 +470,8 @@ impl AuthKey {
             }
         }
 
-        let encoded = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            &data,
-        );
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &data);
 
         Self {
             key: format!("{}_{}", Self::PREFIX, encoded),
@@ -540,7 +538,9 @@ impl AuthKey {
         }
 
         if server_addrs.is_empty() {
-            return Err(crate::Error::InvalidKey("no server addresses in key".into()));
+            return Err(crate::Error::InvalidKey(
+                "no server addresses in key".into(),
+            ));
         }
 
         Ok(Self {
@@ -577,7 +577,10 @@ impl fmt::Display for AuthKey {
 impl fmt::Debug for AuthKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthKey")
-            .field("key", &format!("{}...", &self.key[..16.min(self.key.len())]))
+            .field(
+                "key",
+                &format!("{}...", &self.key[..16.min(self.key.len())]),
+            )
             .field("server_addrs", &self.server_addrs)
             .finish()
     }

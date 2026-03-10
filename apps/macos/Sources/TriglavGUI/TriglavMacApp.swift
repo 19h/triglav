@@ -19,14 +19,14 @@ struct TriglavMacApp: App {
         Window("Triglav", id: "main") {
             MainWindowView()
                 .environmentObject(model)
-                .frame(minWidth: 1120, minHeight: 760)
+                .frame(minWidth: 720, minHeight: 480)
         }
-        .defaultSize(width: 1180, height: 780)
+        .defaultSize(width: 900, height: 600)
 
         Settings {
             SettingsView()
                 .environmentObject(model)
-                .frame(width: 560)
+                .frame(width: 520)
         }
 
         MenuBarExtra("Triglav", systemImage: "bolt.horizontal.circle.fill", isInserted: .init(

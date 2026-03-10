@@ -129,8 +129,35 @@ struct NetworkInterface: Codable, Hashable, Identifiable {
     let name: String
     let displayName: String
     let kind: String
+    let macAddress: String?
+    let ipv4Address: String?
+    let ipv4Netmask: String?
+    let ipv6Addresses: [String]
+    let isUp: Bool
+    let isRunning: Bool
+    let isLoopback: Bool
+    let isDefaultRoute: Bool
 
     var id: String { name }
+
+    /// CIDR notation for IPv4, e.g. "192.168.1.42/24"
+    var ipv4CIDR: String? {
+        guard let addr = ipv4Address, let mask = ipv4Netmask else { return nil }
+        return "\(addr)/\(netmaskToCIDR(mask))"
+    }
+
+    var statusDescription: String {
+        if !isUp { return "Down" }
+        if !isRunning { return "No carrier" }
+        if ipv4Address == nil && ipv6Addresses.isEmpty { return "No address" }
+        return "Active"
+    }
+}
+
+private func netmaskToCIDR(_ mask: String) -> Int {
+    mask.split(separator: ".").compactMap { UInt8($0) }.reduce(0) { total, octet in
+        total + octet.nonzeroBitCount
+    }
 }
 
 struct AppSettings: Codable {
@@ -1238,24 +1265,259 @@ private enum ActivationPolicyController {
 
 private enum NetworkInterfaceProvider {
     static func listInterfaces() -> [NetworkInterface] {
+        // Step 1: Get display names and types from SystemConfiguration
+        let scInfo = loadSCInterfaceInfo()
+
+        // Step 2: Get addresses, flags, and MACs from getifaddrs
+        let ifaddrsInfo = loadGetifaddrsInfo()
+
+        // Step 3: Get default route interface
+        let defaultRouteInterface = defaultRouteInterfaceName()
+
+        // Step 4: Get macOS network service order (user-configured priority)
+        let serviceOrder = loadServiceOrder()
+
+        // Step 5: Merge into unified NetworkInterface objects
+        let allNames = Set(scInfo.keys).union(ifaddrsInfo.keys)
+
+        let results = allNames.compactMap { name -> NetworkInterface? in
+            let sc = scInfo[name]
+            let ifa = ifaddrsInfo[name]
+
+            if sc == nil && ifa == nil { return nil }
+
+            let displayName = sc?.displayName ?? name
+            let kind = sc?.kind ?? guessKind(name)
+
+            let isLoopback = ifa?.flags.contains(.loopback) ?? false
+            if sc == nil && isLoopback { return nil }
+            if sc == nil && ifa?.ipv4 == nil && (ifa?.ipv6s ?? []).isEmpty && ifa?.mac == nil { return nil }
+
+            return NetworkInterface(
+                name: name,
+                displayName: displayName,
+                kind: kind,
+                macAddress: ifa?.mac,
+                ipv4Address: ifa?.ipv4,
+                ipv4Netmask: ifa?.netmask,
+                ipv6Addresses: ifa?.ipv6s ?? [],
+                isUp: ifa?.flags.contains(.up) ?? false,
+                isRunning: ifa?.flags.contains(.running) ?? false,
+                isLoopback: isLoopback,
+                isDefaultRoute: name == defaultRouteInterface
+            )
+        }
+
+        // Step 6: Sort using macOS service order as primary key
+        // Service-order interfaces come first (in that order), then remaining by active/name
+        var serviceOrderIndex: [String: Int] = [:]
+        for (idx, name) in serviceOrder.enumerated() {
+            serviceOrderIndex[name] = idx
+        }
+
+        return results.sorted { lhs, rhs in
+            let lhsService = serviceOrderIndex[lhs.name]
+            let rhsService = serviceOrderIndex[rhs.name]
+
+            // Both in service order: use service order position
+            if let li = lhsService, let ri = rhsService { return li < ri }
+
+            // One in service order, one not: service-order wins
+            if lhsService != nil && rhsService == nil { return true }
+            if lhsService == nil && rhsService != nil { return false }
+
+            // Neither in service order: active first, then by name
+            let lhsActive = lhs.isUp && lhs.isRunning && (lhs.ipv4Address != nil || !lhs.ipv6Addresses.isEmpty)
+            let rhsActive = rhs.isUp && rhs.isRunning && (rhs.ipv4Address != nil || !rhs.ipv6Addresses.isEmpty)
+            if lhsActive != rhsActive { return lhsActive }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    // ── SystemConfiguration: display names and types ──
+
+    private struct SCInterfaceInfo {
+        let displayName: String
+        let kind: String
+    }
+
+    private static func loadSCInterfaceInfo() -> [String: SCInterfaceInfo] {
         guard let interfaces = SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] else {
+            return [:]
+        }
+
+        var result: [String: SCInterfaceInfo] = [:]
+        for interface in interfaces {
+            guard let bsdName = SCNetworkInterfaceGetBSDName(interface) as String? else { continue }
+            let displayName = (SCNetworkInterfaceGetLocalizedDisplayName(interface) as String?) ?? bsdName
+            let kind = readableInterfaceKind(SCNetworkInterfaceGetInterfaceType(interface) as String?)
+            result[bsdName] = SCInterfaceInfo(displayName: displayName, kind: kind)
+        }
+        return result
+    }
+
+    // ── getifaddrs: addresses, flags, MACs ──
+
+    private struct IfaddrsInfo {
+        var ipv4: String?
+        var netmask: String?
+        var ipv6s: [String] = []
+        var mac: String?
+        var flags: InterfaceFlags = []
+    }
+
+    private struct InterfaceFlags: OptionSet {
+        let rawValue: UInt32
+        static let up = InterfaceFlags(rawValue: UInt32(IFF_UP))
+        static let running = InterfaceFlags(rawValue: UInt32(IFF_RUNNING))
+        static let loopback = InterfaceFlags(rawValue: UInt32(IFF_LOOPBACK))
+    }
+
+    private static func loadGetifaddrsInfo() -> [String: IfaddrsInfo] {
+        var ifaddrsPointer: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddrsPointer) == 0, let firstAddr = ifaddrsPointer else {
+            return [:]
+        }
+        defer { freeifaddrs(ifaddrsPointer) }
+
+        var result: [String: IfaddrsInfo] = [:]
+
+        var cursor: UnsafeMutablePointer<ifaddrs>? = firstAddr
+        while let ifa = cursor {
+            let name = String(cString: ifa.pointee.ifa_name)
+            var info = result[name] ?? IfaddrsInfo()
+
+            // Flags (same for all address families)
+            info.flags = InterfaceFlags(rawValue: ifa.pointee.ifa_flags)
+
+            if let addr = ifa.pointee.ifa_addr {
+                switch Int32(addr.pointee.sa_family) {
+                case AF_INET:
+                    // IPv4
+                    addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+                        info.ipv4 = formatIPv4(sin.pointee.sin_addr)
+                    }
+                    if let netmask = ifa.pointee.ifa_netmask {
+                        netmask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+                            info.netmask = formatIPv4(sin.pointee.sin_addr)
+                        }
+                    }
+
+                case AF_INET6:
+                    // IPv6
+                    addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { sin6 in
+                        let ipv6 = formatIPv6(sin6.pointee.sin6_addr)
+                        // Skip link-local (fe80::) for display unless it's all we have
+                        if !ipv6.hasPrefix("fe80:") {
+                            info.ipv6s.append(ipv6)
+                        }
+                    }
+
+                case AF_LINK:
+                    // MAC address
+                    addr.withMemoryRebound(to: sockaddr_dl.self, capacity: 1) { sdl in
+                        let addrLen = Int(sdl.pointee.sdl_alen)
+                        if addrLen == 6 {
+                            let macBytes = withUnsafePointer(to: &sdl.pointee.sdl_data) { ptr in
+                                let start = UnsafeRawPointer(ptr).advanced(by: Int(sdl.pointee.sdl_nlen))
+                                return (0..<6).map { start.load(fromByteOffset: $0, as: UInt8.self) }
+                            }
+                            // Skip all-zeros (unset MACs)
+                            if macBytes.contains(where: { $0 != 0 }) {
+                                info.mac = macBytes.map { String(format: "%02X", $0) }.joined(separator: ":")
+                            }
+                        }
+                    }
+
+                default:
+                    break
+                }
+            }
+
+            result[name] = info
+            cursor = ifa.pointee.ifa_next
+        }
+
+        return result
+    }
+
+    private static func formatIPv4(_ addr: in_addr) -> String {
+        var addr = addr
+        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN))
+        if let nullIdx = buf.firstIndex(of: 0) {
+            return String(decoding: buf[..<nullIdx].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        }
+        return String(decoding: buf.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    private static func formatIPv6(_ addr: in6_addr) -> String {
+        var addr = addr
+        var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        inet_ntop(AF_INET6, &addr, &buf, socklen_t(INET6_ADDRSTRLEN))
+        if let nullIdx = buf.firstIndex(of: 0) {
+            return String(decoding: buf[..<nullIdx].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        }
+        return String(decoding: buf.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    // ── Default route via SCDynamicStore ──
+
+    private static func defaultRouteInterfaceName() -> String? {
+        guard let store = SCDynamicStoreCreate(nil, "TriglavGUI" as CFString, nil, nil) else {
+            return nil
+        }
+        let key = "State:/Network/Global/IPv4" as CFString
+        guard let dict = SCDynamicStoreCopyValue(store, key) as? [String: Any] else {
+            return nil
+        }
+        return dict["PrimaryInterface"] as? String
+    }
+
+    // ── macOS network service order ──
+
+    /// Returns BSD interface names in the user's configured service order
+    /// (System Settings → Network → Service Order). This determines the
+    /// priority macOS uses when multiple interfaces are available.
+    private static func loadServiceOrder() -> [String] {
+        guard let prefs = SCPreferencesCreate(nil, "TriglavGUI" as CFString, nil),
+              let currentSet = SCNetworkSetCopyCurrent(prefs),
+              let serviceOrder = SCNetworkSetGetServiceOrder(currentSet) as? [String]
+        else {
             return []
         }
 
-        let mapped = interfaces.compactMap { interface -> NetworkInterface? in
-            guard let bsdName = SCNetworkInterfaceGetBSDName(interface) as String? else {
-                return nil
+        // serviceOrder contains service IDs, not BSD names. We need to resolve each
+        // service ID to its interface's BSD name.
+        var bsdNames: [String] = []
+        for serviceID in serviceOrder {
+            guard let service = SCNetworkServiceCopy(prefs, serviceID as CFString),
+                  SCNetworkServiceGetEnabled(service),
+                  let interface = SCNetworkServiceGetInterface(service),
+                  let bsdName = SCNetworkInterfaceGetBSDName(interface) as String?
+            else {
+                continue
             }
-
-            let displayName = (SCNetworkInterfaceGetLocalizedDisplayName(interface) as String?) ?? bsdName
-            let kind = readableInterfaceKind(SCNetworkInterfaceGetInterfaceType(interface) as String?)
-
-            return NetworkInterface(name: bsdName, displayName: displayName, kind: kind)
+            bsdNames.append(bsdName)
         }
+        return bsdNames
+    }
 
-        return Array(Set(mapped)).sorted { lhs, rhs in
-            lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-        }
+    // ── Helpers ──
+
+    private static func guessKind(_ name: String) -> String {
+        if name.hasPrefix("en") { return "Ethernet" }
+        if name.hasPrefix("pdp_ip") || name.hasPrefix("rmnet") { return "Cellular" }
+        if name.hasPrefix("utun") || name.hasPrefix("ipsec") { return "VPN" }
+        if name.hasPrefix("bridge") { return "Bridge" }
+        if name.hasPrefix("awdl") { return "AWDL" }
+        if name.hasPrefix("llw") { return "Low Latency WLAN" }
+        if name.hasPrefix("ap") { return "Access Point" }
+        if name.hasPrefix("gif") { return "GIF Tunnel" }
+        if name.hasPrefix("stf") { return "6to4" }
+        if name.hasPrefix("tg") { return "Triglav" }
+        if name == "lo0" { return "Loopback" }
+        return "Network"
     }
 
     private static func readableInterfaceKind(_ rawType: String?) -> String {

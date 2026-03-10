@@ -104,6 +104,13 @@ impl StatusProvider for DefaultStatusProvider {
             version: crate::VERSION.to_string(),
             uptime_seconds: 0, // Will be set by handler
             state: "running".to_string(),
+            role: None,
+            mode: None,
+            process_id: None,
+            session_id: None,
+            connection_id: None,
+            quality: None,
+            tunnel: None,
             uplinks: self.uplinks.read().clone(),
             sessions: self.sessions.read().clone(),
             total_bytes_sent: 0,
@@ -160,11 +167,47 @@ pub struct StatusResponse {
     pub version: String,
     pub uptime_seconds: u64,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<QualityStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<TunnelStatus>,
     pub uplinks: Vec<UplinkStatus>,
     pub sessions: Vec<SessionStatus>,
     pub total_bytes_sent: u64,
     pub total_bytes_received: u64,
     pub total_connections: u64,
+}
+
+/// High-level quality summary for local clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityStatus {
+    pub usable_uplinks: usize,
+    pub total_uplinks: usize,
+    pub avg_rtt_ms: f64,
+    pub avg_loss_percent: f64,
+    pub total_bandwidth_mbps: f64,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub packets_dropped: u64,
+}
+
+/// Tunnel-specific runtime information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelStatus {
+    pub tun_name: String,
+    pub full_tunnel: bool,
+    pub include_routes: Vec<String>,
+    pub exclude_routes: Vec<String>,
 }
 
 /// Uplink status.

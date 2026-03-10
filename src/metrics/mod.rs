@@ -9,12 +9,16 @@
 //! - HTTP health endpoints
 
 #[cfg(feature = "metrics")]
+mod client_status;
+#[cfg(feature = "metrics")]
 mod http_server;
 mod predictor;
 #[cfg(feature = "metrics")]
 mod prometheus_export;
 mod quality;
 
+#[cfg(feature = "metrics")]
+pub use client_status::*;
 #[cfg(feature = "metrics")]
 pub use http_server::*;
 pub use predictor::{Prediction, QualityPredictor};

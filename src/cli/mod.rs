@@ -127,6 +127,10 @@ pub struct TunArgs {
     /// Server key (tg1_...)
     pub key: String,
 
+    /// Local HTTP status and metrics address
+    #[arg(long, default_value = "127.0.0.1:9091")]
+    pub metrics_addr: SocketAddr,
+
     /// Network interfaces to use (can be specified multiple times)
     #[arg(short, long)]
     pub interface: Vec<String>,
@@ -185,6 +189,10 @@ pub struct TunArgs {
 pub struct ConnectArgs {
     /// Server key (tg1_...)
     pub key: String,
+
+    /// Local HTTP status and metrics address
+    #[arg(long, default_value = "127.0.0.1:9091")]
+    pub metrics_addr: SocketAddr,
 
     /// Network interfaces to use (can be specified multiple times)
     #[arg(short, long)]

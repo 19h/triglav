@@ -132,11 +132,16 @@ struct NetworkInterface: Codable, Hashable, Identifiable {
     let macAddress: String?
     let ipv4Address: String?
     let ipv4Netmask: String?
+    let ipv4Broadcast: String?
     let ipv6Addresses: [String]
+    let ipv6LinkLocal: String?
+    let gateway: String?
+    let ipv6Gateway: String?
     let isUp: Bool
     let isRunning: Bool
     let isLoopback: Bool
     let isDefaultRoute: Bool
+    let interfaceIndex: Int?
 
     var id: String { name }
 
@@ -1277,7 +1282,11 @@ private enum NetworkInterfaceProvider {
         // Step 4: Get macOS network service order (user-configured priority)
         let serviceOrder = loadServiceOrder()
 
-        // Step 5: Merge into unified NetworkInterface objects
+        // Step 5: Get per-interface gateway/router addresses via SCDynamicStore
+        let gateways = loadGateways()
+        let ipv6Gateways = loadIPv6Gateways()
+
+        // Step 6: Merge into unified NetworkInterface objects
         let allNames = Set(scInfo.keys).union(ifaddrsInfo.keys)
 
         let results = allNames.compactMap { name -> NetworkInterface? in
@@ -1300,11 +1309,16 @@ private enum NetworkInterfaceProvider {
                 macAddress: ifa?.mac,
                 ipv4Address: ifa?.ipv4,
                 ipv4Netmask: ifa?.netmask,
+                ipv4Broadcast: ifa?.broadcast,
                 ipv6Addresses: ifa?.ipv6s ?? [],
+                ipv6LinkLocal: ifa?.ipv6LinkLocal,
+                gateway: gateways[name],
+                ipv6Gateway: ipv6Gateways[name],
                 isUp: ifa?.flags.contains(.up) ?? false,
                 isRunning: ifa?.flags.contains(.running) ?? false,
                 isLoopback: isLoopback,
-                isDefaultRoute: name == defaultRouteInterface
+                isDefaultRoute: name == defaultRouteInterface,
+                interfaceIndex: ifa?.index
             )
         }
 
@@ -1361,9 +1375,12 @@ private enum NetworkInterfaceProvider {
     private struct IfaddrsInfo {
         var ipv4: String?
         var netmask: String?
+        var broadcast: String?
         var ipv6s: [String] = []
+        var ipv6LinkLocal: String?
         var mac: String?
         var flags: InterfaceFlags = []
+        var index: Int?
     }
 
     private struct InterfaceFlags: OptionSet {
@@ -1393,13 +1410,22 @@ private enum NetworkInterfaceProvider {
             if let addr = ifa.pointee.ifa_addr {
                 switch Int32(addr.pointee.sa_family) {
                 case AF_INET:
-                    // IPv4
+                    // IPv4 address
                     addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
                         info.ipv4 = formatIPv4(sin.pointee.sin_addr)
                     }
+                    // Netmask
                     if let netmask = ifa.pointee.ifa_netmask {
                         netmask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
                             info.netmask = formatIPv4(sin.pointee.sin_addr)
+                        }
+                    }
+                    // Broadcast address (ifa_dstaddr for broadcast-capable interfaces)
+                    if info.flags.rawValue & UInt32(IFF_BROADCAST) != 0,
+                       let dstAddr = ifa.pointee.ifa_dstaddr
+                    {
+                        dstAddr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+                            info.broadcast = formatIPv4(sin.pointee.sin_addr)
                         }
                     }
 
@@ -1407,15 +1433,37 @@ private enum NetworkInterfaceProvider {
                     // IPv6
                     addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { sin6 in
                         let ipv6 = formatIPv6(sin6.pointee.sin6_addr)
-                        // Skip link-local (fe80::) for display unless it's all we have
-                        if !ipv6.hasPrefix("fe80:") {
-                            info.ipv6s.append(ipv6)
+
+                        // Extract prefix length from netmask
+                        var prefixLen: Int?
+                        if let netmask = ifa.pointee.ifa_netmask {
+                            netmask.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { maskSin6 in
+                                prefixLen = ipv6PrefixLength(maskSin6.pointee.sin6_addr)
+                            }
+                        }
+
+                        let display: String
+                        if let pl = prefixLen {
+                            display = "\(ipv6)/\(pl)"
+                        } else {
+                            display = ipv6
+                        }
+
+                        if ipv6.hasPrefix("fe80:") {
+                            // Store link-local separately
+                            if info.ipv6LinkLocal == nil {
+                                info.ipv6LinkLocal = display
+                            }
+                        } else {
+                            info.ipv6s.append(display)
                         }
                     }
 
                 case AF_LINK:
-                    // MAC address
+                    // MAC address + interface index
                     addr.withMemoryRebound(to: sockaddr_dl.self, capacity: 1) { sdl in
+                        info.index = Int(sdl.pointee.sdl_index)
+
                         let addrLen = Int(sdl.pointee.sdl_alen)
                         if addrLen == 6 {
                             let macBytes = withUnsafePointer(to: &sdl.pointee.sdl_data) { ptr in
@@ -1461,6 +1509,28 @@ private enum NetworkInterfaceProvider {
         return String(decoding: buf.map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
+    /// Count the number of leading 1-bits in an IPv6 netmask address.
+    private static func ipv6PrefixLength(_ mask: in6_addr) -> Int {
+        var mask = mask
+        return withUnsafeBytes(of: &mask) { buf in
+            var bits = 0
+            for byte in buf {
+                if byte == 0xFF {
+                    bits += 8
+                } else {
+                    // Count leading 1-bits in partial byte
+                    var b = byte
+                    while b & 0x80 != 0 {
+                        bits += 1
+                        b <<= 1
+                    }
+                    break
+                }
+            }
+            return bits
+        }
+    }
+
     // ── Default route via SCDynamicStore ──
 
     private static func defaultRouteInterfaceName() -> String? {
@@ -1472,6 +1542,56 @@ private enum NetworkInterfaceProvider {
             return nil
         }
         return dict["PrimaryInterface"] as? String
+    }
+
+    // ── Per-interface gateway/router via SCDynamicStore ──
+
+    /// Returns a map of BSD interface name → router/gateway IP address.
+    /// Queries SCDynamicStore for `State:/Network/Service/*/IPv4` entries
+    /// which contain the Router key and the InterfaceName.
+    private static func loadGateways() -> [String: String] {
+        guard let store = SCDynamicStoreCreate(nil, "TriglavGUI" as CFString, nil, nil) else {
+            return [:]
+        }
+        let pattern = "State:/Network/Service/.*/IPv4" as CFString
+        guard let keys = SCDynamicStoreCopyKeyList(store, pattern) as? [String] else {
+            return [:]
+        }
+
+        var result: [String: String] = [:]
+        for key in keys {
+            guard let dict = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any],
+                  let ifaceName = dict["InterfaceName"] as? String,
+                  let router = dict["Router"] as? String
+            else {
+                continue
+            }
+            result[ifaceName] = router
+        }
+        return result
+    }
+
+    /// Returns a map of BSD interface name → IPv6 router address.
+    private static func loadIPv6Gateways() -> [String: String] {
+        guard let store = SCDynamicStoreCreate(nil, "TriglavGUI" as CFString, nil, nil) else {
+            return [:]
+        }
+        let pattern = "State:/Network/Service/.*/IPv6" as CFString
+        guard let keys = SCDynamicStoreCopyKeyList(store, pattern) as? [String] else {
+            return [:]
+        }
+
+        var result: [String: String] = [:]
+        for key in keys {
+            guard let dict = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any],
+                  let ifaceName = dict["InterfaceName"] as? String,
+                  let router = dict["Router"] as? String
+            else {
+                continue
+            }
+            result[ifaceName] = router
+        }
+        return result
     }
 
     // ── macOS network service order ──

@@ -113,41 +113,52 @@ private enum DemoData {
             name: "en0", displayName: "Wi-Fi", kind: "Wi-Fi",
             macAddress: "A4:83:E7:2F:1B:C0",
             ipv4Address: "192.168.1.42", ipv4Netmask: "255.255.255.0",
-            ipv6Addresses: ["2001:db8::a483:e7ff:fe2f:1bc0"],
+            ipv4Broadcast: "192.168.1.255",
+            ipv6Addresses: ["2001:db8::a483:e7ff:fe2f:1bc0/64"],
+            ipv6LinkLocal: "fe80::a683:e7ff:fe2f:1bc0/64",
+            gateway: "192.168.1.1", ipv6Gateway: "fe80::1",
             isUp: true, isRunning: true, isLoopback: false,
-            isDefaultRoute: true
+            isDefaultRoute: true, interfaceIndex: 6
         ),
         NetworkInterface(
             name: "en7", displayName: "USB 10/100/1000 LAN", kind: "Ethernet",
             macAddress: "00:E0:4C:68:01:A3",
             ipv4Address: "10.0.0.15", ipv4Netmask: "255.255.255.0",
+            ipv4Broadcast: "10.0.0.255",
             ipv6Addresses: [],
+            ipv6LinkLocal: "fe80::2e0:4cff:fe68:1a3/64",
+            gateway: "10.0.0.1", ipv6Gateway: nil,
             isUp: true, isRunning: true, isLoopback: false,
-            isDefaultRoute: false
+            isDefaultRoute: false, interfaceIndex: 12
         ),
         NetworkInterface(
             name: "en1", displayName: "Thunderbolt Ethernet Slot 1", kind: "Ethernet",
             macAddress: "82:C5:F2:7A:D4:10",
-            ipv4Address: nil, ipv4Netmask: nil,
+            ipv4Address: nil, ipv4Netmask: nil, ipv4Broadcast: nil,
             ipv6Addresses: [],
+            ipv6LinkLocal: nil, gateway: nil, ipv6Gateway: nil,
             isUp: true, isRunning: false, isLoopback: false,
-            isDefaultRoute: false
+            isDefaultRoute: false, interfaceIndex: 7
         ),
         NetworkInterface(
             name: "en2", displayName: "Thunderbolt Bridge", kind: "Bridge",
             macAddress: "82:C5:F2:7A:D4:01",
-            ipv4Address: nil, ipv4Netmask: nil,
+            ipv4Address: nil, ipv4Netmask: nil, ipv4Broadcast: nil,
             ipv6Addresses: [],
+            ipv6LinkLocal: nil, gateway: nil, ipv6Gateway: nil,
             isUp: false, isRunning: false, isLoopback: false,
-            isDefaultRoute: false
+            isDefaultRoute: false, interfaceIndex: 8
         ),
         NetworkInterface(
             name: "pdp_ip0", displayName: "iPhone USB", kind: "Cellular",
             macAddress: nil,
             ipv4Address: "172.20.10.3", ipv4Netmask: "255.255.255.240",
+            ipv4Broadcast: "172.20.10.15",
             ipv6Addresses: ["2600:1700:6f80:4060::2f"],
+            ipv6LinkLocal: "fe80::1c9a:3bff:fe4d:2e17/64",
+            gateway: "172.20.10.1", ipv6Gateway: "fe80::1",
             isUp: true, isRunning: true, isLoopback: false,
-            isDefaultRoute: false
+            isDefaultRoute: false, interfaceIndex: 18
         ),
     ]
 
@@ -1398,58 +1409,120 @@ private struct InterfaceDetailRow: View {
     }
 
     private var detailGrid: some View {
-        let rows = buildDetailRows()
-        return VStack(spacing: 3) {
-            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                HStack(spacing: 0) {
-                    Text(row.label)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 80, alignment: .trailing)
-                        .padding(.trailing, 10)
+        VStack(spacing: 2) {
+            // ── IPv4: address on left, network info on right ──
+            if iface.ipv4Address != nil {
+                HStack(alignment: .top, spacing: 0) {
+                    // Left column: address
+                    detailCell(label: "IPv4", value: iface.ipv4CIDR ?? iface.ipv4Address ?? "")
 
-                    Text(row.value)
-                        .font(.system(size: 10.5, design: .monospaced))
-                        .foregroundStyle(.primary)
-                        .textSelection(.enabled)
-                        .lineLimit(1)
-
-                    Spacer(minLength: 0)
+                    // Right column: gateway, netmask, broadcast
+                    VStack(alignment: .leading, spacing: 2) {
+                        if let gw = iface.gateway {
+                            detailPair("Gateway", gw)
+                        }
+                        if let mask = iface.ipv4Netmask {
+                            detailPair("Netmask", mask)
+                        }
+                        if let bc = iface.ipv4Broadcast {
+                            detailPair("Broadcast", bc)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
+
+            // ── IPv6: addresses on left, gateway on right ──
+            if !iface.ipv6Addresses.isEmpty || iface.ipv6LinkLocal != nil {
+                HStack(alignment: .top, spacing: 0) {
+                    // Left column: label + addresses
+                    HStack(alignment: .top, spacing: 0) {
+                        Text("IPv6")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 50, alignment: .trailing)
+                            .padding(.trailing, 10)
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            ForEach(iface.ipv6Addresses, id: \.self) { addr in
+                                Text(addr)
+                                    .font(.system(size: 10.5, design: .monospaced))
+                                    .textSelection(.enabled)
+                            }
+                            if let ll = iface.ipv6LinkLocal {
+                                Text(ll)
+                                    .font(.system(size: 10.5, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+
+                    // Right column: gateway
+                    VStack(alignment: .leading, spacing: 2) {
+                        if let gw6 = iface.ipv6Gateway {
+                            detailPair("Gateway", gw6)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+
+            // ── Hardware ──
+            if let mac = iface.macAddress {
+                detailCell(label: "MAC", value: mac)
+            }
+
+            // ── Live uplink data ──
+            if let uplink = uplink {
+                HStack(alignment: .top, spacing: 0) {
+                    detailCell(label: "Remote", value: uplink.remoteAddr)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        detailPair("NAT", uplink.natType)
+                        if let ext = uplink.externalAddr {
+                            detailPair("External", ext)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                detailCell(label: "Traffic", value: "TX \(uplink.bytesSent.byteCountDisplay)  RX \(uplink.bytesReceived.byteCountDisplay)")
+            }
         }
-        .padding(.leading, 30)
+        .padding(.leading, 4)
     }
 
-    private struct DetailRow {
-        let label: String
-        let value: String
+    /// Single label + monospaced value row
+    private func detailCell(label: String, value: String) -> some View {
+        HStack(spacing: 0) {
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 50, alignment: .trailing)
+                .padding(.trailing, 10)
+
+            Text(value)
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+                .lineLimit(1)
+
+            Spacer(minLength: 0)
+        }
     }
 
-    private func buildDetailRows() -> [DetailRow] {
-        var rows: [DetailRow] = []
-
-        if let ipv4 = iface.ipv4CIDR {
-            rows.append(DetailRow(label: "IPv4", value: ipv4))
-        } else if iface.ipv4Address != nil {
-            rows.append(DetailRow(label: "IPv4", value: iface.ipv4Address!))
+    /// Compact inline pair for the right column: "Label  value"
+    private func detailPair(_ label: String, _ value: String) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
         }
-
-        for ipv6 in iface.ipv6Addresses {
-            rows.append(DetailRow(label: rows.contains(where: { $0.label == "IPv6" }) ? "" : "IPv6", value: ipv6))
-        }
-
-        if let mac = iface.macAddress {
-            rows.append(DetailRow(label: "MAC", value: mac))
-        }
-
-        if let uplink = uplink {
-            rows.append(DetailRow(label: "Remote", value: uplink.remoteAddr))
-            rows.append(DetailRow(label: "NAT", value: uplink.natType + (uplink.externalAddr.map { "  \($0)" } ?? "")))
-            rows.append(DetailRow(label: "Traffic", value: "TX \(uplink.bytesSent.byteCountDisplay)  RX \(uplink.bytesReceived.byteCountDisplay)"))
-        }
-
-        return rows
     }
 
     private var statusColor: Color {
@@ -1561,6 +1634,9 @@ private struct InactiveInterfacesSection: View {
                 ForEach(interfaces) { iface in
                     InactiveInterfaceRow(iface: iface)
                 }
+
+                Spacer()
+                    .frame(height: 16)
             }
         }
     }

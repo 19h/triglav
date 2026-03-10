@@ -1,0 +1,490 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000010000000000000001 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000001 /* AppModel.swift */; };
+		A10000010000000000000002 /* ClientStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000002 /* ClientStatus.swift */; };
+		A10000010000000000000003 /* LaunchdTunService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000003 /* LaunchdTunService.swift */; };
+		A10000010000000000000004 /* PrivilegedHelperManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000004 /* PrivilegedHelperManager.swift */; };
+		A10000010000000000000005 /* PrivilegedHelperProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000005 /* PrivilegedHelperProtocol.swift */; };
+		A10000010000000000000006 /* TriglavMacApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000006 /* TriglavMacApp.swift */; };
+		A10000010000000000000007 /* Views.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000007 /* Views.swift */; };
+		A10000010000000000000008 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000010 /* Assets.xcassets */; };
+		A10000010000000000000009 /* ServiceManagement.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A20000010000000000000011 /* ServiceManagement.framework */; };
+		A1000001000000000000000A /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A20000010000000000000012 /* Security.framework */; };
+		A1000001000000000000000B /* PrivilegedHelperTool.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000008 /* PrivilegedHelperTool.swift */; };
+		A1000001000000000000000C /* PrivilegedHelperProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000005 /* PrivilegedHelperProtocol.swift */; };
+		A1000001000000000000000D /* AppSceneState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000015 /* AppSceneState.swift */; };
+		A1000001000000000000000E /* MenuBarState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000016 /* MenuBarState.swift */; };
+		A1000001000000000000000F /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000017 /* AppDelegate.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A30000010000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A70000010000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A60000010000000000000002;
+			remoteInfo = TriglavPrivilegedHelper;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A20000010000000000000001 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		A20000010000000000000002 /* ClientStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientStatus.swift; sourceTree = "<group>"; };
+		A20000010000000000000003 /* LaunchdTunService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchdTunService.swift; sourceTree = "<group>"; };
+		A20000010000000000000004 /* PrivilegedHelperManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivilegedHelperManager.swift; sourceTree = "<group>"; };
+		A20000010000000000000005 /* PrivilegedHelperProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivilegedHelperProtocol.swift; sourceTree = "<group>"; };
+		A20000010000000000000006 /* TriglavMacApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TriglavMacApp.swift; sourceTree = "<group>"; };
+		A20000010000000000000007 /* Views.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views.swift; sourceTree = "<group>"; };
+		A20000010000000000000008 /* PrivilegedHelperTool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivilegedHelperTool.swift; sourceTree = "<group>"; };
+		A20000010000000000000009 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A2000001000000000000000A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A20000010000000000000010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A20000010000000000000011 /* ServiceManagement.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ServiceManagement.framework; path = System/Library/Frameworks/ServiceManagement.framework; sourceTree = SDKROOT; };
+		A20000010000000000000012 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		A20000010000000000000013 /* Triglav.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Triglav.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A20000010000000000000014 /* TriglavPrivilegedHelper */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = TriglavPrivilegedHelper; sourceTree = BUILT_PRODUCTS_DIR; };
+		A20000010000000000000015 /* AppSceneState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSceneState.swift; sourceTree = "<group>"; };
+		A20000010000000000000016 /* MenuBarState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarState.swift; sourceTree = "<group>"; };
+		A20000010000000000000017 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A40000010000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000010000000000000009 /* ServiceManagement.framework in Frameworks */,
+				A1000001000000000000000A /* Security.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A40000010000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A50000010000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				A50000010000000000000002 /* Products */,
+				A50000010000000000000003 /* App Sources */,
+				A50000010000000000000004 /* Xcode */,
+				A50000010000000000000005 /* Frameworks */,
+			);
+			sourceTree = "<group>";
+		};
+		A50000010000000000000002 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A20000010000000000000013 /* Triglav.app */,
+				A20000010000000000000014 /* TriglavPrivilegedHelper */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A50000010000000000000003 /* App Sources */ = {
+			isa = PBXGroup;
+			children = (
+				A20000010000000000000001 /* AppModel.swift */,
+				A20000010000000000000017 /* AppDelegate.swift */,
+				A20000010000000000000015 /* AppSceneState.swift */,
+				A20000010000000000000002 /* ClientStatus.swift */,
+				A20000010000000000000003 /* LaunchdTunService.swift */,
+				A20000010000000000000016 /* MenuBarState.swift */,
+				A20000010000000000000004 /* PrivilegedHelperManager.swift */,
+				A20000010000000000000005 /* PrivilegedHelperProtocol.swift */,
+				A20000010000000000000006 /* TriglavMacApp.swift */,
+				A20000010000000000000007 /* Views.swift */,
+			);
+			name = "App Sources";
+			path = Sources/TriglavGUI;
+			sourceTree = "<group>";
+		};
+		A50000010000000000000004 /* Xcode */ = {
+			isa = PBXGroup;
+			children = (
+				A50000010000000000000006 /* App */,
+				A50000010000000000000007 /* Helper */,
+				A50000010000000000000008 /* Resources */,
+			);
+			path = Xcode;
+			sourceTree = "<group>";
+		};
+		A50000010000000000000005 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				A20000010000000000000011 /* ServiceManagement.framework */,
+				A20000010000000000000012 /* Security.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		A50000010000000000000006 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				A20000010000000000000009 /* Info.plist */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		A50000010000000000000007 /* Helper */ = {
+			isa = PBXGroup;
+			children = (
+				A20000010000000000000008 /* PrivilegedHelperTool.swift */,
+				A2000001000000000000000A /* Info.plist */,
+			);
+			path = Helper;
+			sourceTree = "<group>";
+		};
+		A50000010000000000000008 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				A20000010000000000000010 /* Assets.xcassets */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A60000010000000000000001 /* Triglav */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A90000010000000000000002 /* Build configuration list for PBXNativeTarget "Triglav" */;
+			buildPhases = (
+				A40000010000000000000003 /* Sources */,
+				A40000010000000000000001 /* Frameworks */,
+				A40000010000000000000004 /* Resources */,
+				A40000010000000000000005 /* Build Embedded Triglav CLI */,
+				A40000010000000000000006 /* Embed Privileged Helper */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				AA0000010000000000000001 /* PBXTargetDependency */,
+			);
+			name = Triglav;
+			productName = Triglav;
+			productReference = A20000010000000000000013 /* Triglav.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A60000010000000000000002 /* TriglavPrivilegedHelper */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A90000010000000000000003 /* Build configuration list for PBXNativeTarget "TriglavPrivilegedHelper" */;
+			buildPhases = (
+				A40000010000000000000007 /* Sources */,
+				A40000010000000000000002 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = TriglavPrivilegedHelper;
+			productName = TriglavPrivilegedHelper;
+			productReference = A20000010000000000000014 /* TriglavPrivilegedHelper */;
+			productType = "com.apple.product-type.tool";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A70000010000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					A60000010000000000000001 = {
+						CreatedOnToolsVersion = 16.0;
+						ProvisioningStyle = Automatic;
+					};
+					A60000010000000000000002 = {
+						CreatedOnToolsVersion = 16.0;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = A90000010000000000000001 /* Build configuration list for PBXProject "Triglav" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A50000010000000000000001;
+			productRefGroup = A50000010000000000000002 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A60000010000000000000001 /* Triglav */,
+				A60000010000000000000002 /* TriglavPrivilegedHelper */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A40000010000000000000004 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000010000000000000008 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A40000010000000000000005 /* Build Embedded Triglav CLI */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Embedded Triglav CLI";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/bin/triglav",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\nREPO_ROOT=\"${PROJECT_DIR}/../..\"\nif [ \"${CONFIGURATION}\" = \"Release\" ]; then\n  BIN_DIR=\"${REPO_ROOT}/target/release\"\n  cargo build --release --manifest-path \"${REPO_ROOT}/Cargo.toml\" --bin triglav\nelse\n  BIN_DIR=\"${REPO_ROOT}/target/debug\"\n  cargo build --manifest-path \"${REPO_ROOT}/Cargo.toml\" --bin triglav\nfi\nmkdir -p \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/bin\"\ncp \"${BIN_DIR}/triglav\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/bin/triglav\"\nchmod 755 \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/bin/triglav\"\n";
+		};
+		A40000010000000000000006 /* Embed Privileged Helper */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"${BUILT_PRODUCTS_DIR}/TriglavPrivilegedHelper",
+				"${PROJECT_DIR}/Xcode/Helper/com.triglav.gui.helper.plist",
+			);
+			name = "Embed Privileged Helper";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchServices/TriglavPrivilegedHelper",
+				"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchDaemons/com.triglav.gui.helper.plist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\nHELPER_SRC=\"${BUILT_PRODUCTS_DIR}/TriglavPrivilegedHelper\"\nHELPER_DST=\"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchServices\"\nPLIST_SRC=\"${PROJECT_DIR}/Xcode/Helper/com.triglav.gui.helper.plist\"\nPLIST_DST=\"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchDaemons\"\nmkdir -p \"${HELPER_DST}\" \"${PLIST_DST}\"\ncp \"${HELPER_SRC}\" \"${HELPER_DST}/TriglavPrivilegedHelper\"\ncp \"${PLIST_SRC}\" \"${PLIST_DST}/com.triglav.gui.helper.plist\"\nchmod 755 \"${HELPER_DST}/TriglavPrivilegedHelper\"\nchmod 644 \"${PLIST_DST}/com.triglav.gui.helper.plist\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A40000010000000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000010000000000000001 /* AppModel.swift in Sources */,
+				A1000001000000000000000F /* AppDelegate.swift in Sources */,
+				A1000001000000000000000D /* AppSceneState.swift in Sources */,
+				A10000010000000000000002 /* ClientStatus.swift in Sources */,
+				A10000010000000000000003 /* LaunchdTunService.swift in Sources */,
+				A1000001000000000000000E /* MenuBarState.swift in Sources */,
+				A10000010000000000000004 /* PrivilegedHelperManager.swift in Sources */,
+				A10000010000000000000005 /* PrivilegedHelperProtocol.swift in Sources */,
+				A10000010000000000000006 /* TriglavMacApp.swift in Sources */,
+				A10000010000000000000007 /* Views.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A40000010000000000000007 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1000001000000000000000B /* PrivilegedHelperTool.swift in Sources */,
+				A1000001000000000000000C /* PrivilegedHelperProtocol.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		AA0000010000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A60000010000000000000002 /* TriglavPrivilegedHelper */;
+			targetProxy = A30000010000000000000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		A80000010000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.2.0;
+				SDKROOT = macosx;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		A80000010000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.2.0;
+				SDKROOT = macosx;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		A80000010000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APP_CODE_SIGN_REQUIREMENT = "identifier \"com.triglav.gui\" and anchor apple generic and certificate leaf[subject.OU] = \"$(DEVELOPMENT_TEAM)\"";
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				HELPER_BUNDLE_IDENTIFIER = com.triglav.gui.helper;
+				HELPER_CODE_SIGN_REQUIREMENT = "identifier \"com.triglav.gui.helper\" and anchor apple generic and certificate leaf[subject.OU] = \"$(DEVELOPMENT_TEAM)\"";
+				INFOPLIST_FILE = Xcode/App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.2.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.triglav.gui;
+				PRODUCT_MODULE_NAME = TriglavGUI;
+				PRODUCT_NAME = Triglav;
+				SDKROOT = macosx;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		A80000010000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APP_CODE_SIGN_REQUIREMENT = "identifier \"com.triglav.gui\" and anchor apple generic and certificate leaf[subject.OU] = \"$(DEVELOPMENT_TEAM)\"";
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				HELPER_BUNDLE_IDENTIFIER = com.triglav.gui.helper;
+				HELPER_CODE_SIGN_REQUIREMENT = "identifier \"com.triglav.gui.helper\" and anchor apple generic and certificate leaf[subject.OU] = \"$(DEVELOPMENT_TEAM)\"";
+				INFOPLIST_FILE = Xcode/App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.2.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.triglav.gui;
+				PRODUCT_MODULE_NAME = TriglavGUI;
+				PRODUCT_NAME = Triglav;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		A80000010000000000000005 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APP_CODE_SIGN_REQUIREMENT = "identifier \"com.triglav.gui\" and anchor apple generic and certificate leaf[subject.OU] = \"$(DEVELOPMENT_TEAM)\"";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				HELPER_CODE_SIGN_REQUIREMENT = "identifier \"com.triglav.gui.helper\" and anchor apple generic and certificate leaf[subject.OU] = \"$(DEVELOPMENT_TEAM)\"";
+				INFOPLIST_FILE = Xcode/Helper/Info.plist;
+				INSTALL_PATH = /Library/PrivilegedHelperTools;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.2.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.triglav.gui.helper;
+				PRODUCT_MODULE_NAME = TriglavPrivilegedHelper;
+				PRODUCT_NAME = TriglavPrivilegedHelper;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		A80000010000000000000006 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APP_CODE_SIGN_REQUIREMENT = "identifier \"com.triglav.gui\" and anchor apple generic and certificate leaf[subject.OU] = \"$(DEVELOPMENT_TEAM)\"";
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				HELPER_CODE_SIGN_REQUIREMENT = "identifier \"com.triglav.gui.helper\" and anchor apple generic and certificate leaf[subject.OU] = \"$(DEVELOPMENT_TEAM)\"";
+				INFOPLIST_FILE = Xcode/Helper/Info.plist;
+				INSTALL_PATH = /Library/PrivilegedHelperTools;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.2.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.triglav.gui.helper;
+				PRODUCT_MODULE_NAME = TriglavPrivilegedHelper;
+				PRODUCT_NAME = TriglavPrivilegedHelper;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A90000010000000000000001 /* Build configuration list for PBXProject "Triglav" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A80000010000000000000001 /* Debug */,
+				A80000010000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A90000010000000000000002 /* Build configuration list for PBXNativeTarget "Triglav" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A80000010000000000000003 /* Debug */,
+				A80000010000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A90000010000000000000003 /* Build configuration list for PBXNativeTarget "TriglavPrivilegedHelper" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A80000010000000000000005 /* Debug */,
+				A80000010000000000000006 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A70000010000000000000001 /* Project object */;
+}

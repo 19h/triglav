@@ -16,3 +16,16 @@ target/
 *.o
 *.bin
 *.elf
+
+# SwiftPM build output
+apps/macos/.build/
+apps/macos/.swiftpm/
+apps/macos/dist/
+apps/macos/.xcode-derived-data/
+apps/macos/build/
+
+# Xcode user data
+*.xcuserstate
+*.xcuserdata/
+
+.DS_Store

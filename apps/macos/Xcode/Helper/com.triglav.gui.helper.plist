@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>BundleProgram</key>
+    <string>Contents/Library/LaunchServices/TriglavPrivilegedHelper</string>
+    <key>Label</key>
+    <string>com.triglav.gui.helper</string>
+    <key>MachServices</key>
+    <dict>
+        <key>com.triglav.gui.helper</key>
+        <true/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

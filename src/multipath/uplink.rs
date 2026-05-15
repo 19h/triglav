@@ -17,6 +17,10 @@ use crate::types::{
     Bandwidth, ConnectionState, InterfaceType, Latency, TrafficStats, UplinkHealth, UplinkId,
 };
 
+const DEGRADED_RECOVERY_SUCCESSES: u32 = 3;
+const UNHEALTHY_RECOVERY_SUCCESSES: u32 = 5;
+const DOWN_RECOVERY_SUCCESSES: u32 = 8;
+
 /// Uplink configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UplinkConfig {
@@ -55,6 +59,25 @@ fn default_enabled() -> bool {
     true
 }
 
+fn health_severity(health: UplinkHealth) -> u8 {
+    match health {
+        UplinkHealth::Healthy => 0,
+        UplinkHealth::Unknown => 1,
+        UplinkHealth::Degraded => 2,
+        UplinkHealth::Unhealthy => 3,
+        UplinkHealth::Down => 4,
+    }
+}
+
+fn recovery_threshold(health: UplinkHealth) -> u32 {
+    match health {
+        UplinkHealth::Degraded => DEGRADED_RECOVERY_SUCCESSES,
+        UplinkHealth::Unhealthy => UNHEALTHY_RECOVERY_SUCCESSES,
+        UplinkHealth::Down => DOWN_RECOVERY_SUCCESSES,
+        _ => 0,
+    }
+}
+
 impl Default for UplinkConfig {
     fn default() -> Self {
         Self {
@@ -87,6 +110,8 @@ pub struct UplinkState {
     pub last_recv: Option<Instant>,
     /// Consecutive failures.
     pub consecutive_failures: u32,
+    /// Consecutive successful operations while recovering.
+    pub recovery_successes: u32,
     /// Time of last failure.
     pub last_failure: Option<Instant>,
     /// Error message for last failure.
@@ -102,6 +127,7 @@ impl Default for UplinkState {
             last_send: None,
             last_recv: None,
             consecutive_failures: 0,
+            recovery_successes: 0,
             last_failure: None,
             last_error: None,
         }
@@ -490,6 +516,7 @@ impl Uplink {
             last_send: state.last_send,
             last_recv: state.last_recv,
             consecutive_failures: state.consecutive_failures,
+            recovery_successes: state.recovery_successes,
             last_failure: state.last_failure,
             last_error: state.last_error.clone(),
         }
@@ -763,6 +790,7 @@ impl Uplink {
     pub fn record_failure(&self, error: &str) {
         let mut state = self.state.write();
         state.consecutive_failures += 1;
+        state.recovery_successes = 0;
         state.last_failure = Some(Instant::now());
         state.last_error = Some(error.to_string());
 
@@ -778,16 +806,35 @@ impl Uplink {
     /// Record a successful operation (resets failure counter).
     pub fn record_success(&self) {
         let mut state = self.state.write();
-        state.consecutive_failures = 0;
         state.last_activity = Instant::now();
+        state.recovery_successes = state.recovery_successes.saturating_add(1);
 
         // Slowly increase cwnd on success (additive increase)
         let cwnd = self.cwnd.load(Ordering::Relaxed);
         self.cwnd.store((cwnd + 1).min(1000), Ordering::Relaxed);
 
-        // Improve health if currently degraded
-        if state.health == UplinkHealth::Degraded || state.health == UplinkHealth::Unhealthy {
-            state.health = UplinkHealth::Healthy;
+        match state.health {
+            UplinkHealth::Healthy | UplinkHealth::Unknown => {
+                state.consecutive_failures = 0;
+                state.recovery_successes = 0;
+                state.health = UplinkHealth::Healthy;
+            }
+            UplinkHealth::Degraded if state.recovery_successes >= DEGRADED_RECOVERY_SUCCESSES => {
+                state.consecutive_failures = 0;
+                state.recovery_successes = 0;
+                state.health = UplinkHealth::Healthy;
+            }
+            UplinkHealth::Unhealthy if state.recovery_successes >= UNHEALTHY_RECOVERY_SUCCESSES => {
+                state.consecutive_failures = state.consecutive_failures.min(3);
+                state.recovery_successes = 0;
+                state.health = UplinkHealth::Degraded;
+            }
+            UplinkHealth::Down if state.recovery_successes >= DOWN_RECOVERY_SUCCESSES => {
+                state.consecutive_failures = state.consecutive_failures.min(6);
+                state.recovery_successes = 0;
+                state.health = UplinkHealth::Unhealthy;
+            }
+            _ => {}
         }
     }
 
@@ -833,8 +880,7 @@ impl Uplink {
 
         let mut state = self.state.write();
 
-        // Determine health based on metrics
-        let new_health = if loss > 0.3 || rtt > Duration::from_secs(5) {
+        let metric_health = if loss > 0.3 || rtt > Duration::from_secs(5) {
             UplinkHealth::Unhealthy
         } else if loss > 0.1 || rtt > Duration::from_secs(1) {
             UplinkHealth::Degraded
@@ -844,7 +890,14 @@ impl Uplink {
             UplinkHealth::Healthy
         };
 
-        state.health = new_health;
+        let current = state.health;
+        let recovering = health_severity(metric_health) < health_severity(current);
+        let enough_successes = state.recovery_successes >= recovery_threshold(current);
+        state.health = if recovering && !enough_successes {
+            current
+        } else {
+            metric_health
+        };
     }
 
     /// Periodic update (call from timer).
@@ -1037,5 +1090,48 @@ impl std::fmt::Debug for Uplink {
             .field("loss", &format!("{:.1}%", self.loss_ratio() * 100.0))
             .field("priority", &self.priority_score())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_uplink() -> Uplink {
+        Uplink::new(UplinkConfig::default(), 1)
+    }
+
+    #[test]
+    fn degraded_uplink_requires_recovery_window_before_healthy() {
+        let uplink = test_uplink();
+
+        uplink.record_failure("one");
+        uplink.record_failure("two");
+        uplink.record_failure("three");
+        assert_eq!(uplink.health(), UplinkHealth::Degraded);
+
+        uplink.record_success();
+        assert_eq!(uplink.health(), UplinkHealth::Degraded);
+
+        uplink.record_success();
+        assert_eq!(uplink.health(), UplinkHealth::Degraded);
+
+        uplink.record_success();
+        assert_eq!(uplink.health(), UplinkHealth::Healthy);
+        assert_eq!(uplink.state().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn periodic_update_does_not_bypass_recovery_window() {
+        let uplink = test_uplink();
+
+        uplink.record_failure("one");
+        uplink.record_failure("two");
+        uplink.record_failure("three");
+        uplink.record_success();
+
+        uplink.periodic_update();
+
+        assert_eq!(uplink.health(), UplinkHealth::Degraded);
     }
 }

@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use futures::future::join_all;
+use futures::{
+    future::join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
@@ -19,6 +22,7 @@ use crate::crypto::{KeyPair, NoiseSession, PublicKey};
 use crate::error::{Error, Result};
 use crate::protocol::{Packet, PacketFlags, PacketType};
 use crate::transport::{connect, Transport, TransportConfig};
+use crate::tun::IpPacket;
 use crate::types::{
     ConnectionId, ConnectionState, SequenceNumber, SessionId, TrafficStats, UplinkHealth, UplinkId,
 };
@@ -104,6 +108,18 @@ pub struct MultipathConfig {
     /// Aggregator configuration for bandwidth aggregation.
     #[serde(default)]
     pub aggregator: AggregatorConfig,
+
+    /// Enable selective redundancy for latency-sensitive or connection-critical packets.
+    #[serde(default = "default_hedged_packets")]
+    pub hedged_packets: bool,
+
+    /// Maximum copies for a hedged packet, including the primary send.
+    #[serde(default = "default_hedged_max_copies")]
+    pub hedged_max_copies: usize,
+
+    /// Payloads at or below this size are treated as interactive and hedged.
+    #[serde(default = "default_hedged_small_packet_threshold")]
+    pub hedged_small_packet_threshold: usize,
 }
 
 fn default_throughput_optimization() -> bool {
@@ -114,6 +130,15 @@ fn default_bandwidth_probe_interval() -> Duration {
 }
 fn default_aggregation_mode() -> AggregationMode {
     AggregationMode::None
+}
+fn default_hedged_packets() -> bool {
+    true
+}
+fn default_hedged_max_copies() -> usize {
+    2
+}
+fn default_hedged_small_packet_threshold() -> usize {
+    256
 }
 
 fn default_max_uplinks() -> usize {
@@ -162,6 +187,9 @@ impl Default for MultipathConfig {
             bandwidth_probe_interval: default_bandwidth_probe_interval(),
             aggregation_mode: AggregationMode::default(),
             aggregator: AggregatorConfig::default(),
+            hedged_packets: default_hedged_packets(),
+            hedged_max_copies: default_hedged_max_copies(),
+            hedged_small_packet_threshold: default_hedged_small_packet_threshold(),
         }
     }
 }
@@ -194,6 +222,15 @@ pub enum MultipathEvent {
         /// Path diversity score (0.0 - 1.0).
         diversity_score: f64,
     },
+    /// Flow bindings were repaired after a path degraded or failed.
+    PathRepaired {
+        /// Failed/degraded uplink numeric ID.
+        failed_uplink: u16,
+        /// Replacement uplink numeric ID, if one was available.
+        replacement_uplink: Option<u16>,
+        /// Number of flow bindings moved or cleared.
+        moved_flows: usize,
+    },
 }
 
 /// Pending packet for retry.
@@ -203,6 +240,17 @@ struct PendingPacket {
     sent_at: Instant,
     retries: u32,
     uplink_id: u16,
+}
+
+enum ReceiveLoopEvent {
+    Packet {
+        uplink_id: u16,
+        uplink_name: UplinkId,
+        data: Vec<u8>,
+    },
+    Stopped {
+        uplink_id: u16,
+    },
 }
 
 /// Sliding window for packet deduplication with O(1) operations.
@@ -400,6 +448,8 @@ impl MultipathManager {
     pub fn remove_uplink(&self, id: u16) -> Option<Arc<Uplink>> {
         if let Some((_, uplink)) = self.uplinks.remove(&id) {
             self.uplink_ids.remove(uplink.id());
+            self.clear_flow_bindings_for_uplink(id);
+            uplink.set_connection_state(ConnectionState::Disconnected);
 
             // Unregister from throughput optimizer
             if self.config.throughput_optimization {
@@ -412,6 +462,162 @@ impl MultipathManager {
             Some(uplink)
         } else {
             None
+        }
+    }
+
+    /// Remove all uplinks associated with an interface.
+    pub fn remove_uplinks_for_interface(&self, interface: &str) -> Vec<Arc<Uplink>> {
+        let ids: Vec<_> = self
+            .uplinks
+            .iter()
+            .filter(|entry| entry.value().config().interface.as_deref() == Some(interface))
+            .map(|entry| *entry.key())
+            .collect();
+
+        ids.into_iter()
+            .filter_map(|id| self.remove_uplink(id))
+            .collect()
+    }
+
+    /// Add one uplink and immediately connect it if possible.
+    pub async fn add_and_connect_uplink(
+        &self,
+        config: UplinkConfig,
+        remote_public: &PublicKey,
+    ) -> Result<u16> {
+        if let Some(existing_id) = self.uplink_ids.get(&config.id).map(|id| *id) {
+            if let Some(existing) = self.get_uplink(existing_id) {
+                if existing.config().local_addr == config.local_addr
+                    && existing.config().remote_addr == config.remote_addr
+                    && existing.config().protocol == config.protocol
+                {
+                    if existing.state().connection_state != ConnectionState::Connected {
+                        if let Err(e) = self.connect_uplink(&existing, remote_public).await {
+                            existing.record_failure(&e.to_string());
+                            return Err(e);
+                        }
+                        self.send_fast_probe(existing_id).await;
+                    }
+                    return Ok(existing_id);
+                }
+
+                self.remove_uplink(existing_id);
+            }
+        }
+
+        let id = self.add_uplink(config)?;
+        if let Some(uplink) = self.get_uplink(id) {
+            if let Err(e) = self.connect_uplink(&uplink, remote_public).await {
+                uplink.record_failure(&e.to_string());
+                return Err(e);
+            }
+            self.send_fast_probe(id).await;
+        }
+
+        if self
+            .uplinks
+            .iter()
+            .any(|entry| entry.value().state().connection_state == ConnectionState::Connected)
+        {
+            *self.state.write() = ConnectionState::Connected;
+        }
+
+        Ok(id)
+    }
+
+    fn clear_flow_bindings_for_uplink(&self, uplink_id: u16) {
+        self.flow_bindings.retain(|_, bound| *bound != uplink_id);
+    }
+
+    /// Move flow bindings off a degraded/failed path and quickly probe the replacement.
+    async fn repair_uplink_paths(&self, failed_uplink: u16) {
+        let replacement = self.select_repair_uplink(failed_uplink);
+        let affected_flows: Vec<u64> = self
+            .flow_bindings
+            .iter()
+            .filter(|entry| *entry.value() == failed_uplink)
+            .map(|entry| *entry.key())
+            .collect();
+
+        if affected_flows.is_empty() {
+            if let Some(replacement) = replacement {
+                self.send_fast_probe(replacement).await;
+            }
+            return;
+        }
+
+        match replacement {
+            Some(replacement) => {
+                for flow_id in &affected_flows {
+                    self.flow_bindings.insert(*flow_id, replacement);
+                }
+
+                self.send_fast_probe(replacement).await;
+
+                tracing::info!(
+                    failed_uplink,
+                    replacement_uplink = replacement,
+                    moved_flows = affected_flows.len(),
+                    "Repaired flow bindings after uplink degradation"
+                );
+            }
+            None => {
+                for flow_id in &affected_flows {
+                    self.flow_bindings.remove(flow_id);
+                }
+
+                tracing::warn!(
+                    failed_uplink,
+                    moved_flows = affected_flows.len(),
+                    "Cleared flow bindings after uplink degradation; no replacement path available"
+                );
+            }
+        }
+
+        let _ = self.event_tx.send(MultipathEvent::PathRepaired {
+            failed_uplink,
+            replacement_uplink: replacement,
+            moved_flows: affected_flows.len(),
+        });
+    }
+
+    fn select_repair_uplink(&self, failed_uplink: u16) -> Option<u16> {
+        self.uplinks
+            .iter()
+            .filter(|entry| *entry.key() != failed_uplink)
+            .filter(|entry| entry.value().is_usable())
+            .max_by_key(|entry| entry.value().priority_score())
+            .map(|entry| *entry.key())
+    }
+
+    async fn send_fast_probe(&self, uplink_id: u16) {
+        let Some(uplink) = self.get_uplink(uplink_id) else {
+            return;
+        };
+        let Some(transport) = uplink.get_transport() else {
+            return;
+        };
+
+        let seq = SequenceNumber(self.next_seq.fetch_add(1, Ordering::SeqCst));
+        let Ok(ping) = Packet::ping(seq, self.session_id, uplink.numeric_id()) else {
+            return;
+        };
+        let Ok(encoded) = ping.encode() else {
+            return;
+        };
+
+        if let Err(e) = transport.send(&encoded).await {
+            tracing::debug!(
+                uplink = %uplink.id(),
+                error = %e,
+                "Fast path repair probe failed"
+            );
+            uplink.record_failure(&e.to_string());
+        } else {
+            tracing::trace!(
+                uplink = %uplink.id(),
+                "Sent fast path repair probe"
+            );
         }
     }
 
@@ -712,6 +918,7 @@ impl MultipathManager {
                 }
                 Err(e) => {
                     uplink.record_failure(&e.to_string());
+                    self.repair_uplink_paths(uplink_id).await;
 
                     // Try fallback to another uplink
                     self.send_aggregated_fallback(data, uplink_id).await
@@ -763,7 +970,7 @@ impl MultipathManager {
         let uplinks = self.uplinks();
 
         // If we have a bound uplink that's still usable, use it
-        let selected = if let Some(uplink_id) = bound_uplink {
+        let mut selected = if let Some(uplink_id) = bound_uplink {
             if self.get_uplink(uplink_id).is_some_and(|u| u.is_usable()) {
                 vec![uplink_id]
             } else {
@@ -787,6 +994,12 @@ impl MultipathManager {
             selection
         };
 
+        let hedge_packet = self.should_hedge_packet(data)
+            && self.config.scheduler.strategy != super::SchedulingStrategy::Redundant;
+        if hedge_packet {
+            self.extend_with_hedged_uplinks(&mut selected);
+        }
+
         if selected.is_empty() {
             return Err(Error::NoAvailableUplinks);
         }
@@ -794,6 +1007,8 @@ impl MultipathManager {
         // Send on selected uplinks
         let mut last_error = None;
         let mut sent = false;
+        let send_all_selected =
+            self.config.scheduler.strategy == super::SchedulingStrategy::Redundant || hedge_packet;
 
         for uplink_id in &selected {
             if let Some(uplink) = self.get_uplink(*uplink_id) {
@@ -817,13 +1032,14 @@ impl MultipathManager {
                                 .record_send(*uplink_id, data.len() as u64);
                         }
 
-                        // For non-redundant strategies, stop after first success
-                        if self.config.scheduler.strategy != super::SchedulingStrategy::Redundant {
+                        // For normal single-path strategies, stop after first success.
+                        if !send_all_selected {
                             break;
                         }
                     }
                     Err(e) => {
                         uplink.record_failure(&e.to_string());
+                        self.repair_uplink_paths(*uplink_id).await;
 
                         // Record MTU failure if applicable
                         if self.config.throughput_optimization
@@ -851,6 +1067,39 @@ impl MultipathManager {
             Err(e)
         } else {
             Err(Error::NoAvailableUplinks)
+        }
+    }
+
+    fn should_hedge_packet(&self, data: &[u8]) -> bool {
+        self.config.hedged_packets
+            && is_hedged_packet(data, self.config.hedged_small_packet_threshold)
+    }
+
+    fn extend_with_hedged_uplinks(&self, selected: &mut Vec<u16>) {
+        let target_copies = self.config.hedged_max_copies.max(1);
+        if selected.len() >= target_copies {
+            return;
+        }
+
+        let mut candidates: Vec<_> = self
+            .uplinks()
+            .into_iter()
+            .filter(|uplink| {
+                uplink.is_usable() && uplink.can_send() && !selected.contains(&uplink.numeric_id())
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| {
+            hedge_uplink_score(b)
+                .partial_cmp(&hedge_uplink_score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        for uplink in candidates {
+            if selected.len() >= target_copies {
+                break;
+            }
+            selected.push(uplink.numeric_id());
         }
     }
 
@@ -1030,9 +1279,6 @@ impl MultipathManager {
     /// Receive data from any uplink.
     /// Returns the decrypted payload and the uplink ID it came from.
     pub async fn recv(&self) -> Result<(Vec<u8>, u16)> {
-        let mut buf = vec![0u8; 65536];
-
-        // Try to receive from any connected uplink
         let uplinks: Vec<_> = self
             .uplinks
             .iter()
@@ -1044,32 +1290,101 @@ impl MultipathManager {
             return Err(Error::NoAvailableUplinks);
         }
 
-        // Simple approach: try each uplink in sequence with a short timeout
-        // A more sophisticated approach would use select! to wait on all simultaneously
-        for uplink in &uplinks {
-            if let Some(transport) = uplink.get_transport() {
-                match tokio::time::timeout(Duration::from_millis(100), transport.recv(&mut buf))
-                    .await
-                {
-                    Ok(Ok(len)) => {
-                        // Decode and handle the packet
-                        if let Some(payload) =
-                            self.handle_packet(&buf[..len], uplink.numeric_id())?
-                        {
-                            return Ok((payload, uplink.numeric_id()));
+        let mut receives = FuturesUnordered::new();
+        for uplink in uplinks {
+            receives.push(Self::recv_once_from_uplink(uplink));
+        }
+
+        while let Some((uplink, uplink_id, uplink_name, result)) = receives.next().await {
+            match result {
+                Ok(data) => {
+                    let ack_sequence = self.data_sequence_to_ack(&data)?;
+                    let payload = self.handle_packet(&data, uplink_id)?;
+
+                    if let Some(sequence) = ack_sequence {
+                        if let Err(e) = self.send_ack(uplink_id, sequence).await {
+                            tracing::debug!(
+                                uplink = %uplink_name,
+                                sequence,
+                                error = %e,
+                                "Failed to send ACK"
+                            );
                         }
                     }
-                    Ok(Err(e)) => {
-                        tracing::debug!(uplink = %uplink.id(), error = %e, "Receive error");
+
+                    if let Some(payload) = payload {
+                        return Ok((payload, uplink_id));
                     }
-                    Err(_) => {
-                        // Timeout, try next uplink
+
+                    if uplink.is_usable() {
+                        receives.push(Self::recv_once_from_uplink(uplink));
                     }
+                }
+                Err(e) => {
+                    tracing::debug!(uplink = %uplink_name, error = %e, "Receive error");
+                    if let Some(uplink) = self.get_uplink(uplink_id) {
+                        uplink.record_failure(&e.to_string());
+                    }
+                    self.repair_uplink_paths(uplink_id).await;
                 }
             }
         }
 
         Err(Error::NoAvailableUplinks)
+    }
+
+    async fn recv_once_from_uplink(
+        uplink: Arc<Uplink>,
+    ) -> (Arc<Uplink>, u16, UplinkId, Result<Vec<u8>>) {
+        let uplink_id = uplink.numeric_id();
+        let uplink_name = uplink.id().clone();
+        let mut buf = vec![0u8; 65536];
+        let result = uplink.recv(&mut buf).await;
+        (
+            uplink,
+            uplink_id,
+            uplink_name,
+            result.map(|len| buf[..len].to_vec()),
+        )
+    }
+
+    fn data_sequence_to_ack(&self, data: &[u8]) -> Result<Option<u64>> {
+        let packet = Packet::decode(data)?;
+        if packet.header.session_id != self.session_id {
+            return Err(Error::Protocol(
+                crate::error::ProtocolError::InvalidVersion {
+                    expected: 0,
+                    got: 1,
+                },
+            ));
+        }
+
+        Ok((packet.header.packet_type == PacketType::Data).then_some(packet.header.sequence.0))
+    }
+
+    async fn send_ack(&self, uplink_id: u16, acked_sequence: u64) -> Result<()> {
+        let uplink = self
+            .get_uplink(uplink_id)
+            .ok_or(Error::NoAvailableUplinks)?;
+        let transport = uplink.get_transport().ok_or_else(|| {
+            Error::Transport(crate::error::TransportError::SendFailed(
+                "no transport".into(),
+            ))
+        })?;
+
+        let seq = SequenceNumber(self.next_seq.fetch_add(1, Ordering::SeqCst));
+        let packet = Packet::ack(seq, self.session_id, uplink.numeric_id(), &[acked_sequence])?;
+        let encoded = packet.encode()?;
+
+        transport.send(&encoded).await?;
+
+        tracing::trace!(
+            uplink = %uplink.id(),
+            sequence = acked_sequence,
+            "Sent ACK"
+        );
+
+        Ok(())
     }
 
     /// Start the receive loop in a background task.
@@ -1079,57 +1394,90 @@ impl MultipathManager {
         let manager = Arc::clone(self);
 
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
+            let (receive_tx, mut receive_rx) = mpsc::channel(256);
+            let mut spawned = HashSet::new();
+            let mut scan_interval = tokio::time::interval(Duration::from_millis(250));
 
             loop {
-                if *manager.state.read() != ConnectionState::Connected {
-                    break;
-                }
+                tokio::select! {
+                    _ = scan_interval.tick() => {
+                        if *manager.state.read() != ConnectionState::Connected {
+                            break;
+                        }
 
-                // Get usable uplinks
-                let uplinks: Vec<_> = manager
-                    .uplinks
-                    .iter()
-                    .filter(|r| r.value().is_usable())
-                    .map(|r| r.value().clone())
-                    .collect();
-
-                if uplinks.is_empty() {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-
-                // Try to receive from any uplink
-                for uplink in &uplinks {
-                    if let Some(transport) = uplink.get_transport() {
-                        match tokio::time::timeout(
-                            Duration::from_millis(50),
-                            transport.recv(&mut buf),
-                        )
-                        .await
+                        for uplink in manager
+                            .uplinks
+                            .iter()
+                            .filter(|entry| entry.value().is_usable())
+                            .map(|entry| entry.value().clone())
                         {
-                            Ok(Ok(len)) => {
-                                match manager.handle_packet(&buf[..len], uplink.numeric_id()) {
-                                    Ok(Some(payload)) => {
-                                        if tx.send((payload, uplink.numeric_id())).await.is_err() {
-                                            return; // Channel closed
-                                        }
-                                    }
-                                    Ok(None) => {} // Control packet, no data
+                            let uplink_id = uplink.numeric_id();
+                            if spawned.insert(uplink_id) {
+                                Self::spawn_uplink_recv_task(
+                                    Arc::clone(&manager),
+                                    uplink,
+                                    receive_tx.clone(),
+                                );
+                            }
+                        }
+                    }
+                    event = receive_rx.recv() => {
+                        match event {
+                            Some(ReceiveLoopEvent::Packet { uplink_id, uplink_name, data }) => {
+                                let ack_sequence = match manager.data_sequence_to_ack(&data) {
+                                    Ok(sequence) => sequence,
                                     Err(e) => {
                                         tracing::debug!(
-                                            uplink = %uplink.id(),
+                                            uplink = %uplink_name,
+                                            error = %e,
+                                            "Packet decode error"
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                match manager.handle_packet(&data, uplink_id) {
+                                    Ok(Some(payload)) => {
+                                        if let Some(sequence) = ack_sequence {
+                                            if let Err(e) = manager.send_ack(uplink_id, sequence).await {
+                                                tracing::debug!(
+                                                    uplink = %uplink_name,
+                                                    sequence,
+                                                    error = %e,
+                                                    "Failed to send ACK"
+                                                );
+                                            }
+                                        }
+
+                                        if tx.send((payload, uplink_id)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        if let Some(sequence) = ack_sequence {
+                                            if let Err(e) = manager.send_ack(uplink_id, sequence).await {
+                                                tracing::debug!(
+                                                    uplink = %uplink_name,
+                                                    sequence,
+                                                    error = %e,
+                                                    "Failed to send ACK"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            uplink = %uplink_name,
                                             error = %e,
                                             "Packet handling error"
                                         );
                                     }
                                 }
                             }
-                            Ok(Err(e)) => {
-                                tracing::debug!(uplink = %uplink.id(), error = %e, "Receive error");
-                                uplink.record_failure(&e.to_string());
+                            Some(ReceiveLoopEvent::Stopped { uplink_id }) => {
+                                spawned.remove(&uplink_id);
                             }
-                            Err(_) => {} // Timeout, try next
+                            None => break,
                         }
                     }
                 }
@@ -1137,6 +1485,51 @@ impl MultipathManager {
         });
 
         rx
+    }
+
+    fn spawn_uplink_recv_task(
+        manager: Arc<Self>,
+        uplink: Arc<Uplink>,
+        receive_tx: mpsc::Sender<ReceiveLoopEvent>,
+    ) {
+        tokio::spawn(async move {
+            let uplink_id = uplink.numeric_id();
+            let uplink_name = uplink.id().clone();
+            let mut buf = vec![0u8; 65536];
+
+            loop {
+                if *manager.state.read() != ConnectionState::Connected || !uplink.is_usable() {
+                    break;
+                }
+
+                match tokio::time::timeout(Duration::from_secs(1), uplink.recv(&mut buf)).await {
+                    Ok(Ok(len)) => {
+                        if receive_tx
+                            .send(ReceiveLoopEvent::Packet {
+                                uplink_id,
+                                uplink_name: uplink_name.clone(),
+                                data: buf[..len].to_vec(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(uplink = %uplink_name, error = %e, "Receive error");
+                        uplink.record_failure(&e.to_string());
+                        manager.repair_uplink_paths(uplink_id).await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            let _ = receive_tx
+                .send(ReceiveLoopEvent::Stopped { uplink_id })
+                .await;
+        });
     }
 
     /// Handle ACK packet.
@@ -1258,6 +1651,7 @@ impl MultipathManager {
             // Record loss on previous uplink
             if let Some(old_uplink) = self.get_uplink(old_uplink_id) {
                 old_uplink.record_loss();
+                self.repair_uplink_paths(old_uplink_id).await;
             }
 
             // Select new uplink (prefer different one from the failed one)
@@ -1272,40 +1666,56 @@ impl MultipathManager {
                 .or_else(|| selected.first().copied());
 
             if let Some(new_uplink_id) = new_uplink_id {
-                if let Some(uplink) = self.get_uplink(new_uplink_id) {
-                    // Actually send the packet through the new uplink
-                    match self
-                        .send_on_uplink(&uplink, SequenceNumber(seq), &data)
-                        .await
-                    {
-                        Ok(_) => {
-                            tracing::debug!(
-                                seq = seq,
-                                old_uplink = old_uplink_id,
-                                new_uplink = new_uplink_id,
-                                "Retransmitted packet on different uplink"
-                            );
+                let mut retry_uplinks = vec![new_uplink_id];
+                if self.config.hedged_packets {
+                    self.extend_with_hedged_uplinks(&mut retry_uplinks);
+                }
 
-                            // Update pending entry
-                            if let Some(mut entry) = self.pending.get_mut(&seq) {
-                                entry.retries += 1;
-                                entry.uplink_id = new_uplink_id;
-                                entry.sent_at = Instant::now();
+                let mut sent_on = None;
+                let mut attempted = false;
+                for retry_uplink_id in retry_uplinks {
+                    if let Some(uplink) = self.get_uplink(retry_uplink_id) {
+                        attempted = true;
+                        match self
+                            .send_on_uplink(&uplink, SequenceNumber(seq), &data)
+                            .await
+                        {
+                            Ok(_) => {
+                                sent_on = Some(retry_uplink_id);
+                                tracing::debug!(
+                                    seq = seq,
+                                    old_uplink = old_uplink_id,
+                                    new_uplink = retry_uplink_id,
+                                    "Retransmitted packet"
+                                );
                             }
+                            Err(e) => {
+                                tracing::warn!(
+                                    seq = seq,
+                                    uplink = %uplink.id(),
+                                    error = %e,
+                                    "Retry failed"
+                                );
+                                uplink.record_failure(&e.to_string());
+                                self.repair_uplink_paths(retry_uplink_id).await;
+                            }
+                        }
+                    }
+                }
 
-                            // Record as retransmission
-                            let mut stats = self.stats.write();
-                            stats.packets_retransmitted += 1;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                seq = seq,
-                                uplink = %uplink.id(),
-                                error = %e,
-                                "Retry failed"
-                            );
-                            uplink.record_failure(&e.to_string());
-                        }
+                if let Some(sent_uplink_id) = sent_on {
+                    if let Some(mut entry) = self.pending.get_mut(&seq) {
+                        entry.retries += 1;
+                        entry.uplink_id = sent_uplink_id;
+                        entry.sent_at = Instant::now();
+                    }
+
+                    let mut stats = self.stats.write();
+                    stats.packets_retransmitted += 1;
+                } else if attempted {
+                    if let Some(mut entry) = self.pending.get_mut(&seq) {
+                        entry.retries += 1;
+                        entry.sent_at = Instant::now();
                     }
                 }
             }
@@ -1314,11 +1724,14 @@ impl MultipathManager {
         // Fail packets that exceeded retries
         for seq in to_fail {
             if let Some((_, pending)) = self.pending.remove(&seq) {
-                let mut stats = self.stats.write();
-                stats.packets_dropped += 1;
+                {
+                    let mut stats = self.stats.write();
+                    stats.packets_dropped += 1;
+                }
 
                 if let Some(uplink) = self.get_uplink(pending.uplink_id) {
                     uplink.record_loss();
+                    self.repair_uplink_paths(pending.uplink_id).await;
                 }
 
                 tracing::warn!(
@@ -1929,9 +2342,30 @@ impl std::fmt::Debug for MultipathManager {
     }
 }
 
+fn is_hedged_packet(data: &[u8], small_packet_threshold: usize) -> bool {
+    if data.len() <= small_packet_threshold {
+        return true;
+    }
+
+    let Ok(packet) = IpPacket::parse(data) else {
+        return false;
+    };
+
+    packet.is_dns() || packet.is_tcp_syn() || packet.is_tcp_fin_or_rst()
+}
+
+fn hedge_uplink_score(uplink: &Uplink) -> f64 {
+    let health = uplink.health().priority_modifier();
+    let rtt_penalty = uplink.rtt().as_millis() as f64;
+    let loss_penalty = uplink.loss_ratio() * 10_000.0;
+
+    health * 10_000.0 - rtt_penalty - loss_penalty
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::TransportProtocol;
 
     #[test]
     fn test_dedup_new_sequences() {
@@ -1976,5 +2410,136 @@ mod tests {
         assert!(window.is_duplicate(3));
         assert!(window.is_duplicate(7));
         assert!(window.is_duplicate(1));
+    }
+
+    #[test]
+    fn hedged_packet_classifier_matches_interactive_packets() {
+        assert!(is_hedged_packet(b"ping", 8));
+        assert!(!is_hedged_packet(&vec![0xaa; 512], 8));
+
+        let mut dns_packet = vec![0u8; 32];
+        dns_packet[0] = 0x45;
+        dns_packet[2..4].copy_from_slice(&32u16.to_be_bytes());
+        dns_packet[8] = 64;
+        dns_packet[9] = 17;
+        dns_packet[12..16].copy_from_slice(&[10, 77, 0, 2]);
+        dns_packet[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        dns_packet[20..22].copy_from_slice(&49152u16.to_be_bytes());
+        dns_packet[22..24].copy_from_slice(&53u16.to_be_bytes());
+        dns_packet[24..26].copy_from_slice(&12u16.to_be_bytes());
+        dns_packet[28..32].copy_from_slice(b"dns?");
+
+        assert!(is_hedged_packet(&dns_packet, 0));
+
+        let tcp_syn = [
+            0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0xc0, 0xa8,
+            0x01, 0x01, 0x08, 0x08, 0x08, 0x08, 0x04, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        assert!(is_hedged_packet(&tcp_syn, 0));
+    }
+
+    #[test]
+    fn hedging_extends_selection_with_backup_uplink() {
+        let mut config = MultipathConfig::default();
+        config.hedged_packets = true;
+        config.hedged_max_copies = 2;
+        let manager = MultipathManager::new(config, KeyPair::generate());
+
+        let primary_id = manager
+            .add_uplink(UplinkConfig {
+                id: UplinkId::new("primary"),
+                remote_addr: "127.0.0.1:10000".parse().unwrap(),
+                protocol: TransportProtocol::Udp,
+                ..Default::default()
+            })
+            .unwrap();
+        let backup_id = manager
+            .add_uplink(UplinkConfig {
+                id: UplinkId::new("backup"),
+                remote_addr: "127.0.0.1:10001".parse().unwrap(),
+                protocol: TransportProtocol::Udp,
+                ..Default::default()
+            })
+            .unwrap();
+
+        manager
+            .get_uplink(primary_id)
+            .unwrap()
+            .set_connection_state(ConnectionState::Connected);
+        manager
+            .get_uplink(backup_id)
+            .unwrap()
+            .set_connection_state(ConnectionState::Connected);
+
+        let mut selected = vec![primary_id];
+        manager.extend_with_hedged_uplinks(&mut selected);
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&primary_id));
+        assert!(selected.contains(&backup_id));
+    }
+
+    #[tokio::test]
+    async fn path_repair_moves_flow_bindings_to_usable_replacement() {
+        let manager = MultipathManager::new(MultipathConfig::default(), KeyPair::generate());
+
+        let failed_id = manager
+            .add_uplink(UplinkConfig {
+                id: UplinkId::new("failed"),
+                remote_addr: "127.0.0.1:10000".parse().unwrap(),
+                protocol: TransportProtocol::Udp,
+                ..Default::default()
+            })
+            .unwrap();
+        let replacement_id = manager
+            .add_uplink(UplinkConfig {
+                id: UplinkId::new("replacement"),
+                remote_addr: "127.0.0.1:10001".parse().unwrap(),
+                protocol: TransportProtocol::Udp,
+                ..Default::default()
+            })
+            .unwrap();
+
+        manager
+            .get_uplink(failed_id)
+            .unwrap()
+            .set_connection_state(ConnectionState::Connected);
+        manager
+            .get_uplink(replacement_id)
+            .unwrap()
+            .set_connection_state(ConnectionState::Connected);
+
+        let flow_id = manager.allocate_flow_on_uplink(failed_id).unwrap();
+
+        manager.repair_uplink_paths(failed_id).await;
+
+        assert_eq!(manager.get_flow_binding(flow_id), Some(replacement_id));
+    }
+
+    #[tokio::test]
+    async fn path_repair_clears_flow_bindings_without_replacement() {
+        let manager = MultipathManager::new(MultipathConfig::default(), KeyPair::generate());
+
+        let failed_id = manager
+            .add_uplink(UplinkConfig {
+                id: UplinkId::new("failed"),
+                remote_addr: "127.0.0.1:10000".parse().unwrap(),
+                protocol: TransportProtocol::Udp,
+                ..Default::default()
+            })
+            .unwrap();
+
+        manager
+            .get_uplink(failed_id)
+            .unwrap()
+            .set_connection_state(ConnectionState::Connected);
+
+        let flow_id = manager.allocate_flow_on_uplink(failed_id).unwrap();
+
+        manager.repair_uplink_paths(failed_id).await;
+
+        assert_eq!(manager.get_flow_binding(flow_id), None);
     }
 }

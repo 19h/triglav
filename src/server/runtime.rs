@@ -1,13 +1,15 @@
 //! UDP server runtime shared by `triglav server` and `triglav-server`.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::time::timeout;
 use tracing::{debug, error, info};
 
 use crate::config::ServerConfig;
@@ -19,6 +21,7 @@ use crate::metrics::{
 };
 use crate::protocol::{Packet, PacketFlags, PacketType, HEADER_SIZE};
 use crate::server::{Signal, SignalHandler};
+use crate::tun::{IpPacket, IpTransportProtocol, IpVersion};
 use crate::types::{SequenceNumber, SessionId, TrafficStats};
 
 /// Options required to run a Triglav UDP server.
@@ -51,6 +54,8 @@ struct TransportSession {
     last_activity: RwLock<Instant>,
     stats: RwLock<TrafficStats>,
     user_id: RwLock<Option<String>>,
+    next_sequence: AtomicU64,
+    udp_flows: DashMap<UdpExitKey, Arc<UdpExitFlow>>,
 }
 
 impl TransportSession {
@@ -62,6 +67,8 @@ impl TransportSession {
             last_activity: RwLock::new(Instant::now()),
             stats: RwLock::new(TrafficStats::default()),
             user_id: RwLock::new(None),
+            next_sequence: AtomicU64::new(1),
+            udp_flows: DashMap::new(),
         }
     }
 
@@ -79,6 +86,30 @@ impl TransportSession {
             addrs.push(addr);
         }
     }
+
+    fn next_sequence(&self) -> SequenceNumber {
+        SequenceNumber(self.next_sequence.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UdpExitKey {
+    tunnel_src: IpAddr,
+    tunnel_src_port: u16,
+    remote_dst: IpAddr,
+    remote_dst_port: u16,
+}
+
+struct UdpExitFlow {
+    socket: Arc<UdpSocket>,
+    read_lock: Mutex<()>,
+}
+
+#[derive(Debug)]
+struct UdpExitDatagram {
+    key: UdpExitKey,
+    destination: SocketAddr,
+    payload: Vec<u8>,
 }
 
 /// UDP server runtime.
@@ -156,7 +187,7 @@ impl TriglavServer {
                             stats.bytes_received += data.len() as u64;
                         }
 
-                        if let Err(e) = self.handle_packet(&socket, &data, addr).await {
+                        if let Err(e) = self.handle_packet(Arc::clone(&socket), &data, addr).await {
                             debug!("Error handling packet from {}: {}", addr, e);
                             self.stats.write().packets_dropped += 1;
                             self.metrics.packets_dropped_total.with_label_values(&["server", "error"]).inc();
@@ -253,7 +284,12 @@ impl TriglavServer {
         }
     }
 
-    async fn handle_packet(&self, socket: &UdpSocket, data: &[u8], addr: SocketAddr) -> Result<()> {
+    async fn handle_packet(
+        &self,
+        socket: Arc<UdpSocket>,
+        data: &[u8],
+        addr: SocketAddr,
+    ) -> Result<()> {
         if data.len() < HEADER_SIZE {
             return Err(Error::InvalidPacket("Packet too short".into()));
         }
@@ -286,14 +322,14 @@ impl TriglavServer {
         match packet.header.packet_type {
             PacketType::Handshake => {
                 self.metrics.handshakes_total.inc();
-                self.handle_handshake(socket, &session, &packet, addr)
+                self.handle_handshake(&socket, &session, &packet, addr)
                     .await?;
             }
             PacketType::Data => {
-                self.handle_data(socket, &session, &packet, addr).await?;
+                self.handle_data(socket, session, &packet, addr).await?;
             }
             PacketType::Ping => {
-                self.handle_ping(socket, &session, &packet, addr).await?;
+                self.handle_ping(&socket, &session, &packet, addr).await?;
             }
             PacketType::Close => {
                 self.handle_close(&session, addr).await?;
@@ -321,7 +357,7 @@ impl TriglavServer {
 
         let response_packet = Packet::new(
             PacketType::Handshake,
-            packet.header.sequence.next(),
+            session.next_sequence(),
             session.id,
             packet.header.uplink_id,
             response,
@@ -336,8 +372,8 @@ impl TriglavServer {
 
     async fn handle_data(
         &self,
-        socket: &UdpSocket,
-        session: &TransportSession,
+        socket: Arc<UdpSocket>,
+        session: Arc<TransportSession>,
         packet: &Packet,
         addr: SocketAddr,
     ) -> Result<()> {
@@ -374,48 +410,229 @@ impl TriglavServer {
             session.id
         );
 
-        self.send_data(socket, session, &payload, packet.header.uplink_id, addr)
-            .await
-    }
+        self.send_ack(
+            &socket,
+            &session,
+            packet.header.sequence.0,
+            packet.header.uplink_id,
+            addr,
+        )
+        .await?;
 
-    async fn send_data(
-        &self,
-        socket: &UdpSocket,
-        session: &TransportSession,
-        payload: &[u8],
-        uplink_id: u16,
-        addr: SocketAddr,
-    ) -> Result<()> {
-        let (encrypted_payload, is_encrypted) = if let Some(ref mut noise) = *session.noise.write()
-        {
-            if noise.is_transport() {
-                self.metrics.encrypt_operations.inc();
-                (noise.encrypt(payload)?, true)
-            } else {
-                (payload.to_vec(), false)
+        let datagram = match parse_udp_datagram(&payload) {
+            Ok(Some(datagram)) => datagram,
+            Ok(None) => {
+                if let Some(response) = build_ipv4_protocol_unreachable(&payload)? {
+                    send_data_packet(
+                        &socket,
+                        &session,
+                        &self.metrics,
+                        &self.stats,
+                        &response,
+                        packet.header.uplink_id,
+                        addr,
+                    )
+                    .await?;
+                }
+                debug!(
+                    session = %session.id,
+                    "Rejected unsupported tunneled packet; UDP/IPv4 forwarding is available"
+                );
+                return Ok(());
             }
-        } else {
-            (payload.to_vec(), false)
+            Err(e) => {
+                debug!(error = %e, session = %session.id, "Dropping malformed tunneled packet");
+                return Ok(());
+            }
         };
 
-        let mut response =
-            Packet::data(SequenceNumber(1), session.id, uplink_id, encrypted_payload)?;
+        let flow = self
+            .get_or_create_udp_flow(&session, datagram.key.clone())
+            .await?;
+        let metrics = Arc::clone(&self.metrics);
+        let stats = Arc::clone(&self.stats);
+        let uplink_id = packet.header.uplink_id;
 
-        if is_encrypted {
-            response.set_flag(PacketFlags::ENCRYPTED);
-        }
-
-        self.send_packet(socket, &response, addr).await?;
-
-        {
-            let mut stats = session.stats.write();
-            stats.bytes_sent += payload.len() as u64;
-            stats.packets_sent += 1;
-        }
+        tokio::spawn(async move {
+            if let Err(e) = relay_udp_datagram(
+                socket, metrics, stats, session, flow, datagram, uplink_id, addr,
+            )
+            .await
+            {
+                debug!(error = %e, "UDP exit relay failed");
+            }
+        });
 
         Ok(())
     }
 
+    async fn get_or_create_udp_flow(
+        &self,
+        session: &TransportSession,
+        key: UdpExitKey,
+    ) -> Result<Arc<UdpExitFlow>> {
+        if let Some(flow) = session.udp_flows.get(&key) {
+            return Ok(flow.clone());
+        }
+
+        let bind_addr = match key.remote_dst {
+            IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            IpAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
+        };
+        let socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
+            Error::Transport(crate::error::TransportError::BindFailed {
+                addr: bind_addr,
+                reason: e.to_string(),
+            })
+        })?;
+
+        let flow = Arc::new(UdpExitFlow {
+            socket: Arc::new(socket),
+            read_lock: Mutex::new(()),
+        });
+
+        match session.udp_flows.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(existing) => Ok(existing.get().clone()),
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(flow.clone());
+                Ok(flow)
+            }
+        }
+    }
+
+    async fn send_ack(
+        &self,
+        socket: &UdpSocket,
+        session: &TransportSession,
+        acked_sequence: u64,
+        uplink_id: u16,
+        addr: SocketAddr,
+    ) -> Result<()> {
+        let ack = Packet::ack(
+            session.next_sequence(),
+            session.id,
+            uplink_id,
+            &[acked_sequence],
+        )?;
+
+        self.send_packet(socket, &ack, addr).await
+    }
+
+    async fn send_packet(
+        &self,
+        socket: &UdpSocket,
+        packet: &Packet,
+        addr: SocketAddr,
+    ) -> Result<()> {
+        send_packet_with_metrics(socket, packet, addr, &self.metrics, &self.stats).await
+    }
+}
+
+async fn send_data_packet(
+    socket: &UdpSocket,
+    session: &TransportSession,
+    metrics: &PrometheusMetrics,
+    server_stats: &RwLock<ServerStats>,
+    payload: &[u8],
+    uplink_id: u16,
+    addr: SocketAddr,
+) -> Result<()> {
+    let (encrypted_payload, is_encrypted) = if let Some(ref mut noise) = *session.noise.write() {
+        if noise.is_transport() {
+            metrics.encrypt_operations.inc();
+            (noise.encrypt(payload)?, true)
+        } else {
+            (payload.to_vec(), false)
+        }
+    } else {
+        (payload.to_vec(), false)
+    };
+
+    let mut response = Packet::data(
+        session.next_sequence(),
+        session.id,
+        uplink_id,
+        encrypted_payload,
+    )?;
+
+    if is_encrypted {
+        response.set_flag(PacketFlags::ENCRYPTED);
+    }
+
+    send_packet_with_metrics(socket, &response, addr, metrics, server_stats).await?;
+
+    {
+        let mut stats = session.stats.write();
+        stats.bytes_sent += payload.len() as u64;
+        stats.packets_sent += 1;
+    }
+
+    Ok(())
+}
+
+async fn relay_udp_datagram(
+    client_socket: Arc<UdpSocket>,
+    metrics: Arc<PrometheusMetrics>,
+    server_stats: Arc<RwLock<ServerStats>>,
+    session: Arc<TransportSession>,
+    flow: Arc<UdpExitFlow>,
+    datagram: UdpExitDatagram,
+    uplink_id: u16,
+    client_addr: SocketAddr,
+) -> Result<()> {
+    let _read_guard = flow.read_lock.lock().await;
+
+    flow.socket
+        .send_to(&datagram.payload, datagram.destination)
+        .await
+        .map_err(|e| crate::error::TransportError::SendFailed(e.to_string()))?;
+
+    let mut buf = vec![0u8; 65535];
+    let deadline = Duration::from_secs(2);
+
+    loop {
+        let (len, response_addr) = match timeout(deadline, flow.socket.recv_from(&mut buf)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                return Err(crate::error::TransportError::ReceiveFailed(e.to_string()).into());
+            }
+            Err(_) => return Ok(()),
+        };
+
+        if response_addr.ip() != datagram.key.remote_dst
+            || response_addr.port() != datagram.key.remote_dst_port
+        {
+            debug!(
+                expected = %datagram.destination,
+                actual = %response_addr,
+                "Ignoring UDP response from unexpected endpoint"
+            );
+            continue;
+        }
+
+        let packet = build_udp_packet(
+            datagram.key.remote_dst,
+            datagram.key.tunnel_src,
+            datagram.key.remote_dst_port,
+            datagram.key.tunnel_src_port,
+            &buf[..len],
+        )?;
+
+        send_data_packet(
+            &client_socket,
+            &session,
+            &metrics,
+            &server_stats,
+            &packet,
+            uplink_id,
+            client_addr,
+        )
+        .await?;
+        return Ok(());
+    }
+}
+
+impl TriglavServer {
     async fn handle_ping(
         &self,
         socket: &UdpSocket,
@@ -424,7 +641,7 @@ impl TriglavServer {
         addr: SocketAddr,
     ) -> Result<()> {
         let pong = Packet::pong(
-            packet.header.sequence.next(),
+            session.next_sequence(),
             session.id,
             packet.header.uplink_id,
             packet.header.timestamp,
@@ -453,33 +670,399 @@ impl TriglavServer {
 
         Ok(())
     }
+}
 
-    async fn send_packet(
-        &self,
-        socket: &UdpSocket,
-        packet: &Packet,
-        addr: SocketAddr,
-    ) -> Result<()> {
-        let data = packet.encode()?;
+async fn send_packet_with_metrics(
+    socket: &UdpSocket,
+    packet: &Packet,
+    addr: SocketAddr,
+    metrics: &PrometheusMetrics,
+    stats: &RwLock<ServerStats>,
+) -> Result<()> {
+    let data = packet.encode()?;
 
-        socket
-            .send_to(&data, addr)
-            .await
-            .map_err(|e| crate::error::TransportError::SendFailed(e.to_string()))?;
+    socket
+        .send_to(&data, addr)
+        .await
+        .map_err(|e| crate::error::TransportError::SendFailed(e.to_string()))?;
 
-        self.stats.write().packets_sent += 1;
-        self.stats.write().bytes_sent += data.len() as u64;
+    stats.write().packets_sent += 1;
+    stats.write().bytes_sent += data.len() as u64;
 
-        self.metrics
-            .packets_sent_total
-            .with_label_values(&["server"])
-            .inc();
-        self.metrics
-            .bytes_sent_total
-            .with_label_values(&["server"])
-            .inc_by(data.len() as u64);
+    metrics
+        .packets_sent_total
+        .with_label_values(&["server"])
+        .inc();
+    metrics
+        .bytes_sent_total
+        .with_label_values(&["server"])
+        .inc_by(data.len() as u64);
 
-        Ok(())
+    Ok(())
+}
+
+fn parse_udp_datagram(packet: &[u8]) -> Result<Option<UdpExitDatagram>> {
+    let parsed = IpPacket::parse(packet)?;
+    if parsed.protocol != IpTransportProtocol::Udp {
+        return Ok(None);
+    }
+
+    let src_port = match parsed.src_port {
+        Some(port) => port,
+        None => return Ok(None),
+    };
+    let dst_port = match parsed.dst_port {
+        Some(port) => port,
+        None => return Ok(None),
+    };
+
+    if parsed.total_len > packet.len() || parsed.header_len + 8 > parsed.total_len {
+        return Err(Error::InvalidPacket("Malformed UDP packet".into()));
+    }
+
+    let udp_len_offset = parsed.header_len + 4;
+    let udp_len = u16::from_be_bytes([packet[udp_len_offset], packet[udp_len_offset + 1]]) as usize;
+    if udp_len < 8 || parsed.header_len + udp_len > parsed.total_len {
+        return Err(Error::InvalidPacket("Malformed UDP length".into()));
+    }
+
+    Ok(Some(UdpExitDatagram {
+        key: UdpExitKey {
+            tunnel_src: parsed.src_addr,
+            tunnel_src_port: src_port,
+            remote_dst: parsed.dst_addr,
+            remote_dst_port: dst_port,
+        },
+        destination: SocketAddr::from((parsed.dst_addr, dst_port)),
+        payload: packet[parsed.header_len + 8..parsed.header_len + udp_len].to_vec(),
+    }))
+}
+
+fn build_udp_packet(
+    src_addr: IpAddr,
+    dst_addr: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    match (src_addr, dst_addr) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            build_ipv4_udp_packet(src, dst, src_port, dst_port, payload)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            build_ipv6_udp_packet(src, dst, src_port, dst_port, payload)
+        }
+        _ => Err(Error::InvalidPacket(
+            "UDP response address version mismatch".into(),
+        )),
+    }
+}
+
+fn build_ipv4_udp_packet(
+    src_addr: Ipv4Addr,
+    dst_addr: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let udp_len = 8usize
+        .checked_add(payload.len())
+        .ok_or_else(|| Error::InvalidPacket("UDP payload too large".into()))?;
+    let total_len = 20usize
+        .checked_add(udp_len)
+        .ok_or_else(|| Error::InvalidPacket("IPv4 packet too large".into()))?;
+
+    if udp_len > u16::MAX as usize || total_len > u16::MAX as usize {
+        return Err(Error::InvalidPacket("IPv4 UDP packet too large".into()));
+    }
+
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = IpTransportProtocol::Udp.protocol_number();
+    packet[12..16].copy_from_slice(&src_addr.octets());
+    packet[16..20].copy_from_slice(&dst_addr.octets());
+
+    let header_checksum = internet_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+
+    packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+    packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    packet[28..].copy_from_slice(payload);
+
+    let udp_checksum = udp_ipv4_checksum(src_addr, dst_addr, &packet[20..]);
+    packet[26..28].copy_from_slice(&udp_checksum.to_be_bytes());
+
+    Ok(packet)
+}
+
+fn build_ipv6_udp_packet(
+    src_addr: Ipv6Addr,
+    dst_addr: Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let udp_len = 8usize
+        .checked_add(payload.len())
+        .ok_or_else(|| Error::InvalidPacket("UDP payload too large".into()))?;
+    let total_len = 40usize
+        .checked_add(udp_len)
+        .ok_or_else(|| Error::InvalidPacket("IPv6 packet too large".into()))?;
+
+    if udp_len > u16::MAX as usize {
+        return Err(Error::InvalidPacket("IPv6 UDP packet too large".into()));
+    }
+
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    packet[6] = IpTransportProtocol::Udp.protocol_number();
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src_addr.octets());
+    packet[24..40].copy_from_slice(&dst_addr.octets());
+
+    packet[40..42].copy_from_slice(&src_port.to_be_bytes());
+    packet[42..44].copy_from_slice(&dst_port.to_be_bytes());
+    packet[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    packet[48..].copy_from_slice(payload);
+
+    let udp_checksum = udp_ipv6_checksum(src_addr, dst_addr, &packet[40..]);
+    packet[46..48].copy_from_slice(&udp_checksum.to_be_bytes());
+
+    Ok(packet)
+}
+
+fn build_ipv4_protocol_unreachable(original_packet: &[u8]) -> Result<Option<Vec<u8>>> {
+    let parsed = match IpPacket::parse(original_packet) {
+        Ok(packet) => packet,
+        Err(_) => return Ok(None),
+    };
+
+    if parsed.version != IpVersion::V4 {
+        return Ok(None);
+    }
+
+    let (src_addr, dst_addr) = match (parsed.src_addr, parsed.dst_addr) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => (src, dst),
+        _ => return Ok(None),
+    };
+
+    if parsed.total_len > original_packet.len() || parsed.header_len > parsed.total_len {
+        return Ok(None);
+    }
+
+    let quote_len = (parsed.header_len + 8).min(parsed.total_len);
+    let icmp_len = 8usize
+        .checked_add(quote_len)
+        .ok_or_else(|| Error::InvalidPacket("ICMP payload too large".into()))?;
+    let total_len = 20usize
+        .checked_add(icmp_len)
+        .ok_or_else(|| Error::InvalidPacket("IPv4 ICMP packet too large".into()))?;
+
+    if total_len > u16::MAX as usize {
+        return Err(Error::InvalidPacket("IPv4 ICMP packet too large".into()));
+    }
+
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = IpTransportProtocol::Icmp.protocol_number();
+    packet[12..16].copy_from_slice(&dst_addr.octets());
+    packet[16..20].copy_from_slice(&src_addr.octets());
+
+    let header_checksum = internet_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+
+    let icmp_offset = 20;
+    packet[icmp_offset] = 3;
+    packet[icmp_offset + 1] = 2;
+    packet[icmp_offset + 8..icmp_offset + 8 + quote_len]
+        .copy_from_slice(&original_packet[..quote_len]);
+
+    let icmp_checksum = internet_checksum(&packet[icmp_offset..]);
+    packet[icmp_offset + 2..icmp_offset + 4].copy_from_slice(&icmp_checksum.to_be_bytes());
+
+    Ok(Some(packet))
+}
+
+fn udp_ipv4_checksum(src_addr: Ipv4Addr, dst_addr: Ipv4Addr, udp_segment: &[u8]) -> u16 {
+    let mut data = Vec::with_capacity(12 + udp_segment.len() + (udp_segment.len() % 2));
+    data.extend_from_slice(&src_addr.octets());
+    data.extend_from_slice(&dst_addr.octets());
+    data.push(0);
+    data.push(IpTransportProtocol::Udp.protocol_number());
+    data.extend_from_slice(&(udp_segment.len() as u16).to_be_bytes());
+    data.extend_from_slice(udp_segment);
+    if data.len() % 2 != 0 {
+        data.push(0);
+    }
+
+    let checksum = internet_checksum(&data);
+    if checksum == 0 {
+        0xffff
+    } else {
+        checksum
+    }
+}
+
+fn udp_ipv6_checksum(src_addr: Ipv6Addr, dst_addr: Ipv6Addr, udp_segment: &[u8]) -> u16 {
+    let mut data = Vec::with_capacity(40 + udp_segment.len() + (udp_segment.len() % 2));
+    data.extend_from_slice(&src_addr.octets());
+    data.extend_from_slice(&dst_addr.octets());
+    data.extend_from_slice(&(udp_segment.len() as u32).to_be_bytes());
+    data.extend_from_slice(&[0, 0, 0]);
+    data.push(IpTransportProtocol::Udp.protocol_number());
+    data.extend_from_slice(udp_segment);
+    if data.len() % 2 != 0 {
+        data.push(0);
+    }
+
+    let checksum = internet_checksum(&data);
+    if checksum == 0 {
+        0xffff
+    } else {
+        checksum
+    }
+}
+
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = data.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(&byte) = chunks.remainder().first() {
+        sum += u16::from_be_bytes([byte, 0]) as u32;
+    }
+
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+
+    !(sum as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_ipv4_parser_extracts_exit_datagram() {
+        let packet = build_ipv4_udp_packet(
+            Ipv4Addr::new(10, 77, 0, 2),
+            Ipv4Addr::new(203, 0, 113, 10),
+            49152,
+            53,
+            b"hello",
+        )
+        .unwrap();
+
+        let datagram = parse_udp_datagram(&packet).unwrap().unwrap();
+
+        assert_eq!(
+            datagram.key.tunnel_src,
+            IpAddr::V4(Ipv4Addr::new(10, 77, 0, 2))
+        );
+        assert_eq!(datagram.key.tunnel_src_port, 49152);
+        assert_eq!(
+            datagram.key.remote_dst,
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))
+        );
+        assert_eq!(datagram.key.remote_dst_port, 53);
+        assert_eq!(
+            datagram.destination,
+            SocketAddr::from((Ipv4Addr::new(203, 0, 113, 10), 53))
+        );
+        assert_eq!(datagram.payload, b"hello");
+    }
+
+    #[test]
+    fn udp_ipv4_builder_creates_valid_reverse_packet() {
+        let packet = build_ipv4_udp_packet(
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(10, 77, 0, 2),
+            53,
+            49152,
+            b"world",
+        )
+        .unwrap();
+
+        assert_eq!(internet_checksum(&packet[..20]), 0);
+        assert_eq!(
+            udp_ipv4_checksum(
+                Ipv4Addr::new(8, 8, 8, 8),
+                Ipv4Addr::new(10, 77, 0, 2),
+                &packet[20..]
+            ),
+            0xffff
+        );
+
+        let parsed = IpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.version, IpVersion::V4);
+        assert_eq!(parsed.protocol, IpTransportProtocol::Udp);
+        assert_eq!(parsed.src_addr, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(parsed.dst_addr, IpAddr::V4(Ipv4Addr::new(10, 77, 0, 2)));
+        assert_eq!(parsed.src_port, Some(53));
+        assert_eq!(parsed.dst_port, Some(49152));
+        assert_eq!(parsed.payload(), b"world");
+    }
+
+    #[test]
+    fn udp_ipv6_parser_and_builder_round_trip() {
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 10);
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 20);
+        let packet = build_ipv6_udp_packet(src, dst, 53000, 53, b"hello6").unwrap();
+
+        let datagram = parse_udp_datagram(&packet).unwrap().unwrap();
+        assert_eq!(datagram.key.tunnel_src, IpAddr::V6(src));
+        assert_eq!(datagram.key.tunnel_src_port, 53000);
+        assert_eq!(datagram.key.remote_dst, IpAddr::V6(dst));
+        assert_eq!(datagram.key.remote_dst_port, 53);
+        assert_eq!(datagram.destination, SocketAddr::from((dst, 53)));
+        assert_eq!(datagram.payload, b"hello6");
+
+        let parsed = IpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.version, IpVersion::V6);
+        assert_eq!(parsed.protocol, IpTransportProtocol::Udp);
+        assert_eq!(parsed.src_addr, IpAddr::V6(src));
+        assert_eq!(parsed.dst_addr, IpAddr::V6(dst));
+        assert_eq!(parsed.src_port, Some(53000));
+        assert_eq!(parsed.dst_port, Some(53));
+        assert_eq!(parsed.payload(), b"hello6");
+        assert_eq!(udp_ipv6_checksum(src, dst, &packet[40..]), 0xffff);
+    }
+
+    #[test]
+    fn unsupported_ipv4_packet_builds_protocol_unreachable() {
+        let tcp_packet = [
+            0x45, 0x00, 0x00, 0x28, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0x0a, 0x4d,
+            0x00, 0x02, 0xcb, 0x00, 0x71, 0x0a, 0xc0, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let response = build_ipv4_protocol_unreachable(&tcp_packet)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(internet_checksum(&response[..20]), 0);
+
+        let parsed = IpPacket::parse(&response).unwrap();
+        assert_eq!(parsed.version, IpVersion::V4);
+        assert_eq!(parsed.protocol, IpTransportProtocol::Icmp);
+        assert_eq!(parsed.src_addr, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)));
+        assert_eq!(parsed.dst_addr, IpAddr::V4(Ipv4Addr::new(10, 77, 0, 2)));
+
+        let icmp = parsed.payload();
+        assert_eq!(icmp[0], 3);
+        assert_eq!(icmp[1], 2);
+        assert_eq!(internet_checksum(icmp), 0);
+        assert_eq!(&icmp[8..28], &tcp_packet[..20]);
     }
 }
 

@@ -16,14 +16,14 @@ use triglav::metrics::{start_client_status_server, ClientRuntimeConfig, TunnelRu
 
 use triglav::cli::*;
 use triglav::config::{init_logging, Config};
-use triglav::crypto::KeyPair;
+use triglav::crypto::{KeyPair, PublicKey};
 use triglav::error::Result;
 use triglav::multipath::{MultipathConfig, MultipathManager, UplinkConfig};
 use triglav::proxy::{HttpProxyConfig, HttpProxyServer, Socks5Config, Socks5Server};
 use triglav::transport::TransportProtocol;
 use triglav::tun::{NatConfig, RouteConfig, TunConfig, TunnelConfig, TunnelRunner};
 use triglav::types::AuthKey;
-use triglav::util;
+use triglav::util::{self, NetworkEvent, NetworkWatcher, NetworkWatcherConfig};
 use triglav::VERSION;
 
 #[tokio::main]
@@ -234,6 +234,139 @@ fn build_uplink_configs(interfaces: &[String], server_addrs: &[SocketAddr]) -> V
         .collect()
 }
 
+fn start_network_adaptation(
+    manager: Arc<MultipathManager>,
+    server_addrs: Vec<SocketAddr>,
+    remote_public: PublicKey,
+    auto_discover: bool,
+    configured_interfaces: Vec<String>,
+) -> Arc<NetworkWatcher> {
+    let watcher = Arc::new(NetworkWatcher::new(NetworkWatcherConfig::default()));
+    let mut event_rx = watcher.subscribe();
+
+    {
+        let watcher = Arc::clone(&watcher);
+        tokio::spawn(async move {
+            watcher.start().await;
+        });
+    }
+
+    tokio::spawn(async move {
+        while let Ok(event) = event_rx.recv().await {
+            handle_network_event(
+                Arc::clone(&manager),
+                &server_addrs,
+                remote_public.clone(),
+                auto_discover,
+                &configured_interfaces,
+                event,
+            )
+            .await;
+        }
+    });
+
+    watcher
+}
+
+async fn handle_network_event(
+    manager: Arc<MultipathManager>,
+    server_addrs: &[SocketAddr],
+    remote_public: PublicKey,
+    auto_discover: bool,
+    configured_interfaces: &[String],
+    event: NetworkEvent,
+) {
+    match event {
+        NetworkEvent::InterfaceAdded(interface) => {
+            if interface.is_up
+                && interface_is_allowed(auto_discover, configured_interfaces, &interface.name)
+            {
+                reconcile_interface(manager, server_addrs, remote_public, &interface.name).await;
+            }
+        }
+        NetworkEvent::InterfaceStateChanged { name, is_up, .. } => {
+            if !interface_is_allowed(auto_discover, configured_interfaces, &name) {
+                return;
+            }
+
+            if is_up {
+                reconcile_interface(manager, server_addrs, remote_public, &name).await;
+            } else {
+                remove_interface_uplinks(manager, &name);
+            }
+        }
+        NetworkEvent::AddressAdded { interface, .. } => {
+            if interface_is_allowed(auto_discover, configured_interfaces, &interface) {
+                reconcile_interface(manager, server_addrs, remote_public, &interface).await;
+            }
+        }
+        NetworkEvent::AddressRemoved { interface, .. }
+        | NetworkEvent::InterfaceRemoved(interface) => {
+            remove_interface_uplinks(manager, &interface);
+        }
+        NetworkEvent::GatewayChanged { interface, .. } => {
+            if let Some(interface) = interface {
+                if interface_is_allowed(auto_discover, configured_interfaces, &interface) {
+                    reconcile_interface(manager, server_addrs, remote_public, &interface).await;
+                }
+            }
+        }
+        NetworkEvent::ConnectivityChanged {
+            interface,
+            has_internet,
+        } => {
+            if !interface_is_allowed(auto_discover, configured_interfaces, &interface) {
+                return;
+            }
+
+            if has_internet {
+                reconcile_interface(manager, server_addrs, remote_public, &interface).await;
+            } else {
+                remove_interface_uplinks(manager, &interface);
+            }
+        }
+    }
+}
+
+fn interface_is_allowed(
+    auto_discover: bool,
+    configured_interfaces: &[String],
+    interface: &str,
+) -> bool {
+    auto_discover
+        || configured_interfaces.is_empty()
+        || configured_interfaces.iter().any(|i| i == interface)
+}
+
+async fn reconcile_interface(
+    manager: Arc<MultipathManager>,
+    server_addrs: &[SocketAddr],
+    remote_public: PublicKey,
+    interface: &str,
+) {
+    let interface = interface.to_string();
+    for config in build_uplink_configs(std::slice::from_ref(&interface), server_addrs) {
+        if let Err(e) = manager.add_and_connect_uplink(config, &remote_public).await {
+            tracing::debug!(
+                interface = %interface,
+                error = %e,
+                "Failed to add or reconnect uplink for interface"
+            );
+        }
+    }
+}
+
+fn remove_interface_uplinks(manager: Arc<MultipathManager>, interface: &str) {
+    let removed = manager.remove_uplinks_for_interface(interface);
+    if !removed.is_empty() {
+        tracing::info!(
+            interface,
+            uplinks = removed.len(),
+            "Removed uplinks for unavailable interface"
+        );
+    }
+}
+
 /// Start TUN tunnel (true VPN mode)
 async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
     println!(
@@ -362,6 +495,14 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
             return Err(e);
         }
     }
+
+    let _network_watcher = start_network_adaptation(
+        Arc::clone(runner.manager()),
+        server_addrs.to_vec(),
+        remote_public,
+        args.auto_discover,
+        args.interface.clone(),
+    );
 
     #[cfg(feature = "metrics")]
     let _client_status_server = start_client_status_server(
@@ -496,6 +637,14 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
             return Err(e);
         }
     }
+
+    let _network_watcher = start_network_adaptation(
+        Arc::clone(&manager),
+        server_addrs.to_vec(),
+        remote_public,
+        args.auto_discover,
+        args.interface.clone(),
+    );
 
     #[cfg(feature = "metrics")]
     let _client_status_server = start_client_status_server(

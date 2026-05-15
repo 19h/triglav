@@ -182,13 +182,19 @@ impl NetworkWatcher {
         old: &HashMap<String, Vec<NetworkInterface>>,
         new: &HashMap<String, Vec<NetworkInterface>>,
     ) {
+        Self::emit_diff_events_to(&self.event_tx, old, new);
+    }
+
+    fn emit_diff_events_to(
+        event_tx: &broadcast::Sender<NetworkEvent>,
+        old: &HashMap<String, Vec<NetworkInterface>>,
+        new: &HashMap<String, Vec<NetworkInterface>>,
+    ) {
         // Check for removed interfaces
         for name in old.keys() {
             if !new.contains_key(name) {
                 debug!("Interface removed: {}", name);
-                let _ = self
-                    .event_tx
-                    .send(NetworkEvent::InterfaceRemoved(name.clone()));
+                let _ = event_tx.send(NetworkEvent::InterfaceRemoved(name.clone()));
             }
         }
 
@@ -206,7 +212,7 @@ impl NetworkWatcher {
                         "Interface state changed: {} up={} running={}",
                         name, new_up, new_running
                     );
-                    let _ = self.event_tx.send(NetworkEvent::InterfaceStateChanged {
+                    let _ = event_tx.send(NetworkEvent::InterfaceStateChanged {
                         name: name.clone(),
                         is_up: new_up,
                         is_running: new_running,
@@ -221,7 +227,7 @@ impl NetworkWatcher {
 
                 for addr in new_addrs.difference(&old_addrs) {
                     debug!("Address added: {} on {}", addr, name);
-                    let _ = self.event_tx.send(NetworkEvent::AddressAdded {
+                    let _ = event_tx.send(NetworkEvent::AddressAdded {
                         interface: name.clone(),
                         address: *addr,
                     });
@@ -229,7 +235,7 @@ impl NetworkWatcher {
 
                 for addr in old_addrs.difference(&new_addrs) {
                     debug!("Address removed: {} from {}", addr, name);
-                    let _ = self.event_tx.send(NetworkEvent::AddressRemoved {
+                    let _ = event_tx.send(NetworkEvent::AddressRemoved {
                         interface: name.clone(),
                         address: *addr,
                     });
@@ -238,9 +244,7 @@ impl NetworkWatcher {
                 // New interface
                 if let Some(iface) = new_ifaces.first() {
                     info!("Interface added: {}", name);
-                    let _ = self
-                        .event_tx
-                        .send(NetworkEvent::InterfaceAdded(iface.clone()));
+                    let _ = event_tx.send(NetworkEvent::InterfaceAdded(iface.clone()));
                 }
             }
         }
@@ -284,20 +288,7 @@ impl NetworkWatcher {
                             old
                         };
 
-                        // Emit events for changes
-                        for name in old_state.keys() {
-                            if !new_state.contains_key(name) {
-                                let _ = event_tx.send(NetworkEvent::InterfaceRemoved(name.clone()));
-                            }
-                        }
-
-                        for (name, new_ifaces) in &new_state {
-                            if !old_state.contains_key(name) {
-                                if let Some(iface) = new_ifaces.first() {
-                                    let _ = event_tx.send(NetworkEvent::InterfaceAdded(iface.clone()));
-                                }
-                            }
-                        }
+                        Self::emit_diff_events_to(&event_tx, &old_state, &new_state);
                     }
                     _ = shutdown_rx.recv() => {
                         debug!("Network watcher polling stopped");
@@ -349,9 +340,15 @@ impl NetworkWatcher {
                                         .push(iface);
                                 }
 
-                                let mut s = state.write();
-                                s.interfaces = new_state;
-                                s.last_update = Some(std::time::Instant::now());
+                                let old_state = {
+                                    let mut s = state.write();
+                                    let old = std::mem::take(&mut s.interfaces);
+                                    s.interfaces = new_state.clone();
+                                    s.last_update = Some(std::time::Instant::now());
+                                    old
+                                };
+
+                                Self::emit_diff_events_to(&event_tx, &old_state, &new_state);
                             }
                             _ = shutdown_rx.recv() => {
                                 break;

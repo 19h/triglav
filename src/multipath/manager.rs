@@ -6,10 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use futures::{
-    future::join_all,
-    stream::{FuturesUnordered, StreamExt},
-};
+use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
@@ -622,44 +619,57 @@ impl MultipathManager {
     }
 
     /// Connect all uplinks to the remote server.
-    pub async fn connect(&self, remote_public: PublicKey) -> Result<()> {
+    pub async fn connect(self: &Arc<Self>, remote_public: PublicKey) -> Result<()> {
         *self.state.write() = ConnectionState::Connecting;
 
         let uplinks: Vec<_> = self.uplinks.iter().map(|r| r.value().clone()).collect();
 
-        let connect_attempts = uplinks.into_iter().map(|uplink| {
-            let remote_public = remote_public.clone();
-            async move {
-                let result = self.connect_uplink(&uplink, &remote_public).await;
-                (uplink, result)
-            }
-        });
-
-        for (uplink, result) in join_all(connect_attempts).await {
-            if let Err(e) = result {
-                tracing::warn!(
-                    uplink = %uplink.id(),
-                    error = %e,
-                    "Failed to connect uplink"
-                );
-                uplink.record_failure(&e.to_string());
-            }
-        }
-
-        // Check if at least one uplink connected
-        let connected = self
-            .uplinks
-            .iter()
-            .any(|r| r.value().state().connection_state == ConnectionState::Connected);
-
-        if connected {
-            *self.state.write() = ConnectionState::Connected;
-            let _ = self.event_tx.send(MultipathEvent::Connected);
-            Ok(())
-        } else {
+        if uplinks.is_empty() {
             *self.state.write() = ConnectionState::Failed;
-            Err(Error::NoAvailableUplinks)
+            return Err(Error::NoAvailableUplinks);
         }
+
+        let (result_tx, mut result_rx) = mpsc::channel(uplinks.len());
+
+        for uplink in uplinks {
+            let manager = Arc::clone(self);
+            let remote_public = remote_public.clone();
+            let result_tx = result_tx.clone();
+
+            tokio::spawn(async move {
+                let result = manager.connect_uplink(&uplink, &remote_public).await;
+                if let Err(e) = &result {
+                    tracing::warn!(
+                        uplink = %uplink.id(),
+                        error = %e,
+                        "Failed to connect uplink"
+                    );
+                    uplink.record_failure(&e.to_string());
+                }
+                let _ = result_tx.send((uplink.numeric_id(), result)).await;
+            });
+        }
+        drop(result_tx);
+
+        let mut last_error = None;
+        while let Some((_uplink_id, result)) = result_rx.recv().await {
+            match result {
+                Ok(()) => {
+                    *self.state.write() = ConnectionState::Connected;
+                    let _ = self.event_tx.send(MultipathEvent::Connected);
+
+                    tokio::spawn(async move { while result_rx.recv().await.is_some() {} });
+
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        *self.state.write() = ConnectionState::Failed;
+        Err(last_error.unwrap_or(Error::NoAvailableUplinks))
     }
 
     /// Connect a single uplink.

@@ -1,4 +1,4 @@
-//! UDP server runtime shared by `triglav server` and `triglav-server`.
+//! Server runtime shared by `triglav server` and `triglav-server`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{tcp::OwnedWriteHalf, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::time::timeout;
 use tracing::{debug, error, info};
@@ -56,6 +57,7 @@ struct TransportSession {
     user_id: RwLock<Option<String>>,
     next_sequence: AtomicU64,
     udp_flows: DashMap<UdpExitKey, Arc<UdpExitFlow>>,
+    tcp_flows: DashMap<TcpExitKey, Arc<TcpExitFlow>>,
 }
 
 impl TransportSession {
@@ -69,6 +71,7 @@ impl TransportSession {
             user_id: RwLock::new(None),
             next_sequence: AtomicU64::new(1),
             udp_flows: DashMap::new(),
+            tcp_flows: DashMap::new(),
         }
     }
 
@@ -112,7 +115,47 @@ struct UdpExitDatagram {
     payload: Vec<u8>,
 }
 
-/// UDP server runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TcpExitKey {
+    tunnel_src: IpAddr,
+    tunnel_src_port: u16,
+    remote_dst: IpAddr,
+    remote_dst_port: u16,
+}
+
+#[derive(Clone)]
+struct TcpReturnPath {
+    socket: Arc<UdpSocket>,
+    uplink_id: u16,
+    client_addr: SocketAddr,
+}
+
+struct TcpExitFlow {
+    key: TcpExitKey,
+    writer: Mutex<OwnedWriteHalf>,
+    state: Mutex<TcpExitState>,
+    return_path: RwLock<TcpReturnPath>,
+}
+
+#[derive(Debug)]
+struct TcpExitState {
+    client_next: u32,
+    server_next: u32,
+    established: bool,
+    closing: bool,
+}
+
+#[derive(Debug)]
+struct TcpExitSegment {
+    key: TcpExitKey,
+    destination: SocketAddr,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+    payload: Vec<u8>,
+}
+
+/// Server runtime.
 pub struct TriglavServer {
     config: ServerConfig,
     keypair: KeyPair,
@@ -419,10 +462,33 @@ impl TriglavServer {
         )
         .await?;
 
-        let datagram = match parse_udp_datagram(&payload) {
-            Ok(Some(datagram)) => datagram,
+        match parse_exit_packet(&payload) {
+            Ok(Some(ExitPacket::Udp(datagram))) => {
+                let flow = self
+                    .get_or_create_udp_flow(&session, datagram.key.clone())
+                    .await?;
+                let metrics = Arc::clone(&self.metrics);
+                let stats = Arc::clone(&self.stats);
+                let uplink_id = packet.header.uplink_id;
+
+                tokio::spawn(async move {
+                    if let Err(e) = relay_udp_datagram(
+                        socket, metrics, stats, session, flow, datagram, uplink_id, addr,
+                    )
+                    .await
+                    {
+                        debug!(error = %e, "UDP exit relay failed");
+                    }
+                });
+
+                Ok(())
+            }
+            Ok(Some(ExitPacket::Tcp(segment))) => {
+                self.handle_tcp_segment(socket, session, segment, packet.header.uplink_id, addr)
+                    .await
+            }
             Ok(None) => {
-                if let Some(response) = build_ipv4_protocol_unreachable(&payload)? {
+                if let Some(response) = build_unsupported_ip_response(&payload)? {
                     send_data_packet(
                         &socket,
                         &session,
@@ -436,7 +502,7 @@ impl TriglavServer {
                 }
                 debug!(
                     session = %session.id,
-                    "Rejected unsupported tunneled packet; UDP/IPv4 forwarding is available"
+                    "Rejected unsupported tunneled packet; TCP/UDP forwarding is available"
                 );
                 return Ok(());
             }
@@ -444,26 +510,7 @@ impl TriglavServer {
                 debug!(error = %e, session = %session.id, "Dropping malformed tunneled packet");
                 return Ok(());
             }
-        };
-
-        let flow = self
-            .get_or_create_udp_flow(&session, datagram.key.clone())
-            .await?;
-        let metrics = Arc::clone(&self.metrics);
-        let stats = Arc::clone(&self.stats);
-        let uplink_id = packet.header.uplink_id;
-
-        tokio::spawn(async move {
-            if let Err(e) = relay_udp_datagram(
-                socket, metrics, stats, session, flow, datagram, uplink_id, addr,
-            )
-            .await
-            {
-                debug!(error = %e, "UDP exit relay failed");
-            }
-        });
-
-        Ok(())
+        }
     }
 
     async fn get_or_create_udp_flow(
@@ -498,6 +545,163 @@ impl TriglavServer {
                 Ok(flow)
             }
         }
+    }
+
+    async fn handle_tcp_segment(
+        &self,
+        socket: Arc<UdpSocket>,
+        session: Arc<TransportSession>,
+        segment: TcpExitSegment,
+        uplink_id: u16,
+        client_addr: SocketAddr,
+    ) -> Result<()> {
+        if let Some(flow) = session
+            .tcp_flows
+            .get(&segment.key)
+            .map(|entry| entry.clone())
+        {
+            *flow.return_path.write() = TcpReturnPath {
+                socket,
+                uplink_id,
+                client_addr,
+            };
+            return relay_tcp_segment(
+                Arc::clone(&self.metrics),
+                Arc::clone(&self.stats),
+                session,
+                flow,
+                segment,
+            )
+            .await;
+        }
+
+        if segment.flags & 0x02 == 0 || segment.flags & 0x04 != 0 {
+            return Ok(());
+        }
+
+        match self
+            .create_tcp_flow(
+                Arc::clone(&socket),
+                Arc::clone(&session),
+                &segment,
+                uplink_id,
+                client_addr,
+            )
+            .await
+        {
+            Ok(flow) => {
+                let server_isn = {
+                    let state = flow.state.lock().await;
+                    state.server_next.wrapping_sub(1)
+                };
+                send_tcp_response(
+                    &self.metrics,
+                    &self.stats,
+                    &session,
+                    &socket,
+                    client_addr,
+                    uplink_id,
+                    &segment.key,
+                    server_isn,
+                    segment.sequence.wrapping_add(1),
+                    0x12,
+                    &[],
+                )
+                .await
+            }
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    destination = %segment.destination,
+                    "TCP exit connect failed; sending reset"
+                );
+                let (sequence, acknowledgment, flags) = tcp_reset_fields_for_segment(&segment);
+                let packet = build_tcp_packet(
+                    segment.key.remote_dst,
+                    segment.key.tunnel_src,
+                    segment.key.remote_dst_port,
+                    segment.key.tunnel_src_port,
+                    sequence,
+                    acknowledgment,
+                    flags,
+                    &[],
+                )?;
+                send_data_packet(
+                    &socket,
+                    &session,
+                    &self.metrics,
+                    &self.stats,
+                    &packet,
+                    uplink_id,
+                    client_addr,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn create_tcp_flow(
+        &self,
+        socket: Arc<UdpSocket>,
+        session: Arc<TransportSession>,
+        segment: &TcpExitSegment,
+        uplink_id: u16,
+        client_addr: SocketAddr,
+    ) -> Result<Arc<TcpExitFlow>> {
+        let stream = match timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(segment.destination),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                return Err(Error::ConnectionFailed {
+                    addr: segment.destination,
+                    reason: e.to_string(),
+                });
+            }
+            Err(_) => return Err(Error::ConnectionTimeout),
+        };
+        stream
+            .set_nodelay(true)
+            .map_err(|e| crate::error::TransportError::Tcp(e.to_string()))?;
+
+        let (reader, writer) = stream.into_split();
+        let server_isn = rand::random::<u32>();
+        let flow = Arc::new(TcpExitFlow {
+            key: segment.key.clone(),
+            writer: Mutex::new(writer),
+            state: Mutex::new(TcpExitState {
+                client_next: segment.sequence.wrapping_add(1),
+                server_next: server_isn.wrapping_add(1),
+                established: false,
+                closing: false,
+            }),
+            return_path: RwLock::new(TcpReturnPath {
+                socket,
+                uplink_id,
+                client_addr,
+            }),
+        });
+
+        let inserted = match session.tcp_flows.entry(segment.key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(existing) => return Ok(existing.get().clone()),
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(flow.clone());
+                flow.clone()
+            }
+        };
+
+        spawn_tcp_remote_reader(
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.stats),
+            Arc::clone(&session),
+            inserted.clone(),
+            reader,
+        );
+
+        Ok(inserted)
     }
 
     async fn send_ack(
@@ -632,6 +836,234 @@ async fn relay_udp_datagram(
     }
 }
 
+async fn relay_tcp_segment(
+    metrics: Arc<PrometheusMetrics>,
+    server_stats: Arc<RwLock<ServerStats>>,
+    session: Arc<TransportSession>,
+    flow: Arc<TcpExitFlow>,
+    segment: TcpExitSegment,
+) -> Result<()> {
+    if segment.flags & 0x04 != 0 {
+        session.tcp_flows.remove(&segment.key);
+        return Ok(());
+    }
+
+    let mut response = None;
+    let mut write_payload = None;
+    let mut shutdown_writer = false;
+
+    {
+        let mut state = flow.state.lock().await;
+        if state.closing {
+            return Ok(());
+        }
+
+        if !state.established && segment.flags & 0x10 != 0 {
+            state.established = true;
+        }
+
+        if !segment.payload.is_empty() {
+            if segment.sequence == state.client_next {
+                state.client_next = state.client_next.wrapping_add(segment.payload.len() as u32);
+                write_payload = Some(segment.payload.clone());
+            }
+            response = Some((state.server_next, state.client_next, 0x10));
+        }
+
+        if segment.flags & 0x01 != 0 {
+            if segment.sequence == state.client_next {
+                state.client_next = state.client_next.wrapping_add(1);
+                shutdown_writer = true;
+            }
+            response = Some((state.server_next, state.client_next, 0x10));
+        }
+
+        if response.is_none()
+            && (segment.sequence != state.client_next || segment.flags & 0x02 != 0)
+        {
+            response = Some((state.server_next, state.client_next, 0x10));
+        }
+    }
+
+    if let Some(payload) = write_payload {
+        let mut writer = flow.writer.lock().await;
+        writer
+            .write_all(&payload)
+            .await
+            .map_err(|e| crate::error::TransportError::Tcp(e.to_string()))?;
+    }
+
+    if shutdown_writer {
+        let mut writer = flow.writer.lock().await;
+        let _ = writer.shutdown().await;
+    }
+
+    if let Some((sequence, acknowledgment, flags)) = response {
+        let path = flow.return_path.read().clone();
+        send_tcp_response(
+            &metrics,
+            &server_stats,
+            &session,
+            &path.socket,
+            path.client_addr,
+            path.uplink_id,
+            &flow.key,
+            sequence,
+            acknowledgment,
+            flags,
+            &[],
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn spawn_tcp_remote_reader(
+    metrics: Arc<PrometheusMetrics>,
+    server_stats: Arc<RwLock<ServerStats>>,
+    session: Arc<TransportSession>,
+    flow: Arc<TcpExitFlow>,
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1200];
+        loop {
+            let len = match reader.read(&mut buf).await {
+                Ok(0) => {
+                    if let Err(e) = send_tcp_fin(&metrics, &server_stats, &session, &flow).await {
+                        debug!(error = %e, "TCP exit FIN relay failed");
+                    }
+                    session.tcp_flows.remove(&flow.key);
+                    return;
+                }
+                Ok(len) => len,
+                Err(e) => {
+                    debug!(error = %e, "TCP exit remote read failed");
+                    session.tcp_flows.remove(&flow.key);
+                    return;
+                }
+            };
+
+            let (sequence, acknowledgment) = {
+                let mut state = flow.state.lock().await;
+                if state.closing {
+                    return;
+                }
+                let sequence = state.server_next;
+                let acknowledgment = state.client_next;
+                state.server_next = state.server_next.wrapping_add(len as u32);
+                (sequence, acknowledgment)
+            };
+
+            let path = flow.return_path.read().clone();
+            if let Err(e) = send_tcp_response(
+                &metrics,
+                &server_stats,
+                &session,
+                &path.socket,
+                path.client_addr,
+                path.uplink_id,
+                &flow.key,
+                sequence,
+                acknowledgment,
+                0x18,
+                &buf[..len],
+            )
+            .await
+            {
+                debug!(error = %e, "TCP exit data relay failed");
+                session.tcp_flows.remove(&flow.key);
+                return;
+            }
+        }
+    });
+}
+
+async fn send_tcp_fin(
+    metrics: &PrometheusMetrics,
+    server_stats: &RwLock<ServerStats>,
+    session: &TransportSession,
+    flow: &TcpExitFlow,
+) -> Result<()> {
+    let (sequence, acknowledgment) = {
+        let mut state = flow.state.lock().await;
+        if state.closing {
+            return Ok(());
+        }
+        state.closing = true;
+        let sequence = state.server_next;
+        let acknowledgment = state.client_next;
+        state.server_next = state.server_next.wrapping_add(1);
+        (sequence, acknowledgment)
+    };
+
+    let path = flow.return_path.read().clone();
+    send_tcp_response(
+        metrics,
+        server_stats,
+        session,
+        &path.socket,
+        path.client_addr,
+        path.uplink_id,
+        &flow.key,
+        sequence,
+        acknowledgment,
+        0x11,
+        &[],
+    )
+    .await
+}
+
+async fn send_tcp_response(
+    metrics: &PrometheusMetrics,
+    server_stats: &RwLock<ServerStats>,
+    session: &TransportSession,
+    socket: &UdpSocket,
+    client_addr: SocketAddr,
+    uplink_id: u16,
+    key: &TcpExitKey,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Result<()> {
+    let packet = build_tcp_packet(
+        key.remote_dst,
+        key.tunnel_src,
+        key.remote_dst_port,
+        key.tunnel_src_port,
+        sequence,
+        acknowledgment,
+        flags,
+        payload,
+    )?;
+    send_data_packet(
+        socket,
+        session,
+        metrics,
+        server_stats,
+        &packet,
+        uplink_id,
+        client_addr,
+    )
+    .await
+}
+
+fn tcp_reset_fields_for_segment(segment: &TcpExitSegment) -> (u32, u32, u8) {
+    if segment.flags & 0x10 != 0 {
+        (segment.acknowledgment, 0, 0x04)
+    } else {
+        let control_len =
+            u32::from(segment.flags & 0x02 != 0) + u32::from(segment.flags & 0x01 != 0);
+        let acknowledgment = segment
+            .sequence
+            .wrapping_add(segment.payload.len() as u32)
+            .wrapping_add(control_len);
+        (0, acknowledgment, 0x14)
+    }
+}
+
 impl TriglavServer {
     async fn handle_ping(
         &self,
@@ -701,8 +1133,33 @@ async fn send_packet_with_metrics(
     Ok(())
 }
 
+enum ExitPacket {
+    Udp(UdpExitDatagram),
+    Tcp(TcpExitSegment),
+}
+
+fn parse_exit_packet(packet: &[u8]) -> Result<Option<ExitPacket>> {
+    let parsed = IpPacket::parse(packet)?;
+    match parsed.protocol {
+        IpTransportProtocol::Udp => parse_udp_datagram_from_packet(packet, &parsed)
+            .map(|datagram| datagram.map(ExitPacket::Udp)),
+        IpTransportProtocol::Tcp => {
+            parse_tcp_segment(packet, &parsed).map(|segment| segment.map(ExitPacket::Tcp))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
 fn parse_udp_datagram(packet: &[u8]) -> Result<Option<UdpExitDatagram>> {
     let parsed = IpPacket::parse(packet)?;
+    parse_udp_datagram_from_packet(packet, &parsed)
+}
+
+fn parse_udp_datagram_from_packet(
+    packet: &[u8],
+    parsed: &IpPacket<'_>,
+) -> Result<Option<UdpExitDatagram>> {
     if parsed.protocol != IpTransportProtocol::Udp {
         return Ok(None);
     }
@@ -738,6 +1195,56 @@ fn parse_udp_datagram(packet: &[u8]) -> Result<Option<UdpExitDatagram>> {
     }))
 }
 
+fn parse_tcp_segment(packet: &[u8], parsed: &IpPacket<'_>) -> Result<Option<TcpExitSegment>> {
+    if parsed.protocol != IpTransportProtocol::Tcp {
+        return Ok(None);
+    }
+
+    let src_port = match parsed.src_port {
+        Some(port) => port,
+        None => return Ok(None),
+    };
+    let dst_port = match parsed.dst_port {
+        Some(port) => port,
+        None => return Ok(None),
+    };
+
+    if parsed.total_len > packet.len() || parsed.header_len + 20 > parsed.total_len {
+        return Err(Error::InvalidPacket("Malformed TCP packet".into()));
+    }
+
+    let tcp_header_len = ((packet[parsed.header_len + 12] >> 4) as usize) * 4;
+    if tcp_header_len < 20 || parsed.header_len + tcp_header_len > parsed.total_len {
+        return Err(Error::InvalidPacket("Malformed TCP header length".into()));
+    }
+
+    let sequence = u32::from_be_bytes(
+        packet[parsed.header_len + 4..parsed.header_len + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let acknowledgment = u32::from_be_bytes(
+        packet[parsed.header_len + 8..parsed.header_len + 12]
+            .try_into()
+            .unwrap(),
+    );
+    let flags = packet[parsed.header_len + 13];
+
+    Ok(Some(TcpExitSegment {
+        key: TcpExitKey {
+            tunnel_src: parsed.src_addr,
+            tunnel_src_port: src_port,
+            remote_dst: parsed.dst_addr,
+            remote_dst_port: dst_port,
+        },
+        destination: SocketAddr::from((parsed.dst_addr, dst_port)),
+        sequence,
+        acknowledgment,
+        flags,
+        payload: packet[parsed.header_len + tcp_header_len..parsed.total_len].to_vec(),
+    }))
+}
+
 fn build_udp_packet(
     src_addr: IpAddr,
     dst_addr: IpAddr,
@@ -756,6 +1263,158 @@ fn build_udp_packet(
             "UDP response address version mismatch".into(),
         )),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tcp_packet(
+    src_addr: IpAddr,
+    dst_addr: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    match (src_addr, dst_addr) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => build_ipv4_tcp_packet(
+            src,
+            dst,
+            src_port,
+            dst_port,
+            sequence,
+            acknowledgment,
+            flags,
+            payload,
+        ),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => build_ipv6_tcp_packet(
+            src,
+            dst,
+            src_port,
+            dst_port,
+            sequence,
+            acknowledgment,
+            flags,
+            payload,
+        ),
+        _ => Err(Error::InvalidPacket(
+            "TCP response address version mismatch".into(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_ipv4_tcp_packet(
+    src_addr: Ipv4Addr,
+    dst_addr: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let tcp_len = 20usize
+        .checked_add(payload.len())
+        .ok_or_else(|| Error::InvalidPacket("TCP payload too large".into()))?;
+    let total_len = 20usize
+        .checked_add(tcp_len)
+        .ok_or_else(|| Error::InvalidPacket("IPv4 packet too large".into()))?;
+
+    if tcp_len > u16::MAX as usize || total_len > u16::MAX as usize {
+        return Err(Error::InvalidPacket("IPv4 TCP packet too large".into()));
+    }
+
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = IpTransportProtocol::Tcp.protocol_number();
+    packet[12..16].copy_from_slice(&src_addr.octets());
+    packet[16..20].copy_from_slice(&dst_addr.octets());
+
+    let header_checksum = internet_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+
+    write_tcp_segment(
+        &mut packet[20..],
+        src_port,
+        dst_port,
+        sequence,
+        acknowledgment,
+        flags,
+        payload,
+    );
+    let tcp_checksum = tcp_ipv4_checksum(src_addr, dst_addr, &packet[20..]);
+    packet[36..38].copy_from_slice(&tcp_checksum.to_be_bytes());
+
+    Ok(packet)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_ipv6_tcp_packet(
+    src_addr: Ipv6Addr,
+    dst_addr: Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let tcp_len = 20usize
+        .checked_add(payload.len())
+        .ok_or_else(|| Error::InvalidPacket("TCP payload too large".into()))?;
+    let total_len = 40usize
+        .checked_add(tcp_len)
+        .ok_or_else(|| Error::InvalidPacket("IPv6 packet too large".into()))?;
+
+    if tcp_len > u16::MAX as usize {
+        return Err(Error::InvalidPacket("IPv6 TCP packet too large".into()));
+    }
+
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+    packet[6] = IpTransportProtocol::Tcp.protocol_number();
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src_addr.octets());
+    packet[24..40].copy_from_slice(&dst_addr.octets());
+
+    write_tcp_segment(
+        &mut packet[40..],
+        src_port,
+        dst_port,
+        sequence,
+        acknowledgment,
+        flags,
+        payload,
+    );
+    let tcp_checksum = tcp_ipv6_checksum(src_addr, dst_addr, &packet[40..]);
+    packet[56..58].copy_from_slice(&tcp_checksum.to_be_bytes());
+
+    Ok(packet)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_tcp_segment(
+    segment: &mut [u8],
+    src_port: u16,
+    dst_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+    payload: &[u8],
+) {
+    segment[0..2].copy_from_slice(&src_port.to_be_bytes());
+    segment[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    segment[4..8].copy_from_slice(&sequence.to_be_bytes());
+    segment[8..12].copy_from_slice(&acknowledgment.to_be_bytes());
+    segment[12] = 0x50;
+    segment[13] = flags;
+    segment[14..16].copy_from_slice(&64240u16.to_be_bytes());
+    segment[20..].copy_from_slice(payload);
 }
 
 fn build_ipv4_udp_packet(
@@ -836,12 +1495,174 @@ fn build_ipv6_udp_packet(
     Ok(packet)
 }
 
-fn build_ipv4_protocol_unreachable(original_packet: &[u8]) -> Result<Option<Vec<u8>>> {
+fn build_unsupported_ip_response(original_packet: &[u8]) -> Result<Option<Vec<u8>>> {
     let parsed = match IpPacket::parse(original_packet) {
         Ok(packet) => packet,
         Err(_) => return Ok(None),
     };
 
+    if parsed.protocol == IpTransportProtocol::Tcp {
+        return build_tcp_reset_response(original_packet, &parsed);
+    }
+
+    match parsed.version {
+        IpVersion::V4 => build_ipv4_protocol_unreachable(original_packet, &parsed),
+        IpVersion::V6 => build_ipv6_next_header_unreachable(original_packet, &parsed),
+    }
+}
+
+#[derive(Debug)]
+struct TcpReset {
+    src_port: u16,
+    dst_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+}
+
+fn build_tcp_reset_response(
+    original_packet: &[u8],
+    parsed: &IpPacket<'_>,
+) -> Result<Option<Vec<u8>>> {
+    let reset = match build_tcp_reset(original_packet, parsed)? {
+        Some(reset) => reset,
+        None => return Ok(None),
+    };
+
+    match (parsed.version, parsed.src_addr, parsed.dst_addr) {
+        (IpVersion::V4, IpAddr::V4(src), IpAddr::V4(dst)) => {
+            build_ipv4_tcp_reset_packet(dst, src, reset).map(Some)
+        }
+        (IpVersion::V6, IpAddr::V6(src), IpAddr::V6(dst)) => {
+            build_ipv6_tcp_reset_packet(dst, src, reset).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn build_tcp_reset(original_packet: &[u8], parsed: &IpPacket<'_>) -> Result<Option<TcpReset>> {
+    if parsed.protocol != IpTransportProtocol::Tcp
+        || parsed.total_len > original_packet.len()
+        || parsed.header_len + 20 > parsed.total_len
+    {
+        return Ok(None);
+    }
+
+    let tcp_offset = parsed.header_len;
+    let tcp_header_len = ((original_packet[tcp_offset + 12] >> 4) as usize) * 4;
+    if tcp_header_len < 20 || tcp_offset + tcp_header_len > parsed.total_len {
+        return Ok(None);
+    }
+
+    let flags = original_packet[tcp_offset + 13];
+    if flags & 0x04 != 0 {
+        return Ok(None);
+    }
+
+    let src_port = match parsed.dst_port {
+        Some(port) => port,
+        None => return Ok(None),
+    };
+    let dst_port = match parsed.src_port {
+        Some(port) => port,
+        None => return Ok(None),
+    };
+    let original_sequence = u32::from_be_bytes(
+        original_packet[tcp_offset + 4..tcp_offset + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let original_acknowledgment = u32::from_be_bytes(
+        original_packet[tcp_offset + 8..tcp_offset + 12]
+            .try_into()
+            .unwrap(),
+    );
+
+    if flags & 0x10 != 0 {
+        Ok(Some(TcpReset {
+            src_port,
+            dst_port,
+            sequence: original_acknowledgment,
+            acknowledgment: 0,
+            flags: 0x04,
+        }))
+    } else {
+        let segment_len = parsed.total_len - parsed.header_len - tcp_header_len;
+        let control_len = u32::from(flags & 0x02 != 0) + u32::from(flags & 0x01 != 0);
+        let acknowledgment = original_sequence
+            .wrapping_add(segment_len as u32)
+            .wrapping_add(control_len);
+
+        Ok(Some(TcpReset {
+            src_port,
+            dst_port,
+            sequence: 0,
+            acknowledgment,
+            flags: 0x14,
+        }))
+    }
+}
+
+fn build_ipv4_tcp_reset_packet(
+    src_addr: Ipv4Addr,
+    dst_addr: Ipv4Addr,
+    reset: TcpReset,
+) -> Result<Vec<u8>> {
+    let total_len = 40usize;
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = IpTransportProtocol::Tcp.protocol_number();
+    packet[12..16].copy_from_slice(&src_addr.octets());
+    packet[16..20].copy_from_slice(&dst_addr.octets());
+
+    let header_checksum = internet_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+
+    write_tcp_reset_segment(&mut packet[20..], &reset);
+    let tcp_checksum = tcp_ipv4_checksum(src_addr, dst_addr, &packet[20..]);
+    packet[36..38].copy_from_slice(&tcp_checksum.to_be_bytes());
+
+    Ok(packet)
+}
+
+fn build_ipv6_tcp_reset_packet(
+    src_addr: Ipv6Addr,
+    dst_addr: Ipv6Addr,
+    reset: TcpReset,
+) -> Result<Vec<u8>> {
+    let tcp_len = 20usize;
+    let total_len = 40usize + tcp_len;
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+    packet[6] = IpTransportProtocol::Tcp.protocol_number();
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src_addr.octets());
+    packet[24..40].copy_from_slice(&dst_addr.octets());
+
+    write_tcp_reset_segment(&mut packet[40..], &reset);
+    let tcp_checksum = tcp_ipv6_checksum(src_addr, dst_addr, &packet[40..]);
+    packet[56..58].copy_from_slice(&tcp_checksum.to_be_bytes());
+
+    Ok(packet)
+}
+
+fn write_tcp_reset_segment(segment: &mut [u8], reset: &TcpReset) {
+    segment[0..2].copy_from_slice(&reset.src_port.to_be_bytes());
+    segment[2..4].copy_from_slice(&reset.dst_port.to_be_bytes());
+    segment[4..8].copy_from_slice(&reset.sequence.to_be_bytes());
+    segment[8..12].copy_from_slice(&reset.acknowledgment.to_be_bytes());
+    segment[12] = 0x50;
+    segment[13] = reset.flags;
+}
+
+fn build_ipv4_protocol_unreachable(
+    original_packet: &[u8],
+    parsed: &IpPacket<'_>,
+) -> Result<Option<Vec<u8>>> {
     if parsed.version != IpVersion::V4 {
         return Ok(None);
     }
@@ -891,6 +1712,57 @@ fn build_ipv4_protocol_unreachable(original_packet: &[u8]) -> Result<Option<Vec<
     Ok(Some(packet))
 }
 
+fn build_ipv6_next_header_unreachable(
+    original_packet: &[u8],
+    parsed: &IpPacket<'_>,
+) -> Result<Option<Vec<u8>>> {
+    if parsed.version != IpVersion::V6 {
+        return Ok(None);
+    }
+
+    let (src_addr, dst_addr) = match (parsed.src_addr, parsed.dst_addr) {
+        (IpAddr::V6(src), IpAddr::V6(dst)) => (src, dst),
+        _ => return Ok(None),
+    };
+
+    if parsed.total_len > original_packet.len() || parsed.header_len > parsed.total_len {
+        return Ok(None);
+    }
+
+    let max_quote_len = 1232usize.saturating_sub(48);
+    let quote_len = parsed.total_len.min(max_quote_len);
+    let icmp_len = 8usize
+        .checked_add(quote_len)
+        .ok_or_else(|| Error::InvalidPacket("ICMPv6 payload too large".into()))?;
+    let total_len = 40usize
+        .checked_add(icmp_len)
+        .ok_or_else(|| Error::InvalidPacket("IPv6 ICMP packet too large".into()))?;
+
+    if icmp_len > u16::MAX as usize {
+        return Err(Error::InvalidPacket("IPv6 ICMP packet too large".into()));
+    }
+
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(icmp_len as u16).to_be_bytes());
+    packet[6] = IpTransportProtocol::Icmpv6.protocol_number();
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&dst_addr.octets());
+    packet[24..40].copy_from_slice(&src_addr.octets());
+
+    let icmp_offset = 40;
+    packet[icmp_offset] = 4;
+    packet[icmp_offset + 1] = 1;
+    packet[icmp_offset + 4..icmp_offset + 8].copy_from_slice(&6u32.to_be_bytes());
+    packet[icmp_offset + 8..icmp_offset + 8 + quote_len]
+        .copy_from_slice(&original_packet[..quote_len]);
+
+    let icmp_checksum = icmpv6_checksum(dst_addr, src_addr, &packet[icmp_offset..]);
+    packet[icmp_offset + 2..icmp_offset + 4].copy_from_slice(&icmp_checksum.to_be_bytes());
+
+    Ok(Some(packet))
+}
+
 fn udp_ipv4_checksum(src_addr: Ipv4Addr, dst_addr: Ipv4Addr, udp_segment: &[u8]) -> u16 {
     let mut data = Vec::with_capacity(12 + udp_segment.len() + (udp_segment.len() % 2));
     data.extend_from_slice(&src_addr.octets());
@@ -911,14 +1783,66 @@ fn udp_ipv4_checksum(src_addr: Ipv4Addr, dst_addr: Ipv4Addr, udp_segment: &[u8])
     }
 }
 
-fn udp_ipv6_checksum(src_addr: Ipv6Addr, dst_addr: Ipv6Addr, udp_segment: &[u8]) -> u16 {
-    let mut data = Vec::with_capacity(40 + udp_segment.len() + (udp_segment.len() % 2));
+fn tcp_ipv4_checksum(src_addr: Ipv4Addr, dst_addr: Ipv4Addr, tcp_segment: &[u8]) -> u16 {
+    let mut data = Vec::with_capacity(12 + tcp_segment.len() + (tcp_segment.len() % 2));
     data.extend_from_slice(&src_addr.octets());
     data.extend_from_slice(&dst_addr.octets());
-    data.extend_from_slice(&(udp_segment.len() as u32).to_be_bytes());
+    data.push(0);
+    data.push(IpTransportProtocol::Tcp.protocol_number());
+    data.extend_from_slice(&(tcp_segment.len() as u16).to_be_bytes());
+    data.extend_from_slice(tcp_segment);
+    if data.len() % 2 != 0 {
+        data.push(0);
+    }
+
+    let checksum = internet_checksum(&data);
+    if checksum == 0 {
+        0xffff
+    } else {
+        checksum
+    }
+}
+
+fn udp_ipv6_checksum(src_addr: Ipv6Addr, dst_addr: Ipv6Addr, udp_segment: &[u8]) -> u16 {
+    transport_ipv6_checksum(
+        src_addr,
+        dst_addr,
+        IpTransportProtocol::Udp.protocol_number(),
+        udp_segment,
+    )
+}
+
+fn tcp_ipv6_checksum(src_addr: Ipv6Addr, dst_addr: Ipv6Addr, tcp_segment: &[u8]) -> u16 {
+    transport_ipv6_checksum(
+        src_addr,
+        dst_addr,
+        IpTransportProtocol::Tcp.protocol_number(),
+        tcp_segment,
+    )
+}
+
+fn icmpv6_checksum(src_addr: Ipv6Addr, dst_addr: Ipv6Addr, icmp_segment: &[u8]) -> u16 {
+    transport_ipv6_checksum(
+        src_addr,
+        dst_addr,
+        IpTransportProtocol::Icmpv6.protocol_number(),
+        icmp_segment,
+    )
+}
+
+fn transport_ipv6_checksum(
+    src_addr: Ipv6Addr,
+    dst_addr: Ipv6Addr,
+    next_header: u8,
+    segment: &[u8],
+) -> u16 {
+    let mut data = Vec::with_capacity(40 + segment.len() + (segment.len() % 2));
+    data.extend_from_slice(&src_addr.octets());
+    data.extend_from_slice(&dst_addr.octets());
+    data.extend_from_slice(&(segment.len() as u32).to_be_bytes());
     data.extend_from_slice(&[0, 0, 0]);
-    data.push(IpTransportProtocol::Udp.protocol_number());
-    data.extend_from_slice(udp_segment);
+    data.push(next_header);
+    data.extend_from_slice(segment);
     if data.len() % 2 != 0 {
         data.push(0);
     }
@@ -1039,16 +1963,316 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_ipv4_packet_builds_protocol_unreachable() {
+    fn tcp_ipv4_parser_extracts_exit_segment() {
+        let packet = build_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 77, 0, 2),
+            Ipv4Addr::new(203, 0, 113, 10),
+            49152,
+            443,
+            42,
+            9000,
+            0x18,
+            b"GET /",
+        )
+        .unwrap();
+        let parsed = IpPacket::parse(&packet).unwrap();
+
+        let segment = parse_tcp_segment(&packet, &parsed).unwrap().unwrap();
+
+        assert_eq!(
+            segment.key.tunnel_src,
+            IpAddr::V4(Ipv4Addr::new(10, 77, 0, 2))
+        );
+        assert_eq!(segment.key.tunnel_src_port, 49152);
+        assert_eq!(
+            segment.key.remote_dst,
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))
+        );
+        assert_eq!(segment.key.remote_dst_port, 443);
+        assert_eq!(
+            segment.destination,
+            SocketAddr::from(([203, 0, 113, 10], 443))
+        );
+        assert_eq!(segment.sequence, 42);
+        assert_eq!(segment.acknowledgment, 9000);
+        assert_eq!(segment.flags, 0x18);
+        assert_eq!(segment.payload, b"GET /");
+    }
+
+    #[test]
+    fn tcp_ipv4_builder_creates_valid_reverse_packet() {
+        let packet = build_ipv4_tcp_packet(
+            Ipv4Addr::new(203, 0, 113, 10),
+            Ipv4Addr::new(10, 77, 0, 2),
+            443,
+            49152,
+            9000,
+            47,
+            0x18,
+            b"HTTP",
+        )
+        .unwrap();
+
+        assert_eq!(internet_checksum(&packet[..20]), 0);
+        assert_eq!(
+            tcp_ipv4_checksum(
+                Ipv4Addr::new(203, 0, 113, 10),
+                Ipv4Addr::new(10, 77, 0, 2),
+                &packet[20..]
+            ),
+            0xffff
+        );
+
+        let parsed = IpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.version, IpVersion::V4);
+        assert_eq!(parsed.protocol, IpTransportProtocol::Tcp);
+        assert_eq!(parsed.src_addr, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)));
+        assert_eq!(parsed.dst_addr, IpAddr::V4(Ipv4Addr::new(10, 77, 0, 2)));
+        assert_eq!(parsed.src_port, Some(443));
+        assert_eq!(parsed.dst_port, Some(49152));
+        assert_eq!(parsed.payload(), b"HTTP");
+    }
+
+    #[test]
+    fn tcp_ipv6_builder_creates_valid_reverse_packet() {
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 20);
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 10);
+        let packet = build_ipv6_tcp_packet(src, dst, 443, 49152, 9000, 47, 0x18, b"HTTP").unwrap();
+
+        assert_eq!(tcp_ipv6_checksum(src, dst, &packet[40..]), 0xffff);
+
+        let parsed = IpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.version, IpVersion::V6);
+        assert_eq!(parsed.protocol, IpTransportProtocol::Tcp);
+        assert_eq!(parsed.src_addr, IpAddr::V6(src));
+        assert_eq!(parsed.dst_addr, IpAddr::V6(dst));
+        assert_eq!(parsed.src_port, Some(443));
+        assert_eq!(parsed.dst_port, Some(49152));
+        assert_eq!(parsed.payload(), b"HTTP");
+    }
+
+    #[tokio::test]
+    async fn tcp_exit_syn_connects_remote_and_returns_syn_ack() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (payload_tx, payload_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            match listener.accept().await {
+                Ok((mut stream, _)) => {
+                    let _ = accepted_tx.send(Ok(()));
+                    let mut payload = [0u8; 5];
+                    if stream.read_exact(&mut payload).await.is_ok() {
+                        let _ = payload_tx.send(payload);
+                        let _ = stream.write_all(b"world").await;
+                    }
+                }
+                Err(e) => {
+                    let _ = accepted_tx.send(Err(e));
+                }
+            }
+        });
+
+        let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+        let metrics = Arc::new(PrometheusMetrics::new().unwrap());
+        let stats = Arc::new(RwLock::new(ServerStats::default()));
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let server = TriglavServer {
+            config: ServerConfig::default(),
+            keypair: KeyPair::generate(),
+            transport_sessions: DashMap::new(),
+            sessions_by_addr: DashMap::new(),
+            sockets: vec![Arc::clone(&server_socket)],
+            metrics,
+            stats,
+            start_time: Instant::now(),
+            shutdown_tx,
+        };
+        let session = Arc::new(TransportSession::new(SessionId::generate(), client_addr));
+
+        let syn = build_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 77, 0, 2),
+            Ipv4Addr::LOCALHOST,
+            49152,
+            remote_addr.port(),
+            42,
+            0,
+            0x02,
+            &[],
+        )
+        .unwrap();
+        let parsed = IpPacket::parse(&syn).unwrap();
+        let segment = parse_tcp_segment(&syn, &parsed).unwrap().unwrap();
+
+        server
+            .handle_tcp_segment(
+                Arc::clone(&server_socket),
+                Arc::clone(&session),
+                segment,
+                7,
+                client_addr,
+            )
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(2), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(2), client_socket.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let packet = Packet::decode(&buf[..len]).unwrap();
+        assert_eq!(packet.header.packet_type, PacketType::Data);
+        assert_eq!(packet.header.uplink_id, 7);
+
+        let response = IpPacket::parse(&packet.payload).unwrap();
+        assert_eq!(response.protocol, IpTransportProtocol::Tcp);
+        assert_eq!(response.src_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(response.dst_addr, IpAddr::V4(Ipv4Addr::new(10, 77, 0, 2)));
+        assert_eq!(response.src_port, Some(remote_addr.port()));
+        assert_eq!(response.dst_port, Some(49152));
+        let server_sequence = u32::from_be_bytes(packet.payload[24..28].try_into().unwrap());
+        assert_eq!(packet.payload[33], 0x12);
+        assert_eq!(
+            u32::from_be_bytes(packet.payload[28..32].try_into().unwrap()),
+            43
+        );
+        assert_eq!(
+            tcp_ipv4_checksum(
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::new(10, 77, 0, 2),
+                &packet.payload[20..]
+            ),
+            0xffff
+        );
+
+        let ack = build_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 77, 0, 2),
+            Ipv4Addr::LOCALHOST,
+            49152,
+            remote_addr.port(),
+            43,
+            server_sequence.wrapping_add(1),
+            0x10,
+            &[],
+        )
+        .unwrap();
+        let parsed = IpPacket::parse(&ack).unwrap();
+        let segment = parse_tcp_segment(&ack, &parsed).unwrap().unwrap();
+        server
+            .handle_tcp_segment(
+                Arc::clone(&server_socket),
+                Arc::clone(&session),
+                segment,
+                7,
+                client_addr,
+            )
+            .await
+            .unwrap();
+
+        let data = build_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 77, 0, 2),
+            Ipv4Addr::LOCALHOST,
+            49152,
+            remote_addr.port(),
+            43,
+            server_sequence.wrapping_add(1),
+            0x18,
+            b"hello",
+        )
+        .unwrap();
+        let parsed = IpPacket::parse(&data).unwrap();
+        let segment = parse_tcp_segment(&data, &parsed).unwrap().unwrap();
+        server
+            .handle_tcp_segment(Arc::clone(&server_socket), session, segment, 7, client_addr)
+            .await
+            .unwrap();
+
+        let payload = timeout(Duration::from_secs(2), payload_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&payload, b"hello");
+
+        let mut remote_payload = None;
+        for _ in 0..2 {
+            let (len, _) = timeout(Duration::from_secs(2), client_socket.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let packet = Packet::decode(&buf[..len]).unwrap();
+            let response = IpPacket::parse(&packet.payload).unwrap();
+            if !response.payload().is_empty() {
+                remote_payload = Some(packet.payload);
+                break;
+            }
+        }
+
+        let remote_payload = remote_payload.expect("remote TCP payload should be relayed");
+        let response = IpPacket::parse(&remote_payload).unwrap();
+        assert_eq!(response.src_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(response.dst_addr, IpAddr::V4(Ipv4Addr::new(10, 77, 0, 2)));
+        assert_eq!(response.src_port, Some(remote_addr.port()));
+        assert_eq!(response.dst_port, Some(49152));
+        assert_eq!(remote_payload[33], 0x18);
+        assert_eq!(response.payload(), b"world");
+        assert_eq!(
+            tcp_ipv4_checksum(
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::new(10, 77, 0, 2),
+                &remote_payload[20..]
+            ),
+            0xffff
+        );
+    }
+
+    #[test]
+    fn unsupported_ipv4_tcp_packet_builds_reset() {
         let tcp_packet = [
             0x45, 0x00, 0x00, 0x28, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0x0a, 0x4d,
-            0x00, 0x02, 0xcb, 0x00, 0x71, 0x0a, 0xc0, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02, 0xcb, 0x00, 0x71, 0x0a, 0xc0, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x2a,
             0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
 
-        let response = build_ipv4_protocol_unreachable(&tcp_packet)
-            .unwrap()
-            .unwrap();
+        let response = build_unsupported_ip_response(&tcp_packet).unwrap().unwrap();
+
+        assert_eq!(internet_checksum(&response[..20]), 0);
+
+        let parsed = IpPacket::parse(&response).unwrap();
+        assert_eq!(parsed.version, IpVersion::V4);
+        assert_eq!(parsed.protocol, IpTransportProtocol::Tcp);
+        assert_eq!(parsed.src_addr, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)));
+        assert_eq!(parsed.dst_addr, IpAddr::V4(Ipv4Addr::new(10, 77, 0, 2)));
+        assert_eq!(parsed.src_port, Some(80));
+        assert_eq!(parsed.dst_port, Some(49152));
+        assert_eq!(u32::from_be_bytes(response[24..28].try_into().unwrap()), 0);
+        assert_eq!(u32::from_be_bytes(response[28..32].try_into().unwrap()), 43);
+        assert_eq!(response[33], 0x14);
+        assert_eq!(
+            tcp_ipv4_checksum(
+                Ipv4Addr::new(203, 0, 113, 10),
+                Ipv4Addr::new(10, 77, 0, 2),
+                &response[20..]
+            ),
+            0xffff
+        );
+    }
+
+    #[test]
+    fn unsupported_ipv4_non_tcp_packet_builds_protocol_unreachable() {
+        let packet = [
+            0x45, 0x00, 0x00, 0x1c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x84, 0x00, 0x00, 0x0a, 0x4d,
+            0x00, 0x02, 0xcb, 0x00, 0x71, 0x0a, 0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef,
+        ];
+
+        let response = build_unsupported_ip_response(&packet).unwrap().unwrap();
 
         assert_eq!(internet_checksum(&response[..20]), 0);
 
@@ -1062,7 +2286,68 @@ mod tests {
         assert_eq!(icmp[0], 3);
         assert_eq!(icmp[1], 2);
         assert_eq!(internet_checksum(icmp), 0);
-        assert_eq!(&icmp[8..28], &tcp_packet[..20]);
+        assert_eq!(&icmp[8..28], &packet[..20]);
+    }
+
+    #[test]
+    fn unsupported_ipv6_tcp_packet_builds_reset() {
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 10);
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 20);
+        let mut packet = vec![0u8; 60];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&20u16.to_be_bytes());
+        packet[6] = IpTransportProtocol::Tcp.protocol_number();
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&src.octets());
+        packet[24..40].copy_from_slice(&dst.octets());
+        packet[40..42].copy_from_slice(&49152u16.to_be_bytes());
+        packet[42..44].copy_from_slice(&443u16.to_be_bytes());
+        packet[44..48].copy_from_slice(&42u32.to_be_bytes());
+        packet[52] = 0x50;
+        packet[53] = 0x02;
+
+        let response = build_unsupported_ip_response(&packet).unwrap().unwrap();
+
+        let parsed = IpPacket::parse(&response).unwrap();
+        assert_eq!(parsed.version, IpVersion::V6);
+        assert_eq!(parsed.protocol, IpTransportProtocol::Tcp);
+        assert_eq!(parsed.src_addr, IpAddr::V6(dst));
+        assert_eq!(parsed.dst_addr, IpAddr::V6(src));
+        assert_eq!(parsed.src_port, Some(443));
+        assert_eq!(parsed.dst_port, Some(49152));
+        assert_eq!(u32::from_be_bytes(response[44..48].try_into().unwrap()), 0);
+        assert_eq!(u32::from_be_bytes(response[48..52].try_into().unwrap()), 43);
+        assert_eq!(response[53], 0x14);
+        assert_eq!(tcp_ipv6_checksum(dst, src, &response[40..]), 0xffff);
+    }
+
+    #[test]
+    fn unsupported_ipv6_non_tcp_packet_builds_next_header_unreachable() {
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 10);
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 20);
+        let mut packet = vec![0u8; 48];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&8u16.to_be_bytes());
+        packet[6] = 132;
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&src.octets());
+        packet[24..40].copy_from_slice(&dst.octets());
+        packet[40..].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe]);
+
+        let response = build_unsupported_ip_response(&packet).unwrap().unwrap();
+
+        let parsed = IpPacket::parse(&response).unwrap();
+        assert_eq!(parsed.version, IpVersion::V6);
+        assert_eq!(parsed.protocol, IpTransportProtocol::Icmpv6);
+        assert_eq!(parsed.src_addr, IpAddr::V6(dst));
+        assert_eq!(parsed.dst_addr, IpAddr::V6(src));
+
+        let icmp = parsed.payload();
+        assert_eq!(icmp[0], 4);
+        assert_eq!(icmp[1], 1);
+        assert_eq!(u32::from_be_bytes(icmp[4..8].try_into().unwrap()), 6);
+        assert_eq!(icmpv6_checksum(dst, src, icmp), 0xffff);
+        assert_eq!(&icmp[8..], &packet[..]);
     }
 }
 

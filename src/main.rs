@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
 }
 
 /// Run the server
-async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
+async fn run_server(args: ServerArgs, config: Config) -> Result<()> {
     println!(
         "{}",
         "╔══════════════════════════════════════════╗".bright_cyan()
@@ -125,6 +125,13 @@ async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
         return Ok(());
     }
 
+    let metrics_addr: SocketAddr = config.metrics.http_bind.parse().map_err(|e| {
+        triglav::Error::Config(format!(
+            "Invalid metrics HTTP bind address '{}': {e}",
+            config.metrics.http_bind
+        ))
+    })?;
+
     // Print listen addresses
     println!("{}", "Listening on:".bright_white());
     for addr in &args.listen {
@@ -139,24 +146,92 @@ async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
     }
     println!();
 
-    // Setup shutdown signal
-    let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
-
-    tokio::spawn(async move {
-        let _ = signal::ctrl_c().await;
-        let _ = shutdown_tx.send(());
-    });
-
     println!("{} Server running. Press Ctrl+C to stop.", "●".green());
+    println!(
+        "  {} {}",
+        "Metrics:".cyan(),
+        format!("http://{metrics_addr}")
+    );
+    println!();
 
-    // Run server loop
-    // TODO: Implement actual server logic
-    shutdown_rx.recv().await.ok();
+    let mut server_config = config.server.clone();
+    server_config.enabled = true;
+    server_config.listen_addrs = args.listen.clone();
+    server_config.max_connections = args.max_connections;
+    server_config.key_file = args.key.clone();
+    server_config.tcp_fallback = args.tcp_fallback;
+
+    #[cfg(feature = "metrics")]
+    triglav::server::run_server(triglav::server::ServerRuntimeOptions {
+        config: server_config,
+        keypair,
+        metrics_addr,
+    })
+    .await?;
+
+    #[cfg(not(feature = "metrics"))]
+    return Err(triglav::Error::Config(
+        "server runtime requires the metrics feature".into(),
+    ));
 
     println!();
     println!("{} Server stopped.", "●".yellow());
 
     Ok(())
+}
+
+fn discover_client_interfaces(auto_discover: bool, configured: &[String]) -> Vec<String> {
+    if !auto_discover && !configured.is_empty() {
+        return configured.to_vec();
+    }
+
+    let interfaces = util::get_usable_interfaces()
+        .into_iter()
+        .map(|interface| interface.name)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    if !interfaces.is_empty() {
+        return interfaces.into_iter().collect();
+    }
+
+    util::get_network_interfaces()
+        .into_iter()
+        .filter(|interface| interface.is_up && !interface.is_loopback)
+        .map(|interface| interface.name)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn build_uplink_configs(interfaces: &[String], server_addrs: &[SocketAddr]) -> Vec<UplinkConfig> {
+    interfaces
+        .iter()
+        .flat_map(|interface| {
+            server_addrs
+                .iter()
+                .enumerate()
+                .map(move |(endpoint_index, server_addr)| {
+                    let local_addr = util::get_interface_primary_address(interface)
+                        .filter(|ip| ip.is_ipv4() == server_addr.is_ipv4())
+                        .map(|ip| SocketAddr::new(ip, 0));
+
+                    UplinkConfig {
+                        id: if server_addrs.len() == 1 {
+                            interface.clone().into()
+                        } else {
+                            format!("{interface}-{endpoint_index}").into()
+                        },
+                        interface: Some(interface.clone()),
+                        local_addr,
+                        remote_addr: *server_addr,
+                        protocol: TransportProtocol::Udp,
+                        weight: 100,
+                        enabled: true,
+                        ..Default::default()
+                    }
+                })
+        })
+        .collect()
 }
 
 /// Start TUN tunnel (true VPN mode)
@@ -199,22 +274,7 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
     println!();
 
     // Discover interfaces
-    let interfaces = if args.auto_discover {
-        util::get_network_interfaces()
-            .into_iter()
-            .filter(|i| i.is_up && !i.is_loopback)
-            .map(|i| i.name)
-            .collect::<Vec<_>>()
-    } else if !args.interface.is_empty() {
-        args.interface.clone()
-    } else {
-        util::get_network_interfaces()
-            .into_iter()
-            .filter(|i| i.is_up && !i.is_loopback)
-            .take(2)
-            .map(|i| i.name)
-            .collect::<Vec<_>>()
-    };
+    let interfaces = discover_client_interfaces(args.auto_discover, &args.interface);
 
     if interfaces.is_empty() {
         return Err(triglav::Error::NoAvailableUplinks);
@@ -252,10 +312,14 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
             .push(format!("{}/32", addr.ip()));
     }
 
+    let mut multipath_config = MultipathConfig::default();
+    multipath_config.scheduler.strategy = args.strategy.into();
+
     let tunnel_config = TunnelConfig {
         tun: tun_config,
         nat: nat_config,
         routing: route_config,
+        multipath: multipath_config,
         ..Default::default()
     };
 
@@ -282,16 +346,7 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
     println!();
 
     // Add uplinks
-    for iface in &interfaces {
-        let uplink_cfg = UplinkConfig {
-            id: iface.clone().into(),
-            interface: Some(iface.clone()),
-            remote_addr: server_addrs[0],
-            protocol: TransportProtocol::Udp,
-            weight: 100,
-            enabled: true,
-            ..Default::default()
-        };
+    for uplink_cfg in build_uplink_configs(&interfaces, server_addrs) {
         runner.add_uplink(uplink_cfg)?;
     }
 
@@ -329,7 +384,10 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
     println!("  Uplinks:  {} active", runner.manager().uplink_count());
     println!("  Strategy: {:?}", args.strategy);
     #[cfg(feature = "metrics")]
-    println!("  Status:   {}", format!("http://{}", args.metrics_addr).cyan());
+    println!(
+        "  Status:   {}",
+        format!("http://{}", args.metrics_addr).cyan()
+    );
     println!();
     println!("{} Tunnel running. Press Ctrl+C to stop.", "●".green());
     println!();
@@ -389,23 +447,7 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
     println!();
 
     // Discover or use specified interfaces
-    let interfaces = if args.auto_discover {
-        util::get_network_interfaces()
-            .into_iter()
-            .filter(|i| i.is_up && !i.is_loopback)
-            .map(|i| i.name)
-            .collect::<Vec<_>>()
-    } else if !args.interface.is_empty() {
-        args.interface.clone()
-    } else {
-        // Default: try to find usable interfaces
-        util::get_network_interfaces()
-            .into_iter()
-            .filter(|i| i.is_up && !i.is_loopback)
-            .take(2)
-            .map(|i| i.name)
-            .collect::<Vec<_>>()
-    };
+    let interfaces = discover_client_interfaces(args.auto_discover, &args.interface);
 
     if interfaces.is_empty() {
         return Err(triglav::Error::NoAvailableUplinks);
@@ -417,19 +459,8 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
     }
     println!();
 
-    // Create uplink configs
-    let uplinks: Vec<UplinkConfig> = interfaces
-        .iter()
-        .map(|iface| UplinkConfig {
-            id: iface.clone().into(),
-            interface: Some(iface.clone()),
-            remote_addr: server_addrs[0], // Use first server addr
-            protocol: TransportProtocol::Udp,
-            weight: 100,
-            enabled: true,
-            ..Default::default()
-        })
-        .collect();
+    // Create uplink configs for every interface/server endpoint pair.
+    let uplinks = build_uplink_configs(&interfaces, server_addrs);
 
     // Create multipath manager
     let keypair = KeyPair::generate();
@@ -486,7 +517,10 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
     println!("  Uplinks:  {} active", manager.uplink_count());
     println!("  Strategy: {:?}", args.strategy);
     #[cfg(feature = "metrics")]
-    println!("  Status:   {}", format!("http://{}", args.metrics_addr).cyan());
+    println!(
+        "  Status:   {}",
+        format!("http://{}", args.metrics_addr).cyan()
+    );
 
     // Start SOCKS5 proxy if requested
     if let Some(socks_port) = args.socks {

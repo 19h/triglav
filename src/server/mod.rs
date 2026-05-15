@@ -7,6 +7,8 @@
 //! - Signal handling
 
 mod daemon;
+#[cfg(feature = "metrics")]
+mod runtime;
 mod sessions;
 mod signals;
 mod users;
@@ -19,5 +21,7 @@ pub use users::{AuthorizedKey, KeyStore};
 pub use users::{User, UserKey, UserManager, UserRegistration, UserRole};
 
 pub use daemon::*;
+#[cfg(feature = "metrics")]
+pub use runtime::*;
 pub use sessions::*;
 pub use signals::*;

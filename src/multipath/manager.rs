@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use futures::future::join_all;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
@@ -420,8 +421,16 @@ impl MultipathManager {
 
         let uplinks: Vec<_> = self.uplinks.iter().map(|r| r.value().clone()).collect();
 
-        for uplink in uplinks {
-            if let Err(e) = self.connect_uplink(&uplink, &remote_public).await {
+        let connect_attempts = uplinks.into_iter().map(|uplink| {
+            let remote_public = remote_public.clone();
+            async move {
+                let result = self.connect_uplink(&uplink, &remote_public).await;
+                (uplink, result)
+            }
+        });
+
+        for (uplink, result) in join_all(connect_attempts).await {
+            if let Err(e) = result {
                 tracing::warn!(
                     uplink = %uplink.id(),
                     error = %e,

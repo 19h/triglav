@@ -557,7 +557,7 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         }
 
         guard !settings.authKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            presentError("Paste a tg1_ auth key before connecting.")
+            presentError("Paste a tg1 auth key before connecting.")
             return
         }
 

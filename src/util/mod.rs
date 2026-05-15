@@ -47,6 +47,122 @@ impl NetworkInterface {
     }
 }
 
+/// Build the server endpoints that should be embedded in client auth keys.
+///
+/// Wildcard bind addresses such as `0.0.0.0:7443` are useful for listening, but
+/// clients cannot dial them. For those binds, advertise real interface
+/// addresses on the same port. If the host has globally routable addresses,
+/// only those are advertised to keep keys compact and useful from outside the
+/// local network. Otherwise all usable non-loopback, non-link-local addresses
+/// are advertised.
+pub fn advertised_server_addrs(listen_addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    advertised_server_addrs_from_interfaces(listen_addrs, &get_usable_interfaces())
+}
+
+fn advertised_server_addrs_from_interfaces(
+    listen_addrs: &[SocketAddr],
+    interfaces: &[NetworkInterface],
+) -> Vec<SocketAddr> {
+    let interface_ips = interfaces
+        .iter()
+        .filter(|iface| iface.is_up && !iface.is_loopback && is_usable_advertised_ip(iface.address))
+        .map(|iface| iface.address)
+        .collect::<Vec<_>>();
+
+    let public_ips = interface_ips
+        .iter()
+        .copied()
+        .filter(|ip| is_public_ip(*ip))
+        .collect::<Vec<_>>();
+    let wildcard_ips = if public_ips.is_empty() {
+        interface_ips.as_slice()
+    } else {
+        public_ips.as_slice()
+    };
+
+    let mut addrs = Vec::new();
+    for listen_addr in listen_addrs {
+        if listen_addr.ip().is_unspecified() {
+            for ip in wildcard_ips {
+                if listen_addr.is_ipv4() == ip.is_ipv4() {
+                    addrs.push(SocketAddr::new(*ip, listen_addr.port()));
+                }
+            }
+        } else {
+            addrs.push(*listen_addr);
+        }
+    }
+
+    if addrs.is_empty() {
+        addrs.extend(listen_addrs.iter().copied());
+    }
+
+    addrs.sort_by(advertised_addr_cmp);
+    addrs.dedup();
+    addrs
+}
+
+fn advertised_addr_cmp(left: &SocketAddr, right: &SocketAddr) -> std::cmp::Ordering {
+    match (left.ip(), right.ip()) {
+        (IpAddr::V4(left_ip), IpAddr::V4(right_ip)) => left_ip
+            .octets()
+            .cmp(&right_ip.octets())
+            .then(left.port().cmp(&right.port())),
+        (IpAddr::V6(left_ip), IpAddr::V6(right_ip)) => left_ip
+            .octets()
+            .cmp(&right_ip.octets())
+            .then(left.port().cmp(&right.port())),
+        (IpAddr::V4(_), IpAddr::V6(_)) => std::cmp::Ordering::Less,
+        (IpAddr::V6(_), IpAddr::V4(_)) => std::cmp::Ordering::Greater,
+    }
+}
+
+fn is_usable_advertised_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_broadcast()
+                && !ip.is_multicast()
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && segments[0] & 0xffc0 != 0xfe80
+        }
+    }
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_broadcast()
+                && !ip.is_documentation()
+                && !ip.is_multicast()
+                && !ip.is_unspecified()
+                && !(octets[0] == 100 && (octets[1] & 0b1100_0000) == 64)
+                && !(octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                && octets[0] < 224
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && segments[0] & 0xffc0 != 0xfe80
+                && segments[0] & 0xfe00 != 0xfc00
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
+}
+
 /// Guess interface type from name.
 pub fn guess_interface_type(name: &str) -> InterfaceType {
     let name = name.to_lowercase();
@@ -204,4 +320,61 @@ pub fn if_indextoname(index: u32) -> Option<String> {
 #[cfg(not(unix))]
 pub fn if_indextoname(_index: u32) -> Option<String> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn iface(address: &str) -> NetworkInterface {
+        NetworkInterface {
+            name: "eth0".to_string(),
+            index: 1,
+            address: address.parse().unwrap(),
+            netmask: None,
+            broadcast: None,
+            is_up: true,
+            is_running: true,
+            is_loopback: false,
+            mtu: 1500,
+            interface_type: InterfaceType::Ethernet,
+            mac_address: None,
+        }
+    }
+
+    #[test]
+    fn advertised_server_addrs_prefers_public_ips_for_wildcard_binds() {
+        let listen = ["0.0.0.0:7443".parse().unwrap()];
+        let interfaces = [iface("10.0.0.5"), iface("93.184.216.34")];
+
+        let addrs = advertised_server_addrs_from_interfaces(&listen, &interfaces);
+
+        assert_eq!(addrs, ["93.184.216.34:7443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn advertised_server_addrs_falls_back_to_private_ips() {
+        let listen = ["0.0.0.0:7443".parse().unwrap()];
+        let interfaces = [iface("10.0.0.5"), iface("192.168.1.20")];
+
+        let addrs = advertised_server_addrs_from_interfaces(&listen, &interfaces);
+
+        assert_eq!(
+            addrs,
+            [
+                "10.0.0.5:7443".parse().unwrap(),
+                "192.168.1.20:7443".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn advertised_server_addrs_preserves_explicit_listen_addresses() {
+        let listen = ["203.0.113.10:7443".parse().unwrap()];
+        let interfaces = [iface("93.184.216.34")];
+
+        let addrs = advertised_server_addrs_from_interfaces(&listen, &interfaces);
+
+        assert_eq!(addrs, listen.to_vec());
+    }
 }

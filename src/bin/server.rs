@@ -644,7 +644,9 @@ async fn main() -> Result<()> {
     };
 
     // Print connection key
-    let auth_key = triglav::types::AuthKey::new(*keypair.public.as_bytes(), vec![listen_addr]);
+    let advertised_addrs = triglav::util::advertised_server_addrs(&[listen_addr]);
+    let auth_key =
+        triglav::types::AuthKey::new(*keypair.public.as_bytes(), advertised_addrs.clone());
     if !daemon_mode {
         println!();
         println!("╔══════════════════════════════════════════╗");
@@ -656,6 +658,10 @@ async fn main() -> Result<()> {
         println!("╚══════════════════════════════════════════╝");
         println!();
         println!("Listening on: {}", listen_addr);
+        println!("Advertised endpoints:");
+        for addr in &advertised_addrs {
+            println!("  {}", addr);
+        }
         println!("Metrics at:   http://{}", metrics_addr);
         println!();
         println!("Client Connection Key:");

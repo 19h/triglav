@@ -36,7 +36,7 @@ pub struct Cli {
     pub config: Option<PathBuf>,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(short, long, global = true, default_value = "info")]
+    #[arg(long, global = true, default_value = "info")]
     pub log_level: String,
 
     /// Output format
@@ -124,7 +124,7 @@ pub struct ServerArgs {
 /// TUN tunnel command arguments (recommended mode)
 #[derive(Args, Debug)]
 pub struct TunArgs {
-    /// Server key (tg1_...)
+    /// Server key (tg1...)
     pub key: String,
 
     /// Local HTTP status and metrics address
@@ -187,7 +187,7 @@ pub struct TunArgs {
 /// Connect command arguments (legacy proxy mode)
 #[derive(Args, Debug)]
 pub struct ConnectArgs {
-    /// Server key (tg1_...)
+    /// Server key (tg1...)
     pub key: String,
 
     /// Local HTTP status and metrics address

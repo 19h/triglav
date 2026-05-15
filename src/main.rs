@@ -112,7 +112,8 @@ async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
     };
 
     // Generate client key
-    let client_key = AuthKey::new(*keypair.public.as_bytes(), args.listen.clone());
+    let advertised_addrs = util::advertised_server_addrs(&args.listen);
+    let client_key = AuthKey::new(*keypair.public.as_bytes(), advertised_addrs.clone());
     println!();
     println!("{}", "Client Connection Key:".bright_white().bold());
     println!("{}", "─".repeat(50));
@@ -129,6 +130,12 @@ async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
     for addr in &args.listen {
         let protocol = if args.tcp_fallback { "UDP+TCP" } else { "UDP" };
         println!("  {} {} ({})", "→".cyan(), addr, protocol);
+    }
+    println!();
+
+    println!("{}", "Advertised endpoints:".bright_white());
+    for addr in &advertised_addrs {
+        println!("  {} {}", "→".cyan(), addr);
     }
     println!();
 

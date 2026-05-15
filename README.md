@@ -27,20 +27,20 @@ Triglav uses all available connections simultaneously. When WiFi signal drops, t
 
 ```bash
 triglav server --generate-key --listen 0.0.0.0:7443
-# Prints: tg1_<base64-encoded-key>
+# Prints an alphanumeric key starting with tg1
 ```
 
 **Client** (on your laptop):
 
 ```bash
 # Full VPN mode (recommended) - routes ALL traffic through tunnel
-sudo triglav tun tg1_<key> --full-tunnel --auto-discover
+sudo triglav tun tg1KEY --full-tunnel --auto-discover
 
 # Split tunnel - only route specific networks
-sudo triglav tun tg1_<key> --route 10.0.0.0/8 --route 192.168.0.0/16
+sudo triglav tun tg1KEY --route 10.0.0.0/8 --route 192.168.0.0/16
 
 # Legacy proxy mode (no root required)
-triglav connect tg1_<key> --socks 1080 --auto-discover
+triglav connect tg1KEY --socks 1080 --auto-discover
 ```
 
 With TUN mode, all applications automatically use the tunnel—no proxy configuration needed. Your browser, SSH, curl, games, everything just works.
@@ -193,7 +193,7 @@ Client                              Server
   |<═══════ encrypted channel ════════>|
 ```
 
-Each uplink maintains its own Noise session. If one uplink is compromised, others remain secure. The server's public key is embedded in the connection key (`tg1_...`), enabling trust-on-first-use without a PKI.
+Each uplink maintains its own Noise session. If one uplink is compromised, others remain secure. The server's public key is embedded in the connection key (`tg1...`), enabling trust-on-first-use without a PKI.
 
 ### Protocol
 
@@ -320,7 +320,7 @@ listen = "127.0.0.1:9090"
 
 ```toml
 [client]
-auth_key = "tg1_..."
+auth_key = "tg1..."
 auto_discover = true
 
 [tun]
@@ -364,7 +364,7 @@ nat_penalty_weight = 0.1
 
 ```toml
 [client]
-auth_key = "tg1_..."
+auth_key = "tg1..."
 auto_discover = true
 socks_port = 1080
 http_proxy_port = 8080
@@ -375,7 +375,7 @@ uplinks = ["en0", "en1", "pdp_ip0"]
 
 ## The AuthKey Format
 
-The `tg1_<base64url>` key encodes:
+The auth key is the `tg1` prefix followed by a base58 payload. It encodes:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -385,7 +385,7 @@ The `tg1_<base64url>` key encodes:
 │ Address 2: [type:1][ip:4|16][port:2]                         │
 │ ...                                                          │
 └──────────────────────────────────────────────────────────────┘
-type: 1 = IPv4, 2 = IPv6
+type: 4 = IPv4, 6 = IPv6
 ```
 
 This single string contains everything a client needs: the server's identity (public key) and how to reach it (addresses). Share it via QR code, messaging, or anywhere you'd share a URL.

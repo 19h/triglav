@@ -487,7 +487,7 @@ private struct ConnectionPanel: View {
                 SecureInputRow(
                     label: "Auth Key",
                     text: $model.settings.authKey,
-                    placeholder: "tg1_..."
+                    placeholder: "tg1..."
                 )
             }
 

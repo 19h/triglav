@@ -449,6 +449,8 @@ pub struct AuthKey {
 impl AuthKey {
     /// Key prefix for identification
     const PREFIX: &'static str = "tg1";
+    const BASE58_ALPHABET: &'static [u8; 58] =
+        b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
     /// Create a new auth key from components.
     pub fn new(server_pubkey: [u8; 32], server_addrs: Vec<SocketAddr>) -> Self {
@@ -470,11 +472,10 @@ impl AuthKey {
             }
         }
 
-        let encoded =
-            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &data);
+        let encoded = Self::encode_base58(&data);
 
         Self {
-            key: format!("{}_{}", Self::PREFIX, encoded),
+            key: format!("{}{}", Self::PREFIX, encoded),
             server_pubkey: Some(server_pubkey),
             server_addrs,
         }
@@ -484,14 +485,18 @@ impl AuthKey {
     pub fn parse(key: &str) -> Result<Self, crate::Error> {
         use base64::Engine;
 
-        let parts: Vec<&str> = key.split('_').collect();
-        if parts.len() != 2 || parts[0] != Self::PREFIX {
+        let data = if let Some(encoded) = key.strip_prefix(&format!("{}_", Self::PREFIX)) {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|e| crate::Error::InvalidKey(format!("base64 decode failed: {e}")))?
+        } else if let Some(encoded) = key.strip_prefix(Self::PREFIX) {
+            if encoded.is_empty() {
+                return Err(crate::Error::InvalidKey("invalid key format".into()));
+            }
+            Self::decode_base58(encoded)?
+        } else {
             return Err(crate::Error::InvalidKey("invalid key format".into()));
-        }
-
-        let data = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(parts[1])
-            .map_err(|e| crate::Error::InvalidKey(format!("base64 decode failed: {e}")))?;
+        };
 
         if data.len() < 32 {
             return Err(crate::Error::InvalidKey("key too short".into()));
@@ -564,6 +569,67 @@ impl AuthKey {
     pub fn as_str(&self) -> &str {
         &self.key
     }
+
+    fn encode_base58(data: &[u8]) -> String {
+        let leading_zeroes = data.iter().take_while(|&&byte| byte == 0).count();
+        let mut digits = Vec::<u8>::new();
+
+        for &byte in data {
+            let mut carry = u32::from(byte);
+            for digit in &mut digits {
+                let value = u32::from(*digit) * 256 + carry;
+                *digit = (value % 58) as u8;
+                carry = value / 58;
+            }
+
+            while carry > 0 {
+                digits.push((carry % 58) as u8);
+                carry /= 58;
+            }
+        }
+
+        let mut encoded = String::with_capacity(leading_zeroes + digits.len());
+        for _ in 0..leading_zeroes {
+            encoded.push('1');
+        }
+        for digit in digits.iter().rev() {
+            encoded.push(Self::BASE58_ALPHABET[*digit as usize] as char);
+        }
+        encoded
+    }
+
+    fn decode_base58(encoded: &str) -> Result<Vec<u8>, crate::Error> {
+        let leading_zeroes = encoded.bytes().take_while(|&byte| byte == b'1').count();
+        let mut bytes = Vec::<u8>::new();
+
+        for byte in encoded.bytes().skip(leading_zeroes) {
+            let mut carry = u32::from(Self::base58_value(byte).ok_or_else(|| {
+                crate::Error::InvalidKey(format!("invalid base58 character: {}", byte as char))
+            })?);
+
+            for value_byte in &mut bytes {
+                let value = u32::from(*value_byte) * 58 + carry;
+                *value_byte = (value % 256) as u8;
+                carry = value / 256;
+            }
+
+            while carry > 0 {
+                bytes.push((carry % 256) as u8);
+                carry /= 256;
+            }
+        }
+
+        let mut decoded = vec![0u8; leading_zeroes];
+        decoded.extend(bytes.iter().rev());
+        Ok(decoded)
+    }
+
+    fn base58_value(byte: u8) -> Option<u8> {
+        Self::BASE58_ALPHABET
+            .iter()
+            .position(|&candidate| candidate == byte)
+            .map(|position| position as u8)
+    }
 }
 
 impl fmt::Display for AuthKey {
@@ -613,5 +679,34 @@ impl TrafficStats {
         self.packets_received += other.packets_received;
         self.packets_dropped += other.packets_dropped;
         self.packets_retransmitted += other.packets_retransmitted;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_key_new_emits_alphanumeric_key() {
+        let server_pubkey = [7u8; 32];
+        let server_addrs = vec!["93.184.216.34:7443".parse().unwrap()];
+
+        let key = AuthKey::new(server_pubkey, server_addrs.clone());
+        let parsed = AuthKey::parse(key.as_str()).unwrap();
+
+        assert!(key.as_str().starts_with("tg1"));
+        assert!(key.as_str().chars().all(|ch| ch.is_ascii_alphanumeric()));
+        assert_eq!(parsed.server_pubkey(), server_pubkey);
+        assert_eq!(parsed.server_addrs(), server_addrs);
+    }
+
+    #[test]
+    fn auth_key_parse_accepts_legacy_base64url_underscores() {
+        let key = "tg1_wX9-W_GSLswQds7aWisQxpWY10WHmg3AUYZL5YaMmnIEAAAAAB0T";
+
+        let parsed = AuthKey::parse(key).expect("key with '_' in base64url payload should parse");
+
+        assert_eq!(parsed.as_str(), key);
+        assert_eq!(parsed.server_addrs(), &["0.0.0.0:7443".parse().unwrap()]);
     }
 }

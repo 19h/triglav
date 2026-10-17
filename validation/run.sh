@@ -51,6 +51,8 @@ PY
     TRIGLAV_BIN_DIR=/build/release timeout 600 bash validation/netns.sh > /evidence/network.log 2>&1
     TRIGLAV_BIN_DIR=/build/release timeout 180 bash validation/outer_ipv6.sh > /evidence/outer-ipv6.log 2>&1
     TRIGLAV_BIN_DIR=/build/release timeout 300 bash validation/recovery.sh > /evidence/recovery.log 2>&1
+    mkdir /evidence/mtu
+    TRIGLAV_TEST_MTU=1430 TRIGLAV_EVIDENCE_DIR=/evidence/mtu TRIGLAV_BIN_DIR=/build/release timeout 180 bash validation/outer_ipv6.sh > /evidence/mtu.log 2>&1
     sha256sum -c /evidence/source-sha256.txt > /evidence/source-verification.log
     sha256sum /evidence/source.tar.gz /evidence/bin/* > /evidence/archive-sha256.txt
     python3 validation/report.py /evidence > /evidence/report.log

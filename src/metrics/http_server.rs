@@ -207,6 +207,8 @@ pub struct QualityStatus {
 /// Tunnel-specific runtime information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_mtu: Option<u16>,
     pub tun_name: String,
     pub full_tunnel: bool,
     pub include_routes: Vec<String>,

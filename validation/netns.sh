@@ -2,6 +2,7 @@
 # Run inside an isolated privileged Linux container; never changes host routes.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+source "$ROOT/validation/readiness.sh"
 OUT=${TRIGLAV_EVIDENCE_DIR:-$(mktemp -d /tmp/triglav-evidence.XXXXXX)}
 printf 'Evidence: %s\n' "$OUT"
 BIN=${TRIGLAV_BIN_DIR:-/build/debug}
@@ -90,6 +91,7 @@ for i in {1..100}; do
   sleep 0.1
 done
 ip -n tgproof-client route show >"$OUT/client-routes.txt"
+wait_client_paths tgproof-client 9091 2 "$OUT/client-ready.json"
 ip netns exec tgproof-client ping -n -c3 -W3 198.18.0.2 >"$OUT/ping.txt"
 ip netns exec tgproof-exit curl --fail --silent http://127.0.0.1:9090/status >"$OUT/before-single-flow.json"
 ip netns exec tgproof-client python3 "$ROOT/validation/traffic.py" 262144 1 >"$OUT/tcp.json"
@@ -189,10 +191,7 @@ PYMETRICS
 
 ip netns exec tgproof-client "$BIN/triglav" connect "$key" --interface up1 --interface up2 --socks 11080 --http-proxy 18080 --metrics-addr 127.0.0.1:9093 --strategy wrr >"$OUT/proxy-client.log" 2>&1 &
 proxy_pid=$!; pids+=($proxy_pid)
-for i in {1..100}; do
-  if ip netns exec tgproof-client curl --silent --fail http://127.0.0.1:9093/status >/dev/null; then break; fi
-  sleep .1
-done
+wait_client_paths tgproof-client 9093 2 "$OUT/proxy-ready.json"
 ip netns exec tgproof-client python3 "$ROOT/validation/proxies.py" >"$OUT/proxies.json"
 # Allow the authenticated EOFs to finish the server's per-stream accounting.
 sleep .2
@@ -214,6 +213,7 @@ for i in {1..100}; do
   sleep .1
 done
 [[ -n "$address2" ]]
+wait_client_paths tgproof-client 9092 2 "$OUT/client2-ready.json"
 ip -n tgproof-client rule add from "$address2" table 200
 ip -n tgproof-client route add 198.18.0.0/24 dev tg1 table 200
 ip netns exec tgproof-client python3 "$ROOT/validation/traffic.py" 262144 4 >"$OUT/client1-concurrent.json" &

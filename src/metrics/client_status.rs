@@ -119,6 +119,7 @@ impl StatusProvider for ClientStatusProvider {
                 packets_dropped: quality.stats.packets_dropped,
             }),
             tunnel: self.runtime.tunnel.as_ref().map(|tunnel| TunnelStatus {
+                negotiated_mtu: Some(self.manager.negotiated_mtu()),
                 tun_name: tunnel.tun_name.clone(),
                 full_tunnel: tunnel.full_tunnel,
                 include_routes: tunnel.include_routes.clone(),

@@ -103,6 +103,7 @@ pub struct TunHandle {
 pub struct TunDevice {
     /// Configuration used to create this device.
     config: TunConfig,
+    active_mtu: parking_lot::Mutex<u16>,
 
     /// Actual device name (may differ from requested).
     name: String,
@@ -154,7 +155,7 @@ impl TunDevice {
 
     /// Get the MTU.
     pub fn mtu(&self) -> u16 {
-        self.config.mtu
+        *self.active_mtu.lock()
     }
 
     /// Get the configuration.
@@ -287,6 +288,7 @@ impl TunDevice {
         });
 
         let mut device = Self {
+            active_mtu: parking_lot::Mutex::new(config.mtu),
             config,
             name: actual_name,
             handle,
@@ -294,7 +296,7 @@ impl TunDevice {
         };
 
         // Set MTU
-        device.set_mtu(device.config.mtu)?;
+        device.apply_mtu(device.config.mtu)?;
 
         Ok(device)
     }
@@ -411,6 +413,7 @@ impl TunDevice {
         });
 
         let mut device = Self {
+            active_mtu: parking_lot::Mutex::new(config.mtu),
             config,
             name: actual_name,
             handle,
@@ -418,7 +421,7 @@ impl TunDevice {
         };
 
         // Set MTU
-        device.set_mtu(device.config.mtu)?;
+        device.apply_mtu(device.config.mtu)?;
 
         Ok(device)
     }
@@ -432,7 +435,17 @@ impl TunDevice {
         ))
     }
 
-    fn set_mtu(&self, mtu: u16) -> Result<()> {
+    /// Lower the live link MTU; existing sessions continue using the smaller value.
+    pub fn reduce_mtu(&self, mtu: u16) -> Result<()> {
+        let mut current = self.active_mtu.lock();
+        if mtu < *current {
+            self.apply_mtu(mtu)?;
+            *current = mtu;
+        }
+        Ok(())
+    }
+
+    fn apply_mtu(&self, mtu: u16) -> Result<()> {
         #[cfg(unix)]
         {
             use std::process::Command;

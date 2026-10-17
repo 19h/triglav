@@ -12,7 +12,10 @@ from traffic import read_exact
 
 out = pathlib.Path(sys.argv[1])
 results = []
-with socket.create_connection(('198.18.0.2', 19000), timeout=90) as sock:
+ipv6 = len(sys.argv) > 2 and sys.argv[2] == 'tcp6'
+target = '2001:db8:85::2' if ipv6 else '198.18.0.2'
+expected_peer = '2001:db8:85::1' if ipv6 else '198.18.0.1'
+with socket.create_connection((target, 19000), timeout=90) as sock:
     for index in range(1200):
         if (out / 'stop-flow').exists():
             break
@@ -24,7 +27,7 @@ with socket.create_connection(('198.18.0.2', 19000), timeout=90) as sock:
         size, = struct.unpack('!I', read_exact(sock, 4))
         assert size == len(payload)
         assert read_exact(sock, size) == payload
-        assert peer == '198.18.0.1', peer
+        assert peer == expected_peer, peer
         results.append({'chunk': index, 'sha256': hashlib.sha256(payload).hexdigest(),
                         'bytes_each_direction': size, 'elapsed_s': time.monotonic() - start})
         (out / 'progress.txt').write_text(str(index + 1))

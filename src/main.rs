@@ -142,6 +142,7 @@ async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
     exit_config.access_token = triglav::server::parse_access_token(args.access_token.as_deref())?;
     exit_config.max_sessions = args.max_connections;
     exit_config.tun.name = args.tun_name;
+    exit_config.tun.mtu = args.mtu;
     exit_config.tun.ipv4_addr = Some(args.tun_ipv4);
     exit_config.tun.ipv6_addr = if args.ipv4_only {
         None
@@ -483,6 +484,7 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
     // Build tunnel configuration
     let mut tun_config = TunConfig::default();
     tun_config.name = args.tun_name.clone();
+    tun_config.mtu = args.mtu;
     tun_config.ipv4_addr = Some(ipv4);
 
     let mut nat_config = NatConfig::default();
@@ -1419,4 +1421,23 @@ fn save_keypair(keypair: &KeyPair, path: &PathBuf) -> Result<()> {
         .open(path)?
         .write_all(keypair.secret.to_base64().as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod mtu_argument_tests {
+    use super::*;
+
+    #[test]
+    fn mtu_arguments_accept_the_supported_dual_stack_range() {
+        for mtu in ["1280", "1340", "1367"] {
+            let cli = Cli::try_parse_from(["triglav", "tun", "placeholder", "--mtu", mtu]).unwrap();
+            let Commands::Tun(args) = cli.command else {
+                panic!("wrong command")
+            };
+            assert_eq!(args.mtu.to_string(), mtu);
+        }
+        for mtu in ["0", "1279", "1368", "65535"] {
+            assert!(Cli::try_parse_from(["triglav", "tun", "placeholder", "--mtu", mtu]).is_err());
+        }
+    }
 }

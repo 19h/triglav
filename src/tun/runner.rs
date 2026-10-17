@@ -174,10 +174,9 @@ impl TunnelRunner {
         let keypair = KeyPair::generate();
 
         // Create multipath manager
-        let manager = Arc::new(MultipathManager::new(
-            config.multipath.clone(),
-            keypair.clone(),
-        ));
+        let mut multipath = config.multipath.clone();
+        multipath.inner_mtu = config.tun.mtu;
+        let manager = Arc::new(MultipathManager::new(multipath, keypair.clone()));
 
         let (event_tx, _) = broadcast::channel(256);
 
@@ -229,6 +228,8 @@ impl TunnelRunner {
     pub async fn connect(&mut self, remote_public: PublicKey) -> Result<()> {
         // Connect multipath manager
         self.manager.connect_until_ready(remote_public).await?;
+        self.tun.reduce_mtu(self.manager.negotiated_mtu())?;
+        self.config.tun.mtu = self.tun.mtu();
         if let Some(ipv4) = self.manager.assigned_ipv4() {
             self.tun.set_ipv4_address(ipv4);
             self.config.tun.ipv4_addr = Some(ipv4);
@@ -313,6 +314,7 @@ impl TunnelRunner {
         // Start maintenance loop
         self.manager.start_maintenance_loop();
 
+        let mut maintenance = tokio::time::interval(Duration::from_millis(100));
         loop {
             if !self.running.load(Ordering::SeqCst) {
                 break;
@@ -338,7 +340,8 @@ impl TunnelRunner {
                 }
 
                 // Periodic maintenance
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                _ = maintenance.tick() => {
+                    self.tun.reduce_mtu(self.manager.negotiated_mtu())?;
                     // Check if we should stop
                     if !self.running.load(Ordering::SeqCst) {
                         break;

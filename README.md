@@ -28,6 +28,8 @@ proxies, with a separate encrypted TCP stream for each application connection.
   bounded reconnect backoff, authenticated NAT rebinding and confirmed rekeying.
 - **Independent encryption:** separate cipher state for each uplink, authenticated
   packet sequencing and replay rejection.
+- **MTU adaptation:** negotiated packet-size ceilings and live reduction when
+  an uplink reports a smaller MTU.
 - **Shared exit:** per-client tunnel addresses, session isolation and optional
   deployment access tokens.
 - **Local proxies and monitoring:** SOCKS5, HTTP CONNECT, JSON status and
@@ -207,11 +209,17 @@ and their configured limits. Defaults cap retransmission storage at 4096 logical
 packets, 8 MiB of payload and 10 s of age; these limits do not bound all process
 memory. See the [resilience acceptance contract](docs/resilience.md).
 
-The default inner MTU is 1340 bytes. Including Triglav framing, encryption, UDP
-and ordinary IP headers, a full-sized packet occupies 1461 bytes over IPv4 or
-1481 bytes over IPv6. Additional encapsulation and smaller path MTUs require
-separate validation. Full-tunnel routing does not configure the system DNS
-resolver.
+The default inner MTU is 1340 bytes. `--mtu` on the TUN client or exit sets a
+ceiling from 1280 to 1367 bytes. Clients account for their interface MTUs and
+negotiate a common ceiling with the exit; a smaller accepted ceiling lowers the
+live TUN interfaces. The shared exit retains its smallest accepted ceiling until
+restart. Full-tunnel routing does not configure the system DNS resolver.
+
+With ordinary IP headers, the outer packet adds 121 bytes over IPv4 or 141 bytes
+over IPv6. Thus a 1340-byte inner packet occupies 1461 or 1481 bytes. A controlled
+1430-byte IPv6 underlay is validated with a 1289-byte inner MTU. Hidden smaller
+router MTUs and additional encapsulation still need an appropriate configured
+ceiling; this is not a complete path-MTU discovery implementation.
 
 Further command options are available through `triglav tun --help`,
 `triglav connect --help` and `triglav-server --help`.
@@ -233,6 +241,8 @@ admission rejection, replay rejection and routing cleanup.
 A separate recovery lane keeps one TCP connection open through a 20 s total
 outage, an exit restart, changed NAT addresses and twenty local path replacements.
 It checks process/session continuity and samples pending-buffer bounds under load.
+A smaller-MTU lane keeps IPv4 and IPv6 TCP connections open during a live MTU
+reduction and audits the resulting UDP packet sizes.
 
 The [R1 baseline from **2026-10-17**](docs/resilience.md#r1-validation-2026-10-17)
 passed 337 Rust tests on each of Linux and
@@ -260,6 +270,7 @@ workflow runs the same command.
 | Windows TUN | Not implemented |
 | Physical NIC, modem and ISP behavior | Outside the namespace validation results |
 | NAT rebinding, changing uplink addresses and exit restart | Covered by the controlled recovery lab; restart continuity requires the same key/prefix and an available lease |
+| Live MTU reduction | Controlled IPv6 underlay reduction to 1430 bytes; negotiated inner MTU 1289 bytes |
 | Arbitrary MTUs and long-duration load | Outside the recorded acceptance profile |
 
 The protocol uses a Noise NK handshake with X25519 and ChaCha20-Poly1305. Its

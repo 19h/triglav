@@ -60,6 +60,10 @@ pub struct MultipathConfig {
     #[serde(default = "default_max_pending_age", with = "humantime_serde")]
     pub max_pending_age: Duration,
 
+    /// Maximum inner IP packet size; must fit a protected datagram.
+    #[serde(default = "default_inner_mtu")]
+    pub inner_mtu: u16,
+
     /// Retry failed path establishment starting at this delay.
     #[serde(default = "default_reconnect_initial", with = "humantime_serde")]
     pub reconnect_initial_delay: Duration,
@@ -174,6 +178,10 @@ fn default_max_pending_bytes() -> usize {
 fn default_max_pending_age() -> Duration {
     Duration::from_secs(10)
 }
+fn default_inner_mtu() -> u16 {
+    1340
+}
+
 fn default_reconnect_initial() -> Duration {
     Duration::from_millis(250)
 }
@@ -232,6 +240,7 @@ impl Default for MultipathConfig {
             max_pending_packets: default_max_pending_packets(),
             max_pending_bytes: default_max_pending_bytes(),
             max_pending_age: default_max_pending_age(),
+            inner_mtu: default_inner_mtu(),
             reconnect_initial_delay: default_reconnect_initial(),
             reconnect_max_delay: default_reconnect_max(),
             peer_silence_timeout: default_peer_silence(),
@@ -409,6 +418,7 @@ pub struct MultipathManager {
     remote_public: RwLock<Option<PublicKey>>,
     next_return_sequence: AtomicU64,
     next_handshake_epoch: AtomicU64,
+    negotiated_mtu: AtomicU16,
     closing: AtomicBool,
     lifecycle: AtomicU64,
     maintenance_generation: AtomicU64,
@@ -456,6 +466,7 @@ impl MultipathManager {
             path_discovery: PathDiscovery::new(config.path_discovery.clone()),
             throughput_optimizer,
             aggregator,
+            negotiated_mtu: AtomicU16::new(config.inner_mtu),
             config,
             session_id: SessionId::generate(),
             connection_id: ConnectionId::new(),
@@ -769,6 +780,31 @@ impl MultipathManager {
             .map(|entry| *entry.key())
     }
 
+    pub fn negotiated_mtu(&self) -> u16 {
+        self.negotiated_mtu.load(Ordering::Acquire)
+    }
+
+    fn offered_mtu(&self, uplink: &Uplink) -> Result<u16> {
+        use crate::protocol::mtu;
+        let mut offered = mtu::validate_mtu(self.config.inner_mtu)?.min(self.negotiated_mtu());
+        if let Some(interface) = &uplink.config().interface {
+            if let Some(info) = crate::util::get_network_interfaces()
+                .into_iter()
+                .find(|i| &i.name == interface)
+            {
+                offered = offered.min(
+                    mtu::path_inner_mtu(info.mtu, uplink.config().remote_addr.is_ipv6()).map_err(
+                        |error| Error::ConnectionFailed {
+                            addr: uplink.config().remote_addr,
+                            reason: error.to_string(),
+                        },
+                    )?,
+                );
+            }
+        }
+        Ok(offered)
+    }
+
     async fn send_fast_probe(&self, uplink_id: u16) {
         let Some(uplink) = self.get_uplink(uplink_id) else {
             return;
@@ -783,6 +819,14 @@ impl MultipathManager {
         };
         ping.payload = ping.header.timestamp.to_be_bytes().to_vec();
         if self.assigned_ipv4().is_some() {
+            let Ok(offered) = self.offered_mtu(&uplink) else {
+                uplink.mark_unavailable();
+                return;
+            };
+            let mut challenge = [0; 16];
+            challenge[..8].copy_from_slice(&ping.header.timestamp.to_be_bytes());
+            challenge[8..].copy_from_slice(&rand::random::<[u8; 8]>());
+            ping.payload = crate::protocol::mtu::request(&challenge, offered);
             let Ok(payload) = uplink.encrypt_packet(&ping.payload, seq.0, PacketType::Ping as u8)
             else {
                 return;
@@ -815,6 +859,7 @@ impl MultipathManager {
 
     /// Connect all uplinks to the remote server.
     pub async fn connect(self: &Arc<Self>, remote_public: PublicKey) -> Result<()> {
+        crate::protocol::mtu::validate_mtu(self.config.inner_mtu)?;
         self.closing.store(false, Ordering::Release);
         *self.remote_public.write() = Some(remote_public);
         let lifecycle = self.lifecycle.load(Ordering::Acquire);
@@ -895,6 +940,9 @@ impl MultipathManager {
             match self.connect(remote_public).await {
                 Ok(()) => return Ok(()),
                 Err(Error::ConnectionClosed) => return Err(Error::ConnectionClosed),
+                Err(
+                    error @ (Error::Config(_) | Error::InvalidConfig(_) | Error::InvalidKey(_)),
+                ) => return Err(error),
                 Err(error) => tracing::warn!(%error, "Waiting for an available exit path"),
             }
             let delay = reconnect_delay(&self.config, failures, 0.8 + rand::random::<f64>() * 0.4);
@@ -1065,11 +1113,22 @@ impl MultipathManager {
             )));
         }
 
+        if !recovery_peer && response.starts_with(b"TG2") {
+            if self.offered_mtu(uplink)? < crate::protocol::mtu::DEFAULT_INNER_MTU {
+                return Err(Error::HandshakeFailed(
+                    "TG2 exit cannot negotiate the reduced path MTU".into(),
+                ));
+            }
+            self.negotiated_mtu
+                .fetch_min(crate::protocol::mtu::DEFAULT_INNER_MTU, Ordering::AcqRel);
+        }
+
         tracing::debug!(
             uplink = %uplink.id(),
             "Handshake complete, noise session ready"
         );
 
+        let mut confirmed_rtt = None;
         if recovery_peer {
             if !self
                 .get_uplink(uplink.numeric_id())
@@ -1081,7 +1140,9 @@ impl MultipathManager {
             // encrypted confirmation before exposing the new transport to receivers.
             let sequence = self.next_seq.fetch_add(1, Ordering::SeqCst);
             let challenge: [u8; 16] = rand::random();
-            let payload = noise.encrypt_packet(&challenge, sequence, PacketType::Ping as u8)?;
+            let offered = self.offered_mtu(uplink)?;
+            let confirmation = crate::protocol::mtu::request(&challenge, offered);
+            let payload = noise.encrypt_packet(&confirmation, sequence, PacketType::Ping as u8)?;
             let mut probe = Packet::new(
                 PacketType::Ping,
                 SequenceNumber(sequence),
@@ -1095,6 +1156,7 @@ impl MultipathManager {
             loop {
                 // Every retry needs a fresh record nonce. The challenge remains bound
                 // to this handshake; unrelated data cannot confirm its keys.
+                let sent_at = Instant::now();
                 transport.send(&wire).await?;
                 let end = (tokio::time::Instant::now() + Duration::from_millis(500)).min(deadline);
                 if let Ok(Ok(len)) = tokio::time::timeout_at(end, transport.recv(&mut buf)).await {
@@ -1103,15 +1165,18 @@ impl MultipathManager {
                             && packet.header.uplink_id == uplink.numeric_id()
                             && packet.header.packet_type == PacketType::Pong
                             && packet.header.flags.has(PacketFlags::ENCRYPTED)
-                            && noise
-                                .decrypt_packet(
-                                    &packet.payload,
-                                    packet.header.sequence.0,
-                                    PacketType::Pong as u8,
-                                )
-                                .is_ok_and(|payload| payload == challenge)
                         {
-                            break;
+                            if let Ok(payload) = noise.decrypt_packet(
+                                &packet.payload,
+                                packet.header.sequence.0,
+                                PacketType::Pong as u8,
+                            ) {
+                                let accepted =
+                                    crate::protocol::mtu::confirm(&payload, &challenge, offered)?;
+                                self.negotiated_mtu.fetch_min(accepted, Ordering::AcqRel);
+                                confirmed_rtt = Some(sent_at.elapsed());
+                                break;
+                            }
                         }
                     }
                 }
@@ -1120,7 +1185,8 @@ impl MultipathManager {
                 }
                 // Re-encoding below uses a new nonce so the exit can respond after
                 // a lost Pong without weakening replay protection.
-                let payload = noise.encrypt_packet(&challenge, sequence, PacketType::Ping as u8)?;
+                let payload =
+                    noise.encrypt_packet(&confirmation, sequence, PacketType::Ping as u8)?;
                 probe.payload = payload;
                 probe.header.payload_len = probe.payload.len() as u16;
                 probe.set_flag(PacketFlags::ENCRYPTED);
@@ -1139,6 +1205,9 @@ impl MultipathManager {
         uplink.set_transport(Arc::clone(&transport));
         uplink.set_noise_session(noise);
         uplink.set_connection_state(ConnectionState::Connected);
+        if let Some(rtt) = confirmed_rtt {
+            uplink.record_probe_success(rtt);
+        }
 
         // Detect NAT by comparing configured vs actual local address
         // (Dublin Traceroute technique: NAT detection via address comparison)
@@ -1254,6 +1323,13 @@ impl MultipathManager {
     /// When aggregation is disabled (None), the traditional flow-sticky behavior
     /// is used where each flow is bound to a single uplink.
     pub async fn send_on_flow(&self, flow_id: Option<u64>, data: &[u8]) -> Result<u64> {
+        if self.assigned_ipv4().is_some() && data.len() > usize::from(self.negotiated_mtu()) {
+            return Err(crate::error::TransportError::MtuExceeded {
+                size: data.len(),
+                max: usize::from(self.negotiated_mtu()),
+            }
+            .into());
+        }
         if self.closing.load(Ordering::Acquire) {
             return Err(Error::ConnectionClosed);
         }
@@ -2090,6 +2166,22 @@ impl MultipathManager {
 
     /// Handle pong packet.
     fn handle_pong(&self, packet: &Packet, from_uplink: u16) {
+        if let Some(result) = crate::protocol::mtu::acknowledged(&packet.payload) {
+            let Ok(mtu) = result else {
+                return;
+            };
+            self.negotiated_mtu.fetch_min(mtu, Ordering::AcqRel);
+        } else if crate::protocol::mtu::requested(&packet.payload).is_some_and(|result| {
+            result.is_ok_and(|mtu| mtu < crate::protocol::mtu::DEFAULT_INNER_MTU)
+        }) {
+            // An older exit echoes the request but cannot confirm a lower cap.
+            // Quarantine this path so it cannot keep sending oversized records.
+            if let Some(uplink) = self.get_uplink(from_uplink) {
+                uplink.record_failure("exit cannot negotiate the reduced path MTU");
+                uplink.set_connection_state(ConnectionState::Failed);
+            }
+            return;
+        }
         if packet.payload.len() >= 8 {
             let probe_or_ts = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
             let payload_size = packet.payload.len() as u64;
@@ -2149,7 +2241,9 @@ impl MultipathManager {
                     .map_or(Duration::from_millis(500), |u| {
                         u.rtt().saturating_mul(2).max(Duration::from_millis(100))
                     });
-                if now.duration_since(pending.created_at) >= self.config.max_pending_age
+                if (self.assigned_ipv4().is_some()
+                    && pending.packet.payload.len() > usize::from(self.negotiated_mtu()))
+                    || now.duration_since(pending.created_at) >= self.config.max_pending_age
                     || (now.duration_since(pending.sent_at) >= rto
                         && pending.retries >= self.config.send_retries)
                 {
@@ -2382,28 +2476,9 @@ impl MultipathManager {
                         manager.start_due_reconnects(&mut reconnect_tasks);
                     }
                     _ = ping_interval.tick() => {
-                        // Send ping on all uplinks for quality measurement
-                        for uplink_ref in &manager.uplinks {
-                            let uplink = uplink_ref.value();
+                        for uplink in manager.uplinks() {
                             if uplink.is_noise_ready() {
-                                if let Some(transport) = uplink.get_transport() {
-                                    let seq = SequenceNumber(manager.next_seq.fetch_add(1, Ordering::SeqCst));
-                                    if let Ok(mut ping) = Packet::ping(seq, manager.session_id, uplink.numeric_id()) {
-                                        ping.payload = ping.header.timestamp.to_be_bytes().to_vec();
-                                        ping.header.payload_len = ping.payload.len() as u16;
-                                        ping.header.checksum = 0; // Recomputed by set_flag below, also for legacy peers.
-                                        ping.set_flag(0);
-                                        if manager.assigned_ipv4().is_some() {
-                                            match uplink.encrypt_packet(&ping.payload, seq.0, PacketType::Ping as u8) {
-                                                Ok(payload) => { ping.payload = payload; ping.header.payload_len = ping.payload.len() as u16; ping.set_flag(PacketFlags::ENCRYPTED); }
-                                                Err(_) => continue,
-                                            }
-                                        }
-                                        if let Ok(encoded) = ping.encode() {
-                                            let _ = transport.send(&encoded).await;
-                                        }
-                                    }
-                                }
+                                manager.send_fast_probe(uplink.numeric_id()).await;
                             }
                         }
                     }

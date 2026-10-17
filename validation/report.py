@@ -69,6 +69,11 @@ assert recovery['same_client_process'] and recovery['same_session'] and recovery
 assert recovery['outage_seconds'] == 20 and recovery['exit_restarted']
 assert recovery['address_replacement_rounds'] == 10 and recovery['nat_addresses_rebound'] == 2
 assert len(recovery['final_paths']) == 2
+mtu = load('mtu/outer-ipv6/summary.json')
+assert mtu['result'] == 'PASS'
+assert mtu['dynamic_mtu']['outer_mtu'] == 1430 and mtu['dynamic_mtu']['inner_mtu'] == 1289
+assert mtu['dynamic_mtu']['outer_fragments'] == 0
+assert mtu['dynamic_mtu']['tcp4_connections'] == mtu['dynamic_mtu']['tcp6_connections'] == 1
 summary = {
     'result': 'PASS',
     'binary_profile': 'release',
@@ -93,6 +98,7 @@ summary = {
     'concurrent_proxy_transfers': len(proxies['transfers']),
     'source_manifest_sha256': hashlib.sha256((out/'source-sha256.txt').read_bytes()).hexdigest(),
     'recovery': recovery,
+    'mtu': mtu,
     'unproven': ['physical NIC/ISP deployment', 'macOS TUN runtime', 'arbitrary MTUs and long-duration workloads'],
 }
 (out/'summary.json').write_text(json.dumps(summary, indent=2) + '\n')

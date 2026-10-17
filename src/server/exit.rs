@@ -146,6 +146,7 @@ pub struct ExitStatus {
     pub forwarded_packets: u64,
     pub returned_packets: u64,
     pub rejected_packets: u64,
+    pub tun_mtu: u16,
     pub proxy_connections_by_source: std::collections::BTreeMap<String, u64>,
 }
 
@@ -165,6 +166,7 @@ pub struct ExitServer {
 
 impl ExitServer {
     pub async fn new(config: ExitConfig, keypair: KeyPair) -> Result<Self> {
+        crate::protocol::mtu::validate_mtu(config.tun.mtu)?;
         if config.tun.ipv4_netmask != 24 || config.tun.ipv4_addr.is_none() {
             return Err(Error::Config(
                 "Exit requires an IPv4 /24 TUN network".into(),
@@ -229,6 +231,7 @@ impl ExitServer {
             forwarded_packets: self.forwarded.load(Ordering::Relaxed),
             returned_packets: self.returned.load(Ordering::Relaxed),
             rejected_packets: self.rejected.load(Ordering::Relaxed),
+            tun_mtu: self.tun.mtu(),
             proxy_connections_by_source: self.proxy_sources.lock().clone(),
         }
     }
@@ -327,7 +330,15 @@ impl ExitServer {
                             .map_err(|e| Error::InvalidPacket(e.to_string()))?,
                     )
                 }
-                PacketType::Ping => (PacketType::Pong, payload.clone()),
+                PacketType::Ping => {
+                    if let Some(requested) = crate::protocol::mtu::requested(&payload) {
+                        let mtu = requested?.min(self.tun.mtu());
+                        self.tun.reduce_mtu(mtu)?;
+                        (PacketType::Pong, crate::protocol::mtu::reply(&payload, mtu))
+                    } else {
+                        (PacketType::Pong, payload.clone())
+                    }
+                }
                 _ => return Err(Error::InvalidPacket("unsupported exit record".into())),
             };
             let response = Self::record(

@@ -9,7 +9,7 @@ the fault matrix below passes against the resulting binaries.
 |---|---|---|
 | R1: bounded retransmission | Packet and byte caps; absolute expiry during a total outage; one congestion slot per outstanding path copy; ACK/send race tests; occupancy in `/status` | Validated; evidence below |
 | R2: automatic recovery | Retry failed startup and stale paths with bounded backoff; authenticated rebinding and rekey; retain tunnel addresses across exit restart when the lease is available; stop retries on shutdown | Validated; evidence below |
-| R3: network variability | Explicit MTU configuration and negotiation; dual-stack underlay selection; correct behavior on a constrained path; preserve existing split/full routing | Pending |
+| R3: network variability | Explicit MTU configuration and negotiation; dual-stack underlay selection; correct behavior on a constrained path; preserve existing split/full routing | Validated; evidence below |
 | R4: lifecycle and live faults | Idempotent background tasks; cancellation on shutdown; prolonged total outage, exit restart, changed source endpoint, constrained MTU and repeated recovery in the real-binary lab | Pending |
 
 ## R1: retransmission invariants
@@ -114,6 +114,69 @@ The run retains the matching release executables, source archive, packet capture
 and destination observations. A prior development run exposed missing interface
 rescan behavior; the complete acceptance run includes the periodic-snapshot fix.
 
+## R3: negotiated packet-size limits
+
+`--mtu` on the TUN client and either exit entry point sets an inner-packet ceiling
+between 1280 and 1367 bytes. The default remains 1340 bytes. The lower bound
+preserves the IPv6 minimum link MTU from
+[RFC 8200, section 5](https://www.rfc-editor.org/rfc/rfc8200#section-5).
+The upper bound is the 1400-byte record payload limit less 33 bytes for the
+explicit nonce, authenticated record binding and authentication tag.
+
+| Component | IPv4 underlay, bytes | IPv6 underlay, bytes |
+|---|---|---|
+| Triglav header | 60 | 60 |
+| Record overhead | 33 | 33 |
+| UDP header | 8 | 8 |
+| Ordinary outer IP header | 20 | 40 |
+| Total outside the inner packet | 121 | 141 |
+
+The client offers the minimum of its configured ceiling, previously negotiated
+ceiling and the interface MTU minus this overhead. Encrypted probes carry the
+offer; an authenticated response bound to the probe confirms the exit ceiling.
+The shared exit TUN takes the minimum accepted ceiling, and each client lowers
+its TUN accordingly. The 5 s liveness interval also detects local interface MTU
+reductions. The client TUN loop applies a negotiated reduction on its periodic
+tick. Obsolete retransmission payloads larger than the new ceiling expire.
+
+For the controlled 1430-byte IPv6 underlay, `1430 - 141 = 1289` bytes is the
+negotiated inner MTU. The dedicated lane keeps one IPv4 and one IPv6 TCP socket
+open across the reduction, checks both tunnel MTUs, validates destination bytes,
+and rejects oversized or fragmented UDP records in the steady-state captures.
+The TCP proxy lane is validated separately; its packets are not UDP records.
+
+These controls negotiate ceilings; they do not implement the full datagram
+path-MTU search and probe-size confirmation described in
+[RFC 8899](https://www.rfc-editor.org/rfc/rfc8899). An unobserved smaller router
+MTU still requires an appropriate configured ceiling. Headers and encapsulations
+beyond those in the table require their own allowance. Automatic increases are
+not performed: the ceiling is conservative for the client/exit lifetimes. A
+fresh deployment is needed to recover a larger ceiling. Older exits can retain
+the default 1340-byte operation; reduced ceilings require MTU negotiation support.
+
+The scheduler combines its relative RTT cutoff with the existing absolute RTT
+allowance. Sub-millisecond measurement differences no longer exclude an
+otherwise healthy path. A new path starts with the measured RTT of its encrypted
+confirmation exchange. Proxy acceptance waits for both required paths before
+asserting that both source addresses carried connections.
+
+### R3 validation, 2026-10-17
+
+`validation/artifacts/20261017-resilience-r3-02/summary.json` records a complete
+release pass: 356 Linux Rust tests, 10 explicitly ignored tests, and one separate
+live admission test. The macOS library suite passed 165 tests. Across all four
+network lanes, 349 destination records account for 23,757,638 bytes in each
+direction with matching hashes. The rate-capped median goodput ratio was 1.5161.
+
+The constrained IPv6-underlay lane carried 40 frames on each of the existing
+IPv4 and IPv6 TCP connections after negotiating a 1289-byte inner MTU. Its
+steady-state captures contained no oversized or fragmented UDP records. The
+recovery lane retained one connection across all faults; its largest frame round
+trip was 58.775 s. This is a measured delay, not an upper-bound recovery guarantee.
+
+Source manifest SHA-256:
+`2d8e432814aafaf1c181c6152738ce49464b8a5f1c3d3e3ce8facde9cb81e270`.
+
 ## Assumption register
 
 | ID | Assumption | Falsification probe | Dependent result |
@@ -122,6 +185,7 @@ rescan behavior; the complete acceptance run includes the periodic-snapshot fix.
 | A2 | A restarted exit retains its configured static key and tunnel prefix | Restart the real exit, then repeat with a different key/prefix and require rejection | Authenticated recovery and address continuity |
 | A3 | The previous tunnel address remains available after restart | Restart with another client claiming the old address and require an explicit collision outcome | Reuse of an existing inner flow |
 | A4 | A successful lab run applies to its recorded source, executable and topology | Hash sources and binaries; capture topology and destination records | Reported live acceptance only |
+| A5 | The configured ceiling or local interface MTU accounts for smaller links along the route | Insert a smaller remote-router MTU without changing the local interface; configure a lower ceiling when required | MTU adaptation; no full path-MTU discovery claim |
 
 ## Adjacent findings and bounded scope
 

@@ -119,6 +119,14 @@ are checked independently. The requested lease must remain available for restart
 continuity; a collision is rejected by the handshake rather than silently
 changing the address.
 
+Authenticated probes also negotiate an inner MTU ceiling. The client accounts
+for the local interface and framing overhead; the shared exit and client TUNs
+retain the smallest accepted ceiling. The optional `TRIGLAV_TEST_MTU=1430` IPv6
+lane reduces both outer paths while IPv4 and IPv6 TCP sockets remain open. It
+requires 1289-byte tunnel MTUs, exact destination payloads and no oversized or
+fragmented UDP records in steady-state captures. The UDP size audit excludes
+the separate TCP proxy transport.
+
 A data record carries an explicit 8-byte nonce. The encrypted plaintext binds
 the packet type (1 byte), logical sequence (8 bytes), and payload. The AEAD tag
 adds 16 bytes. Replay state changes only after successful authentication and
@@ -143,6 +151,11 @@ payload limit: `1340 + 33 = 1373 <= 1400`. This calculation assumes an outer
 path MTU of at least 1481 bytes for IPv6 transport, or 1461 bytes for IPv4
 transport. Smaller outer MTUs require configuration or additional PMTU work;
 the default calculation is not proof for every access network.
+
+The supported negotiated inner range is 1280--1367 bytes. This preserves the
+IPv6 minimum and the protected-record payload limit. Ceiling negotiation does
+not implement the complete probe-size search described by RFC 8899; hidden
+path bottlenecks and extra encapsulation still require explicit configuration.
 
 Authenticated record replay tracking takes amortized `O(log W)` time and `O(W)` space,
 with a bounded nonce history; one eviction batch can take `O(W log W)` time. The exit bounds logical sessions by configuration,

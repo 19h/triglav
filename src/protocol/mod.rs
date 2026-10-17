@@ -16,6 +16,7 @@
 
 mod codec;
 mod message;
+pub(crate) mod mtu;
 mod packet;
 pub(crate) mod recovery;
 

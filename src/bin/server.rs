@@ -12,6 +12,8 @@ use triglav::{
 struct Args {
     #[arg(long, env = "TRIGLAV_ACCESS_TOKEN", hide_env_values = true)]
     access_token: Option<String>,
+    #[arg(long, default_value = "1340", value_parser = clap::value_parser!(u16).range(1280..=1367))]
+    mtu: u16,
     #[arg(short, long, default_value = "0.0.0.0:7443")]
     listen: std::net::SocketAddr,
     #[arg(short, long, default_value = "127.0.0.1:9090")]
@@ -65,6 +67,7 @@ async fn main() -> Result<()> {
     config.listen = args.listen;
     config.access_token = triglav::server::parse_access_token(args.access_token.as_deref())?;
     config.tun.name = args.tun_name;
+    config.tun.mtu = args.mtu;
     config.tun.ipv4_addr = Some(args.tun_ipv4);
     config.tun.ipv6_addr = if args.ipv4_only {
         None

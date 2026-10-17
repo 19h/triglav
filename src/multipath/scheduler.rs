@@ -346,7 +346,7 @@ impl Scheduler {
     }
 
     /// Filter out uplinks that would cause latency blocking.
-    /// An uplink is blocked if its RTT exceeds best_rtt * blocking_ratio.
+    /// Block only a material absolute difference as well as a relative slowdown.
     fn filter_latency_blocked<'a>(&self, uplinks: &'a [Arc<Uplink>]) -> Vec<&'a Arc<Uplink>> {
         let usable: Vec<_> = uplinks.iter().filter(|u| u.is_usable()).collect();
 
@@ -365,9 +365,17 @@ impl Scheduler {
             return usable;
         }
 
-        let threshold = Duration::from_secs_f64(
-            min_rtt.as_secs_f64() * self.config.latency_blocking_ratio as f64,
-        );
+        let ratio = if self.config.latency_blocking_ratio.is_finite() {
+            self.config.latency_blocking_ratio.max(1.0)
+        } else {
+            default_latency_blocking_ratio()
+        };
+        let relative = Duration::try_from_secs_f64(min_rtt.as_secs_f64() * f64::from(ratio))
+            .unwrap_or(Duration::MAX);
+        let absolute = min_rtt.saturating_add(Duration::from_millis(u64::from(
+            self.config.rtt_threshold_ms,
+        )));
+        let threshold = relative.max(absolute);
 
         usable
             .into_iter()
@@ -763,5 +771,43 @@ mod tests {
         let scheduler = Scheduler::new(SchedulerConfig::default());
         let result = scheduler.select(&[], None);
         assert!(result.is_empty());
+    }
+
+    fn timed_uplink(id: u16, micros: u64) -> Arc<Uplink> {
+        let uplink = Arc::new(Uplink::new(super::super::UplinkConfig::default(), id));
+        uplink.set_connection_state(crate::types::ConnectionState::Connected);
+        uplink.record_send(1);
+        uplink.record_rtt(Duration::from_micros(micros));
+        uplink
+    }
+
+    #[test]
+    fn latency_filter_keeps_fast_paths_despite_relative_timer_jitter() {
+        let scheduler = Scheduler::new(SchedulerConfig {
+            strategy: SchedulingStrategy::WeightedRoundRobin,
+            sticky_paths: false,
+            ..Default::default()
+        });
+        let uplinks = vec![
+            timed_uplink(0, 100),
+            timed_uplink(1, 900),
+            timed_uplink(2, 100_000),
+        ];
+        let choices: std::collections::HashSet<_> = (0..20)
+            .flat_map(|id| scheduler.select(&uplinks, Some(id)))
+            .collect();
+        assert_eq!(choices, std::collections::HashSet::from([0, 1]));
+    }
+
+    #[test]
+    fn invalid_latency_ratios_cannot_panic_selection() {
+        let uplinks = vec![timed_uplink(0, 100), timed_uplink(1, 900)];
+        for ratio in [f32::NAN, f32::INFINITY, f32::MAX, -1.0] {
+            let scheduler = Scheduler::new(SchedulerConfig {
+                latency_blocking_ratio: ratio,
+                ..Default::default()
+            });
+            assert!(!scheduler.select(&uplinks, None).is_empty());
+        }
     }
 }

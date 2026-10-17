@@ -398,3 +398,62 @@ fn recovery_backoff_is_bounded_under_extreme_retry_counts() {
         }
     }
 }
+
+#[test]
+fn legacy_echo_cannot_confirm_a_reduced_path_mtu() {
+    let manager = manager(MultipathConfig::default());
+    let uplink = path(&manager, "legacy");
+    let packet = Packet::new(
+        PacketType::Pong,
+        SequenceNumber(0),
+        manager.session_id(),
+        uplink.numeric_id(),
+        crate::protocol::mtu::request(&[0; 16], 1280),
+    )
+    .unwrap();
+    manager.handle_pong(&packet, uplink.numeric_id());
+    assert_eq!(uplink.state().connection_state, ConnectionState::Failed);
+    assert_eq!(manager.negotiated_mtu(), 1340);
+}
+
+#[tokio::test]
+async fn tg2_exit_cannot_silently_accept_a_reduced_mtu() {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let key = KeyPair::generate();
+    let public = key.public;
+    let server = tokio::spawn(async move {
+        let mut buffer = [0; 2048];
+        let (size, peer) = socket.recv_from(&mut buffer).await.unwrap();
+        let packet = Packet::decode(&buffer[..size]).unwrap();
+        let mut noise = NoiseSession::new_responder(&key.secret).unwrap();
+        noise.read_handshake(&packet.payload).unwrap();
+        let reply = Packet::new(
+            PacketType::Handshake,
+            SequenceNumber(1),
+            packet.header.session_id,
+            packet.header.uplink_id,
+            noise.write_handshake(b"TG2\x0a\x00\x55\x01").unwrap(),
+        )
+        .unwrap();
+        socket
+            .send_to(&reply.encode().unwrap(), peer)
+            .await
+            .unwrap();
+    });
+    let manager = manager(MultipathConfig {
+        inner_mtu: 1280,
+        ..Default::default()
+    });
+    manager
+        .add_uplink(UplinkConfig {
+            remote_addr: address,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(matches!(
+        manager.connect(public).await,
+        Err(Error::HandshakeFailed(_))
+    ));
+    server.await.unwrap();
+}

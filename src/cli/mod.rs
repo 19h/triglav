@@ -88,6 +88,10 @@ pub enum Commands {
 /// Server command arguments
 #[derive(Args, Debug)]
 pub struct ServerArgs {
+    /// Maximum inner IP packet size, in bytes
+    #[arg(long, default_value = "1340", value_parser = clap::value_parser!(u16).range(1280..=1367))]
+    pub mtu: u16,
+
     /// Deployment access token (64 hexadecimal digits)
     #[arg(long, env = "TRIGLAV_ACCESS_TOKEN", hide_env_values = true)]
     pub access_token: Option<String>,
@@ -148,6 +152,10 @@ pub struct ServerArgs {
 /// TUN tunnel command arguments (recommended mode)
 #[derive(Args, Debug)]
 pub struct TunArgs {
+    /// Maximum inner IP packet size, in bytes
+    #[arg(long, default_value = "1340", value_parser = clap::value_parser!(u16).range(1280..=1367))]
+    pub mtu: u16,
+
     /// Deployment access token (64 hexadecimal digits)
     #[arg(long, env = "TRIGLAV_ACCESS_TOKEN", hide_env_values = true)]
     pub access_token: Option<String>,

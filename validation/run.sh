@@ -36,7 +36,8 @@ PY
     xargs -d "\n" sha256sum < /evidence/source-files.txt > /evidence/source-sha256.txt
     tar -czf /evidence/source.tar.gz -T /evidence/source-files.txt
     cargo build --locked --bins > /evidence/build.log 2>&1
-    cargo test --locked --all-targets -- --test-threads=1 > /evidence/tests.log 2>&1
+    # Stress tests enforce throughput floors; measure optimized code on CI.
+    cargo test --locked --release --all-targets -- --test-threads=1 > /evidence/tests.log 2>&1
     cargo build --locked --release --bins > /evidence/release-build.log 2>&1
     mkdir /evidence/bin
     cp /build/release/triglav /build/release/triglav-server /evidence/bin/

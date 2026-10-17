@@ -107,6 +107,7 @@ impl StatusProvider for ClientStatusProvider {
             process_id: Some(std::process::id()),
             session_id: Some(self.manager.session_id().to_string()),
             connection_id: Some(self.manager.connection_id().to_string()),
+            pending: Some(self.manager.pending_stats()),
             quality: Some(QualityStatus {
                 usable_uplinks: quality.usable_uplinks,
                 total_uplinks: quality.total_uplinks,

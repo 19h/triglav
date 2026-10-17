@@ -58,6 +58,9 @@ pub enum Error {
     #[error("all uplinks failed")]
     AllUplinksFailed,
 
+    #[error("pending packet capacity exhausted")]
+    Backpressure,
+
     // Configuration errors
     #[error("configuration error: {0}")]
     Config(String),
@@ -173,6 +176,7 @@ impl Error {
         matches!(
             self,
             Error::ConnectionTimeout
+                | Error::Backpressure
                 | Error::Transport(
                     TransportError::SendFailed(_) | TransportError::ReceiveFailed(_)
                 )

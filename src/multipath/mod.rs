@@ -26,7 +26,7 @@ pub use aggregator::{
     AggregationMode, AggregatorConfig, AggregatorStats, BandwidthAggregator, ReorderBuffer,
     ReorderStats,
 };
-pub use manager::{MultipathConfig, MultipathEvent, MultipathManager};
+pub use manager::{MultipathConfig, MultipathEvent, MultipathManager, PendingStats};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulingStrategy};
 pub use throughput::{
     BbrState, BdpEstimator, EffectiveThroughput, FrameBatcher, PmtudState, ThroughputConfig,

@@ -770,6 +770,34 @@ impl Uplink {
 
     /// Record a successful send.
     pub fn record_send(&self, bytes: usize) {
+        self.begin_in_flight();
+        self.record_transmission(bytes);
+    }
+
+    /// Reserve a congestion slot before a send can race with its acknowledgement.
+    pub(crate) fn begin_in_flight(&self) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Release an attempt without treating a redundant copy as lost.
+    pub(crate) fn cancel_in_flight(&self) -> bool {
+        let mut current = self.in_flight.load(Ordering::Relaxed);
+        while current != 0 {
+            match self.in_flight.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+        false
+    }
+
+    /// Record bytes on the wire; congestion slots are managed per logical attempt.
+    pub(crate) fn record_transmission(&self, bytes: usize) {
         {
             let mut uplink_state = self.state.write();
             uplink_state.last_send = Some(Instant::now());
@@ -778,7 +806,6 @@ impl Uplink {
 
         self.bandwidth.record_sent(bytes as u64);
         self.loss.record_sent();
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
 
         let mut traffic = self.stats.write();
         traffic.bytes_sent += bytes as u64;
@@ -803,15 +830,18 @@ impl Uplink {
     /// Record an RTT measurement.
     pub fn record_rtt(&self, rtt: Duration) {
         self.rtt.write().add_sample(rtt);
-        self.loss.record_acked();
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if self.cancel_in_flight() {
+            self.loss.record_acked();
+        }
         self.update_priority();
     }
 
     /// Record a packet loss.
     pub fn record_loss(&self) {
+        if !self.cancel_in_flight() {
+            return;
+        }
         self.loss.record_lost();
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
 
         let mut stats = self.stats.write();
         stats.packets_dropped += 1;

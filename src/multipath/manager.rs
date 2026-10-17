@@ -1,13 +1,13 @@
 //! Multi-path connection manager.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
@@ -47,6 +47,18 @@ pub struct MultipathConfig {
     /// Retry count for failed sends.
     #[serde(default = "default_retries")]
     pub send_retries: u32,
+
+    /// Maximum logical packets awaiting acknowledgement (including redundant copies).
+    #[serde(default = "default_max_pending_packets")]
+    pub max_pending_packets: usize,
+
+    /// Maximum retained plaintext bytes awaiting acknowledgement.
+    #[serde(default = "default_max_pending_bytes")]
+    pub max_pending_bytes: usize,
+
+    /// Absolute retention limit, including periods with no usable uplinks.
+    #[serde(default = "default_max_pending_age", with = "humantime_serde")]
+    pub max_pending_age: Duration,
 
     /// Retry delay base.
     #[serde(default = "default_retry_delay", with = "humantime_serde")]
@@ -144,6 +156,15 @@ fn default_max_uplinks() -> usize {
 fn default_retries() -> u32 {
     3
 }
+fn default_max_pending_packets() -> usize {
+    4096
+}
+fn default_max_pending_bytes() -> usize {
+    8 * 1024 * 1024
+}
+fn default_max_pending_age() -> Duration {
+    Duration::from_secs(10)
+}
 fn default_retry_delay() -> Duration {
     Duration::from_millis(100)
 }
@@ -171,6 +192,9 @@ impl Default for MultipathConfig {
             throughput: ThroughputConfig::default(),
             max_uplinks: default_max_uplinks(),
             send_retries: default_retries(),
+            max_pending_packets: default_max_pending_packets(),
+            max_pending_bytes: default_max_pending_bytes(),
+            max_pending_age: default_max_pending_age(),
             retry_delay: default_retry_delay(),
             auto_discover: false,
             health_check_interval: default_health_interval(),
@@ -234,9 +258,35 @@ pub enum MultipathEvent {
 #[derive(Debug)]
 struct PendingPacket {
     packet: Packet,
+    created_at: Instant,
     sent_at: Instant,
     retries: u32,
     uplink_id: u16,
+    attempts: HashMap<u16, Instant>,
+}
+
+#[derive(Default)]
+struct PendingBuffer {
+    packets: HashMap<u64, PendingPacket>,
+    bytes: usize,
+}
+
+impl PendingBuffer {
+    fn remove(&mut self, seq: u64) -> Option<PendingPacket> {
+        let packet = self.packets.remove(&seq)?;
+        self.bytes -= packet.packet.payload.len();
+        Some(packet)
+    }
+}
+
+/// Bounded retransmission buffer occupancy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingStats {
+    pub packets: usize,
+    pub bytes: usize,
+    pub max_packets: usize,
+    pub max_bytes: usize,
+    pub oldest_age_ms: u64,
 }
 
 enum ReceiveLoopEvent {
@@ -312,7 +362,8 @@ pub struct MultipathManager {
     /// Next uplink numeric ID.
     next_uplink_id: AtomicU16,
     /// Pending packets (for retry).
-    pending: DashMap<u64, PendingPacket>,
+    pending: Mutex<PendingBuffer>,
+    retry_lock: tokio::sync::Mutex<()>,
     /// Deduplication window for received packets.
     dedup_window: RwLock<DeduplicationWindow>,
     /// Aggregate stats.
@@ -364,7 +415,8 @@ impl MultipathManager {
             uplink_ids: DashMap::new(),
             next_seq: AtomicU64::new(1),
             next_uplink_id: AtomicU16::new(0),
-            pending: DashMap::new(),
+            pending: Mutex::new(PendingBuffer::default()),
+            retry_lock: tokio::sync::Mutex::new(()),
             dedup_window: RwLock::new(DeduplicationWindow::new(dedup_size)),
             stats: RwLock::new(TrafficStats::default()),
             event_tx,
@@ -1026,6 +1078,7 @@ impl MultipathManager {
 
         // Use aggregator sequence in packet header for reordering
         let seq = SequenceNumber(agg_seq);
+        self.track_packet(seq, data, uplink_id)?;
 
         if let Some(uplink) = self.get_uplink(uplink_id) {
             // Apply pacing if enabled
@@ -1057,10 +1110,15 @@ impl MultipathManager {
                     self.repair_uplink_paths(uplink_id).await;
 
                     // Try fallback to another uplink
-                    self.send_aggregated_fallback(data, uplink_id, seq).await
+                    let result = self.send_aggregated_fallback(data, uplink_id, seq).await;
+                    if result.is_err() {
+                        self.cancel_pending(seq.0);
+                    }
+                    result
                 }
             }
         } else {
+            self.cancel_pending(seq.0);
             Err(Error::NoAvailableUplinks)
         }
     }
@@ -1142,6 +1200,7 @@ impl MultipathManager {
         if selected.is_empty() {
             return Err(Error::NoAvailableUplinks);
         }
+        self.track_packet(seq, data, selected[0])?;
 
         // Send on selected uplinks
         let mut last_error = None;
@@ -1203,8 +1262,10 @@ impl MultipathManager {
             stats.packets_sent += 1;
             Ok(seq.0)
         } else if let Some(e) = last_error {
+            self.cancel_pending(seq.0);
             Err(e)
         } else {
+            self.cancel_pending(seq.0);
             Err(Error::NoAvailableUplinks)
         }
     }
@@ -1242,6 +1303,73 @@ impl MultipathManager {
         }
     }
 
+    fn track_packet(&self, seq: SequenceNumber, data: &[u8], uplink_id: u16) -> Result<()> {
+        let mut buffer = self.pending.lock();
+        if buffer.packets.len() >= self.config.max_pending_packets
+            || data.len() > self.config.max_pending_bytes.saturating_sub(buffer.bytes)
+        {
+            return Err(Error::Backpressure);
+        }
+        if buffer.packets.contains_key(&seq.0) {
+            return Err(Error::Internal("duplicate pending sequence".into()));
+        }
+        let packet = Packet::data(seq, self.session_id, uplink_id, data.to_vec())?;
+        buffer.bytes += data.len();
+        buffer.packets.insert(
+            seq.0,
+            PendingPacket {
+                packet,
+                created_at: Instant::now(),
+                sent_at: Instant::now(),
+                retries: 0,
+                uplink_id,
+                attempts: HashMap::new(),
+            },
+        );
+        Ok(())
+    }
+
+    fn track_attempt(&self, seq: u64, uplink: &Uplink) -> bool {
+        let mut buffer = self.pending.lock();
+        let Some(pending) = buffer.packets.get_mut(&seq) else {
+            return false; // An earlier hedge was already acknowledged or expired.
+        };
+        if pending
+            .attempts
+            .insert(uplink.numeric_id(), Instant::now())
+            .is_none()
+        {
+            uplink.begin_in_flight();
+        }
+        true
+    }
+
+    fn cancel_pending(&self, seq: u64) {
+        if let Some(pending) = self.pending.lock().remove(seq) {
+            for id in pending.attempts.keys() {
+                if let Some(uplink) = self.get_uplink(*id) {
+                    uplink.cancel_in_flight();
+                }
+            }
+        }
+    }
+
+    pub fn pending_stats(&self) -> PendingStats {
+        let buffer = self.pending.lock();
+        PendingStats {
+            packets: buffer.packets.len(),
+            bytes: buffer.bytes,
+            max_packets: self.config.max_pending_packets,
+            max_bytes: self.config.max_pending_bytes,
+            oldest_age_ms: buffer
+                .packets
+                .values()
+                .map(|p| p.created_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
     /// Send packet on a specific uplink.
     async fn send_on_uplink(
         &self,
@@ -1268,8 +1396,19 @@ impl MultipathManager {
             ))
         })?;
 
-        transport.send(&encoded).await?;
-        uplink.record_send(encoded.len());
+        if !self.track_attempt(seq.0, uplink) {
+            return Ok(());
+        }
+        if let Err(error) = transport.send(&encoded).await {
+            let mut buffer = self.pending.lock();
+            if let Some(pending) = buffer.packets.get_mut(&seq.0) {
+                if pending.attempts.remove(&uplink.numeric_id()).is_some() {
+                    uplink.cancel_in_flight();
+                }
+            }
+            return Err(error);
+        }
+        uplink.record_transmission(encoded.len());
 
         tracing::trace!(
             uplink = %uplink.id(),
@@ -1277,14 +1416,6 @@ impl MultipathManager {
             len = data.len(),
             "Sent encrypted packet"
         );
-
-        // Track pending packet for retry (store original data for potential retransmission)
-        self.pending.entry(seq.0).or_insert(PendingPacket {
-            packet: Packet::data(seq, self.session_id, uplink.numeric_id(), data.to_vec())?,
-            sent_at: Instant::now(),
-            retries: 0,
-            uplink_id: uplink.numeric_id(),
-        });
 
         Ok(())
     }
@@ -1392,7 +1523,7 @@ impl MultipathManager {
                 Ok(Some(payload))
             }
             PacketType::Ack => {
-                self.handle_ack(&packet)?;
+                self.handle_ack(&packet, from_uplink)?;
                 Ok(None)
             }
             PacketType::Pong => {
@@ -1693,44 +1824,50 @@ impl MultipathManager {
         });
     }
 
-    /// Handle ACK packet.
-    fn handle_ack(&self, packet: &Packet) -> Result<()> {
-        let acked: Vec<u64> = bincode::deserialize(&packet.payload)
-            .map_err(|e| crate::error::ProtocolError::Deserialization(e.to_string()))?;
-
-        for seq in acked {
-            if let Some((_, pending)) = self.pending.remove(&seq) {
-                // Calculate RTT
-                let rtt = pending.sent_at.elapsed();
-                let uplink_id = pending.uplink_id;
+    /// Retire every copy on the first authenticated acknowledgement.
+    fn handle_ack(&self, packet: &Packet, from_uplink: u16) -> Result<()> {
+        // ACK encoding is an eight-byte count followed by that many u64 values.
+        // Validate the count before deserialization can allocate from untrusted input.
+        if packet.payload.len() < 8 || (packet.payload.len() - 8) % 8 != 0 {
+            return Err(Error::InvalidPacket(
+                "invalid acknowledgement length".into(),
+            ));
+        }
+        let count = u64::from_le_bytes(packet.payload[..8].try_into().unwrap());
+        if count != ((packet.payload.len() - 8) / 8) as u64 {
+            return Err(Error::InvalidPacket("invalid acknowledgement count".into()));
+        }
+        for chunk in packet.payload[8..].chunks_exact(8) {
+            let seq = u64::from_le_bytes(chunk.try_into().unwrap());
+            let pending = self.pending.lock().remove(seq);
+            if let Some(pending) = pending {
                 let packet_size = pending.packet.payload.len() as u64;
-
-                if let Some(uplink) = self.get_uplink(uplink_id) {
-                    uplink.record_rtt(rtt);
-
-                    // Record with throughput optimizer for BBR-style congestion control
-                    if self.config.throughput_optimization {
-                        self.throughput_optimizer
-                            .record_ack(uplink_id, packet_size, rtt);
-
-                        // Record bandwidth measurement
-                        if rtt.as_secs_f64() > 0.0 {
-                            let bandwidth = packet_size as f64 / rtt.as_secs_f64();
-                            self.throughput_optimizer
-                                .record_bandwidth(uplink_id, bandwidth);
+                for (id, sent_at) in pending.attempts {
+                    if let Some(uplink) = self.get_uplink(id) {
+                        if id == from_uplink {
+                            let rtt = sent_at.elapsed();
+                            uplink.record_rtt(rtt);
+                            if self.config.throughput_optimization {
+                                self.throughput_optimizer.record_ack(id, packet_size, rtt);
+                                if !rtt.is_zero() {
+                                    self.throughput_optimizer.record_bandwidth(
+                                        id,
+                                        packet_size as f64 / rtt.as_secs_f64(),
+                                    );
+                                }
+                                self.throughput_optimizer.record_mtu_result(
+                                    id,
+                                    packet_size as u32,
+                                    true,
+                                );
+                            }
+                        } else {
+                            uplink.cancel_in_flight();
                         }
-
-                        // Record MTU success
-                        self.throughput_optimizer.record_mtu_result(
-                            uplink_id,
-                            packet_size as u32,
-                            true,
-                        );
                     }
                 }
             }
         }
-
         Ok(())
     }
 
@@ -1778,129 +1915,96 @@ impl MultipathManager {
         }
     }
 
-    /// Retry pending packets.
+    /// Retry a bounded snapshot. No buffer lock survives a network operation.
     pub async fn retry_pending(&self) {
+        let Ok(_retry_guard) = self.retry_lock.try_lock() else {
+            return;
+        };
         let now = Instant::now();
-        let mut to_retry: Vec<(u64, Vec<u8>, u16)> = Vec::new();
-        let mut to_fail = Vec::new();
-
-        // Find packets that need retry
-        for entry in &self.pending {
-            let pending = entry.value();
-            let uplink = self.get_uplink(pending.uplink_id);
-
-            let rto = uplink.as_ref().map_or(Duration::from_millis(500), |u| {
-                Duration::from_millis((u.rtt().as_millis() as u64 * 2).max(100))
-            });
-
-            if now.duration_since(pending.sent_at) > rto {
-                if pending.retries < self.config.send_retries {
-                    // Clone data for retry
-                    to_retry.push((
-                        *entry.key(),
+        let mut retry = Vec::new();
+        let mut failed = Vec::new();
+        {
+            let mut buffer = self.pending.lock();
+            let mut expired = Vec::new();
+            for (&seq, pending) in &mut buffer.packets {
+                let rto = self
+                    .get_uplink(pending.uplink_id)
+                    .map_or(Duration::from_millis(500), |u| {
+                        u.rtt().saturating_mul(2).max(Duration::from_millis(100))
+                    });
+                if now.duration_since(pending.created_at) >= self.config.max_pending_age
+                    || (now.duration_since(pending.sent_at) >= rto
+                        && pending.retries >= self.config.send_retries)
+                {
+                    expired.push(seq);
+                } else if now.duration_since(pending.sent_at) >= rto {
+                    // Count the retry even during a total outage. Otherwise expired
+                    // attempts would be charged as lost on every maintenance tick.
+                    pending.retries += 1;
+                    pending.sent_at = now;
+                    retry.push((
+                        seq,
                         pending.packet.payload.clone(),
                         pending.uplink_id,
+                        std::mem::take(&mut pending.attempts),
                     ));
-                } else {
-                    to_fail.push(*entry.key());
+                }
+            }
+            for seq in expired {
+                if let Some(packet) = buffer.remove(seq) {
+                    failed.push((seq, packet.attempts));
                 }
             }
         }
-
-        // Retry packets on different uplinks
-        for (seq, data, old_uplink_id) in to_retry {
-            // Record loss on previous uplink
-            if let Some(old_uplink) = self.get_uplink(old_uplink_id) {
-                old_uplink.record_loss();
-                self.repair_uplink_paths(old_uplink_id).await;
+        for (seq, attempts) in failed {
+            for id in attempts.keys() {
+                if let Some(uplink) = self.get_uplink(*id) {
+                    uplink.record_loss();
+                }
             }
-
-            // Select new uplink (prefer different one from the failed one)
-            let uplinks = self.uplinks();
-            let selected = self.scheduler.select(&uplinks, Some(seq));
-
-            // Try to find an uplink that's different from the one that failed
-            let new_uplink_id = selected
+            self.stats.write().packets_dropped += 1;
+            let _ = self.event_tx.send(MultipathEvent::SendFailed(seq));
+        }
+        for (seq, data, old_id, attempts) in retry {
+            for id in attempts.keys() {
+                if let Some(uplink) = self.get_uplink(*id) {
+                    uplink.record_loss();
+                }
+                self.repair_uplink_paths(*id).await;
+            }
+            let selected = self.scheduler.select(&self.uplinks(), Some(seq));
+            let preferred = selected
                 .iter()
-                .find(|&&id| id != old_uplink_id)
+                .find(|&&id| id != old_id)
                 .copied()
                 .or_else(|| selected.first().copied());
-
-            if let Some(new_uplink_id) = new_uplink_id {
-                let mut retry_uplinks = vec![new_uplink_id];
-                if self.config.hedged_packets {
-                    self.extend_with_hedged_uplinks(&mut retry_uplinks);
-                }
-
-                let mut sent_on = None;
-                let mut attempted = false;
-                for retry_uplink_id in retry_uplinks {
-                    if let Some(uplink) = self.get_uplink(retry_uplink_id) {
-                        attempted = true;
-                        match self
-                            .send_on_uplink(&uplink, SequenceNumber(seq), &data)
-                            .await
-                        {
-                            Ok(_) => {
-                                sent_on = Some(retry_uplink_id);
-                                tracing::debug!(
-                                    seq = seq,
-                                    old_uplink = old_uplink_id,
-                                    new_uplink = retry_uplink_id,
-                                    "Retransmitted packet"
-                                );
+            let Some(id) = preferred else { continue };
+            let mut copies = vec![id];
+            if self.config.hedged_packets {
+                self.extend_with_hedged_uplinks(&mut copies);
+            }
+            let mut sent = false;
+            for id in copies {
+                if let Some(uplink) = self.get_uplink(id) {
+                    match self
+                        .send_on_uplink(&uplink, SequenceNumber(seq), &data)
+                        .await
+                    {
+                        Ok(()) => {
+                            sent = true;
+                            if let Some(pending) = self.pending.lock().packets.get_mut(&seq) {
+                                pending.uplink_id = id;
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    seq = seq,
-                                    uplink = %uplink.id(),
-                                    error = %e,
-                                    "Retry failed"
-                                );
-                                uplink.record_failure(&e.to_string());
-                                self.repair_uplink_paths(retry_uplink_id).await;
-                            }
+                        }
+                        Err(e) => {
+                            uplink.record_failure(&e.to_string());
+                            self.repair_uplink_paths(id).await;
                         }
                     }
                 }
-
-                if let Some(sent_uplink_id) = sent_on {
-                    if let Some(mut entry) = self.pending.get_mut(&seq) {
-                        entry.retries += 1;
-                        entry.uplink_id = sent_uplink_id;
-                        entry.sent_at = Instant::now();
-                    }
-
-                    let mut stats = self.stats.write();
-                    stats.packets_retransmitted += 1;
-                } else if attempted {
-                    if let Some(mut entry) = self.pending.get_mut(&seq) {
-                        entry.retries += 1;
-                        entry.sent_at = Instant::now();
-                    }
-                }
             }
-        }
-
-        // Fail packets that exceeded retries
-        for seq in to_fail {
-            if let Some((_, pending)) = self.pending.remove(&seq) {
-                {
-                    let mut stats = self.stats.write();
-                    stats.packets_dropped += 1;
-                }
-
-                if let Some(uplink) = self.get_uplink(pending.uplink_id) {
-                    uplink.record_loss();
-                    self.repair_uplink_paths(pending.uplink_id).await;
-                }
-
-                tracing::warn!(
-                    seq = seq,
-                    "Packet failed after {} retries",
-                    self.config.send_retries
-                );
-                let _ = self.event_tx.send(MultipathEvent::SendFailed(seq));
+            if sent {
+                self.stats.write().packets_retransmitted += 1;
             }
         }
     }
@@ -2210,7 +2314,11 @@ impl MultipathManager {
                 .set_connection_state(ConnectionState::Disconnecting);
         }
 
-        self.pending.clear();
+        let sequences: Vec<_> = self.pending.lock().packets.keys().copied().collect();
+        for seq in sequences {
+            self.cancel_pending(seq);
+        }
+        self.ready_packets.lock().clear();
         *self.state.write() = ConnectionState::Disconnected;
         let _ = self.event_tx.send(MultipathEvent::Disconnected);
 
@@ -2752,3 +2860,7 @@ mod tests {
         assert_eq!(manager.get_flow_binding(flow_id), None);
     }
 }
+
+#[cfg(test)]
+#[path = "resilience_tests.rs"]
+mod resilience_tests;

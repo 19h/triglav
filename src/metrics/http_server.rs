@@ -110,6 +110,7 @@ impl StatusProvider for DefaultStatusProvider {
             session_id: None,
             connection_id: None,
             quality: None,
+            pending: None,
             tunnel: None,
             uplinks: self.uplinks.read().clone(),
             sessions: self.sessions.read().clone(),
@@ -179,6 +180,8 @@ pub struct StatusResponse {
     pub connection_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<QualityStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<crate::multipath::PendingStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<TunnelStatus>,
     pub uplinks: Vec<UplinkStatus>,

@@ -2392,6 +2392,7 @@ impl StatusProvider for ServerStatusProvider {
             session_id: None,
             connection_id: None,
             quality: None,
+            pending: None,
             tunnel: None,
             uplinks: vec![],
             sessions,

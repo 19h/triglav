@@ -172,6 +172,9 @@ impl Transport for ImmediateAck {
         self.send(bytes).await
     }
     async fn recv(&self, _: &mut [u8]) -> Result<usize> {
+        if let Some(manager) = self.0.upgrade() {
+            let _ = manager.event_tx.send(MultipathEvent::Connected);
+        }
         std::future::pending().await
     }
     async fn recv_from(&self, _: &mut [u8]) -> Result<(usize, std::net::SocketAddr)> {
@@ -456,4 +459,152 @@ async fn tg2_exit_cannot_silently_accept_a_reduced_mtu() {
         Err(Error::HandshakeFailed(_))
     ));
     server.await.unwrap();
+}
+
+#[test]
+fn closing_stops_pending_admission() {
+    let manager = manager(MultipathConfig::default());
+    manager.close().unwrap();
+    assert!(matches!(
+        manager.track_packet(SequenceNumber(1), b"payload", 0),
+        Err(Error::ConnectionClosed)
+    ));
+    assert_eq!(manager.pending_stats().bytes, 0);
+}
+
+#[tokio::test]
+async fn dropping_receive_consumer_cancels_a_blocked_read_promptly() {
+    let manager = manager(MultipathConfig::default());
+    *manager.state.write() = ConnectionState::Connected;
+    let uplink = path(&manager, "blocked");
+    uplink.set_transport(Arc::new(ImmediateAck(Arc::downgrade(&manager))));
+    let mut entered_read = manager.subscribe();
+    let receive = manager.start_recv_loop();
+    manager.start_maintenance_loop();
+    tokio::time::timeout(Duration::from_secs(1), entered_read.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let weak = Arc::downgrade(&manager);
+    drop(manager);
+    drop(receive);
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while weak.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("receive task retained the connection after its consumer closed");
+}
+
+#[tokio::test]
+async fn receive_owner_is_exclusive_and_can_be_reacquired_after_drop() {
+    let manager = manager(MultipathConfig::default());
+    *manager.state.write() = ConnectionState::Connected;
+    let first = manager.try_start_recv_loop().unwrap();
+    assert!(manager.try_start_recv_loop().is_err());
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(receive) = manager.try_start_recv_loop() {
+                break receive;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(second);
+    manager.close().unwrap();
+}
+
+#[tokio::test]
+async fn full_production_consumer_queue_does_not_block_control_reader() {
+    let manager = manager(MultipathConfig::default());
+    *manager.assigned_ipv4.write() = Some("10.0.85.1".parse().unwrap());
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.send((vec![1], 1)).await.unwrap();
+    tokio::time::timeout(Duration::from_millis(100), async {
+        for _ in 0..1000 {
+            assert!(manager.deliver_payload(&tx, vec![2], 1).await);
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(manager.stats().packets_dropped, 1000);
+    assert_eq!(rx.recv().await.unwrap().0, vec![1]);
+    drop(rx);
+    assert!(!manager.deliver_payload(&tx, vec![3], 1).await);
+}
+
+#[test]
+fn removing_path_releases_attempts_and_reconnect_metadata() {
+    let manager = manager(MultipathConfig::default());
+    let uplink = path(&manager, "removed");
+    manager
+        .track_packet(SequenceNumber(1), b"payload", uplink.numeric_id())
+        .unwrap();
+    manager.track_attempt(1, &uplink);
+    assert_eq!(uplink.in_flight(), 1);
+    manager.reconnect.lock().insert(
+        uplink.numeric_id(),
+        ReconnectState {
+            failures: 1,
+            next_attempt: Instant::now(),
+            in_progress: false,
+        },
+    );
+    manager.remove_uplink(uplink.numeric_id()).unwrap();
+    assert_eq!(uplink.in_flight(), 0);
+    assert!(!manager.reconnect.lock().contains_key(&uplink.numeric_id()));
+    assert!(manager.pending.lock().packets[&1].attempts.is_empty());
+}
+
+#[test]
+fn closing_releases_transport_even_with_a_retained_path_handle() {
+    let manager = manager(MultipathConfig::default());
+    let uplink = path(&manager, "retained");
+    let transport: Arc<dyn Transport> = Arc::new(ImmediateAck(Arc::downgrade(&manager)));
+    let weak = Arc::downgrade(&transport);
+    uplink.set_transport(transport);
+    assert!(weak.upgrade().is_some());
+    manager.close().unwrap();
+    assert!(uplink.get_transport().is_none());
+    assert!(weak.upgrade().is_none());
+    assert_eq!(
+        uplink.state().connection_state,
+        ConnectionState::Disconnected
+    );
+}
+
+#[tokio::test]
+async fn production_ip_sends_do_not_wait_on_legacy_pacing_estimates() {
+    for aggregation_mode in [AggregationMode::None, AggregationMode::Full] {
+        let manager = manager(MultipathConfig {
+            aggregation_mode,
+            ..Default::default()
+        });
+        let uplink = path(&manager, "slow-estimate");
+        manager
+            .throughput_optimizer
+            .record_bandwidth(uplink.numeric_id(), 1.0);
+        assert!(
+            manager
+                .throughput_optimizer
+                .pacing_interval(uplink.numeric_id(), 64)
+                >= Duration::from_secs(1)
+        );
+        *manager.assigned_ipv4.write() = Some("10.0.85.1".parse().unwrap());
+        // No cipher is installed, so the send must fail promptly at encryption,
+        // without spending seconds asleep in the legacy rate estimator first.
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.send_on_flow(None, &[0; 64]),
+        )
+        .await;
+        assert!(result
+            .expect("production send was blocked by legacy pacing")
+            .is_err());
+        manager.close().unwrap();
+    }
 }

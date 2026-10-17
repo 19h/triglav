@@ -109,6 +109,7 @@ impl StatusProvider for ClientStatusProvider {
             connection_id: Some(self.manager.connection_id().to_string()),
             pending: Some(self.manager.pending_stats()),
             quality: Some(QualityStatus {
+                active_flow_bindings: self.manager.active_flow_count(),
                 usable_uplinks: quality.usable_uplinks,
                 total_uplinks: quality.total_uplinks,
                 avg_rtt_ms: quality.avg_rtt.as_secs_f64() * 1000.0,

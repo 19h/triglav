@@ -10,7 +10,7 @@ the fault matrix below passes against the resulting binaries.
 | R1: bounded retransmission | Packet and byte caps; absolute expiry during a total outage; one congestion slot per outstanding path copy; ACK/send race tests; occupancy in `/status` | Validated; evidence below |
 | R2: automatic recovery | Retry failed startup and stale paths with bounded backoff; authenticated rebinding and rekey; retain tunnel addresses across exit restart when the lease is available; stop retries on shutdown | Validated; evidence below |
 | R3: network variability | Explicit MTU configuration and negotiation; dual-stack underlay selection; correct behavior on a constrained path; preserve existing split/full routing | Validated; evidence below |
-| R4: lifecycle and live faults | Idempotent background tasks; cancellation on shutdown; prolonged total outage, exit restart, changed source endpoint, constrained MTU and repeated recovery in the real-binary lab | Pending |
+| R4: lifecycle and live faults | Owned background tasks; cancellation on shutdown; bounded affinity and receive queues; forced exit crash, repeated recovery and source-port churn in the real-binary lab | Validated; evidence below |
 
 ## R1: retransmission invariants
 
@@ -90,6 +90,9 @@ an exit restart with the same key, two observed NAT address changes, and ten
 rounds replacing both local source addresses. Each round must advance both key
 generations while retaining two path IDs. Destination records must exactly match
 the client hashes. The blackout also samples the bounded retransmission queue.
+The restart replaces the exit process within the same network namespace, retaining
+kernel routing and conntrack state. Host reboot and an egress-address change are
+outside this continuity result.
 
 ### R2 validation, 2026-10-17
 
@@ -177,6 +180,94 @@ trip was 58.775 s. This is a measured delay, not an upper-bound recovery guarant
 Source manifest SHA-256:
 `2d8e432814aafaf1c181c6152738ce49464b8a5f1c3d3e3ce8facde9cb81e270`.
 
+## R4: bounded lifetimes and finite stability testing
+
+The multipath manager owns its connection, receive and maintenance tasks.
+There is one receive owner per lifecycle; a second claimant receives an error.
+Dropping the consumer cancels the coordinator and its per-path workers, including
+blocked reads. Maintenance holds a weak manager reference between ticks.
+Shutdown invalidates the lifecycle before aborting tasks, clearing pending
+payloads and releasing transport/key references from retained path handles.
+Packet admission after shutdown is rejected under the lifecycle lock.
+The TUN runner also owns and cancels its NAT/DNS maintenance tasks.
+
+Flow affinity retains at most 4096 entries by default, evicts the least recently
+used binding at capacity, and expires idle entries after 120 s. These values are
+configurable in `MultipathConfig`. The scheduler's separate affinity cache also
+has a 4096-entry default cap, with its existing 5 s idle timeout; its capacity is
+configured by `SchedulerConfig.max_sticky_flows`. An evicted flow can be assigned a new path;
+inner TCP still owns ordering and retransmission. Lookup/update/eviction take
+expected O(1) hash access plus O(log F) recency updates, with O(F) storage.
+Expiry batches and path cleanup take O(F log F) time in the worst case. The
+scheduler can purge an expired batch during lookup; F is always bounded by its
+configured entry cap.
+Removing a path clears its retry metadata and outstanding congestion charges.
+
+The ready-packet queue is capped at 4096 entries. Production receive channels
+remain bounded; if the TUN consumer stalls, excess payloads are counted as drops
+while the receiver continues handling authenticated control records. UDP remains
+best effort. The exit retains at most 1024 distinct completed-proxy source keys,
+plus one `_other` aggregate; total connection counts are preserved up to u64
+saturation. These component bounds do not constitute a process-wide memory cap.
+
+Production IP sends bypass the legacy per-packet pacing sleeps. Those sleeps
+blocked the TUN processing loop and delayed unrelated TCP acknowledgements under
+UDP churn. Inner TCP retains the kernel's congestion control; UDP remains best
+effort. The churn gate requires at least ten new TCP frames during its 60 s run.
+
+Production client/exit packet send and TUN-write operations use a 1 s timeout. A partial TUN or datagram write
+is an error. The exit marks a logical packet delivered and acknowledges it only
+after the full TUN write succeeds. A failed or timed-out write remains eligible
+for a fresh-nonce retry; an already delivered duplicate receives another ACK
+without another TUN write. An ACK confirms local kernel acceptance, not delivery
+to the remote application.
+
+The recovery lane now kills the exit with SIGKILL and restarts it with the same
+static key. One existing TCP connection crosses that crash, the 20 s total-path
+outage and repeated address changes. It then remains open during 60 s of IPv4
+and IPv6 UDP source-port churn using flow-affinity scheduling. Every sampled
+flow/pending count must remain within its configured bound, and the existing
+stream and an IPv6 transfer must preserve exact destination bytes. RSS is
+recorded; the workload gate permits a 128 MiB increase from its initial sample.
+That finite envelope is a regression threshold, not an indefinite memory-use
+guarantee or an operating-system-wide limit.
+
+### R4 validation, 2026-10-17 UTC
+
+`validation/artifacts/20261017-resilience-r4-03/summary.json` records the complete
+release acceptance pass. Linux and macOS each passed 368 release tests with 10
+explicitly ignored tests; the live admission test passed separately. The minimal
+library feature build also passed. The four network lanes verified 960 exact
+destination records and 33,768,262 bytes in each direction.
+
+The same client process, session and TCP connection crossed a 20 s total outage,
+a SIGKILL/restart of the exit process, two NAT endpoint changes and twenty local
+path replacements. It completed 593 frames overall, including
+572 during 60.009 s of source-port churn.
+The churn generated 73,216 datagrams using
+41,100 distinct family/port pairs. All 572 samples
+remained within the flow and pending-buffer bounds; the flow cache reached its
+4096-entry cap. RSS rose from 19,103,744 to a peak of
+21,422,080 bytes, a 2,318,336-byte
+increase. The maximum recovery-frame round trip was
+26.518 s; this is an observation, not a deadline.
+
+Both MTU reduction streams stayed on their original sockets, completing
+53 IPv4 and 59 IPv6 frames.
+The steady-state captures had no oversized or fragmented UDP records. The
+rate-capped median two-path/single-path goodput ratio was
+1.3988. Artifact ownership returned to the caller
+while the generated exit key retained mode 0600.
+
+An earlier debug build measured 68,009 scheduler selections/s and failed the
+100,000/s timing floor. The final performance acceptance uses release builds;
+no timing threshold was reduced. An initial live churn attempt exposed the
+blocking-pacing stall; the final gate requires TCP progress during churn.
+
+Source manifest SHA-256: `c8b3370e5d9b70c9f4d9c57959bf713ba0c3157f4e6c8bd1ac308805e57632af`.
+The evidence directory retains matching sources, executables, packet captures,
+endpoint records, resource samples and macOS test logs.
+
 ## Assumption register
 
 | ID | Assumption | Falsification probe | Dependent result |
@@ -186,6 +277,8 @@ Source manifest SHA-256:
 | A3 | The previous tunnel address remains available after restart | Restart with another client claiming the old address and require an explicit collision outcome | Reuse of an existing inner flow |
 | A4 | A successful lab run applies to its recorded source, executable and topology | Hash sources and binaries; capture topology and destination records | Reported live acceptance only |
 | A5 | The configured ceiling or local interface MTU accounts for smaller links along the route | Insert a smaller remote-router MTU without changing the local interface; configure a lower ceiling when required | MTU adaptation; no full path-MTU discovery claim |
+| A6 | The async executor continues scheduling tasks | Block a transport read, close its consumer and enforce the cancellation deadline; separately kill the process | Task and I/O deadlines; no cleanup guarantee after process termination |
+| A7 | Exit process restart retains the kernel network namespace, egress address and conntrack state | Recreate the exit namespace or change its egress identity and repeat the same TCP flow | Existing TCP continuity across process restart only |
 
 ## Adjacent findings and bounded scope
 
@@ -195,6 +288,7 @@ Source manifest SHA-256:
 | High | Replacing live Noise state upon an unconfirmed handshake could permit replay-triggered denial of service | R2 must confirm fresh session-key possession before replacement |
 | High | A new exit can allocate a different inner address after restart | R2 must reject a conflicting lease explicitly; never silently misroute an existing flow |
 | Medium | Smaller underlay MTUs invalidate the default encapsulation budget | R3 must account for framing, authentication and IP-family overhead |
+| High | Flow affinity had two independent unbounded caches, and detached workers could outlive their consumer | R4 caps both caches and owns/cancels worker tasks |
 | Medium | A short lab run cannot establish indefinite availability or physical-link behavior | R4 reports duration and topology; physical ISP behavior remains unmeasured |
 
 Quality gates require source-backed claims, the assumptions above, complete

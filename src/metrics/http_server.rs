@@ -194,6 +194,8 @@ pub struct StatusResponse {
 /// High-level quality summary for local clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityStatus {
+    #[serde(default)]
+    pub active_flow_bindings: usize,
     pub usable_uplinks: usize,
     pub total_uplinks: usize,
     pub avg_rtt_ms: f64,

@@ -1,29 +1,46 @@
 # Observed production validation
 
-## Resilience extension, 2026-10-17
+## Resilience extension, 2026-10-17 UTC
 
 The complete release run in
-`validation/artifacts/20261017-resilience-r3-02/` passes. It covers negotiated
-MTU ceilings, both outer IP families, recovery, exact destination bytes, and
-routing restoration. The [resilience contract](../docs/resilience.md) records
-assumptions, resource bounds and the remaining lifecycle work.
+`validation/artifacts/20261017-resilience-r4-03/` passes. All four groups in the
+[resilience contract](../docs/resilience.md) now have live acceptance evidence:
+bounded retransmission, authenticated recovery, negotiated MTU ceilings, and
+bounded task/cache lifetimes under faults and churn.
 
 | Check | Recorded result |
 |---|---|
-| Linux release Rust tests | 356 passed; 10 explicitly ignored |
-| macOS library tests | 165 passed |
+| Release Rust tests, Linux and macOS | 368 passed on each; 10 explicitly ignored on each |
+| Minimal library feature build | Passed |
 | Live admission test | 1 passed separately |
-| Exact destination records, four lanes | 349 |
-| Exact bytes in each direction | 23,757,638 |
+| Exact destination records, four lanes | 960 |
+| Exact bytes in each direction | 33,768,262 |
+| Recovery | Same process/session/TCP socket through 20 s blackout, exit SIGKILL/restart, two NAT changes and 20 path replacements |
+| Recovery stream | 593 frames; maximum frame round trip 26.518 s |
+| Churn duration and volume | 60.009 s; 73,216 UDP datagrams; 41,100 distinct family/port pairs |
+| TCP frames completed during churn | 572 on the existing connection |
+| Resource samples | 572; every flow/pending count within its configured cap |
+| Peak manager flow bindings | 4096 |
+| Client RSS, initial / peak / final | 19,103,744 / 21,422,080 / 21,250,048 bytes |
 | Live MTU reduction | IPv6 underlay 1430 bytes; both TUNs 1289 bytes |
-| Existing TCP connections during reduction | IPv4 and IPv6: 40 frames each; no reconnect |
+| Existing MTU-test streams | 53 IPv4 frames; 59 IPv6 frames; no reconnect |
 | Oversized or fragmented UDP records after settling | 0 |
-| Recovery lane | One TCP connection across a 20 s total outage, exit restart, two NAT changes and 20 path replacements |
-| Recovery maximum frame round trip | 58.775 s |
-| Rate-capped median goodput ratio | 1.5161, two paths versus one; 3 trials per mode |
-| Source manifest SHA-256 | `2d8e432814aafaf1c181c6152738ce49464b8a5f1c3d3e3ce8facde9cb81e270` |
-| Client executable SHA-256 | `d03001f71410d99e8fde83bce43f8418092f5b22b0c60dcb7f863291455d6185` |
-| Exit executable SHA-256 | `b3b52835f7992833dfe8d2d34cc314859f7128612c08035286ce654541ef611f` |
+| Rate-capped median goodput ratio | 1.3988; three trials per mode |
+| Source manifest SHA-256 | `c8b3370e5d9b70c9f4d9c57959bf713ba0c3157f4e6c8bd1ac308805e57632af` |
+| Client executable SHA-256 | `1428169b5bd7d83c29e33ab74f4eb9427a6dca04bf9335866f0097b27e792190` |
+| Exit executable SHA-256 | `fbda2d161294ea4997a6c9428c0b8db8ece4e556e1ac6842648b417078569d50` |
+
+The churn check caught a real TCP stall from blocking per-packet pacing in the
+TUN loop. Production IP forwarding now bypasses that legacy pacing and must
+complete at least ten TCP frames during churn. The final run completed 572.
+The artifact-owner cleanup also preserves failing exit codes and mode-0600
+keys, addressing the CI artifact-upload permission failure.
+
+An earlier macOS debug run failed the fixed scheduler timing floor at 68,009
+selections/s. Final performance acceptance uses release builds on both platforms,
+with the original thresholds intact. The finite namespace/RSS observations do
+not establish physical-ISP behavior, privileged macOS TUN operation, indefinite
+availability, or continuity across an exit-host reboot.
 
 The following sections retain the earlier rebase baseline and describe that
 recorded snapshot rather than the extension's newer counts.

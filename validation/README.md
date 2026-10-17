@@ -21,7 +21,8 @@ produce a nonzero exit status. No network gate silently skips.
 
 Outputs are under `validation/artifacts/<UTC timestamp>/`. Retain the source
 archive, executed binaries, SHA-256 manifests, compiler/platform descriptions, image identity, logs, JSON
-results and PCAPs together. A success applies to that source snapshot and test
+results and PCAPs together. The container returns artifact ownership to the
+invoking user on success or failure, preserving private key file modes. A success applies to that source snapshot and test
 configuration. It does not establish universal correctness on arbitrary
 networks or constitute a formal verification of the implementation.
 
@@ -112,12 +113,17 @@ update a NAT endpoint. A client-side address replacement retains the numeric pat
 ID, avoiding accumulation of obsolete paths on the exit.
 
 `recovery.sh` exercises delayed exit startup, a 20 s all-path outage with pending
-buffer sampling, restart with the same static key, changed NAT source addresses,
-and ten rounds replacing both client source addresses. One existing TCP socket
+buffer sampling, SIGKILL followed by restart with the same static key, changed
+NAT source addresses, and ten rounds replacing both client source addresses. One existing TCP socket
 must survive every phase. Client process/session/path IDs and destination hashes
 are checked independently. The requested lease must remain available for restart
 continuity; a collision is rejected by the handshake rather than silently
-changing the address.
+changing the address. After recovery, 60 s of IPv4/IPv6 UDP source-port churn
+exercises the 4096-entry flow-affinity limit while the same TCP stream remains
+open and completes at least ten new frames during the load. Samples record
+TCP progress, active bindings, pending counts/bytes and RSS. The RSS gate
+allows an increase of 128 MiB from the initial sample; it is a finite workload
+threshold rather than a process-wide memory guarantee.
 
 Authenticated probes also negotiate an inner MTU ceiling. The client accounts
 for the local interface and framing overhead; the shared exit and client TUNs
@@ -196,7 +202,7 @@ The original NK implementation substitutes BLAKE3 through a custom resolver;
 standard Noise implementations using BLAKE2s are not wire-compatible.
 
 Remaining validation boundaries include physical NIC/ISP deployment, macOS
-TUN runtime, sustained soak/load limits, and UDP-blocked
+TUN runtime, workloads beyond the recorded 60 s churn test, and UDP-blocked
 initial connection establishment. Windows TUN support remains unimplemented.
 Full and split IPv4/IPv6 routing are exercised over IPv4 and IPv6 outer paths.
 Routing restoration is verified for graceful SIGTERM, not power loss or SIGKILL.

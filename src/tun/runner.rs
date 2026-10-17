@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
@@ -153,6 +153,7 @@ pub struct TunnelRunner {
 
     /// Event sender.
     event_tx: broadcast::Sender<TunnelEvent>,
+    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl TunnelRunner {
@@ -192,6 +193,7 @@ impl TunnelRunner {
             started_at: RwLock::new(None),
             stats: RwLock::new(TunnelStats::default()),
             event_tx,
+            background_tasks: Mutex::new(Vec::new()),
         })
     }
 
@@ -285,6 +287,7 @@ impl TunnelRunner {
 
         // Cleanup
         self.running.store(false, Ordering::SeqCst);
+        self.stop_background_tasks();
         self.routes.teardown()?;
 
         let _ = self.event_tx.send(TunnelEvent::Disconnected);
@@ -295,6 +298,13 @@ impl TunnelRunner {
     /// Stop the tunnel.
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        self.stop_background_tasks();
+    }
+
+    fn stop_background_tasks(&self) {
+        for task in self.background_tasks.lock().drain(..) {
+            task.abort();
+        }
     }
 
     /// Check if the tunnel is running.
@@ -309,7 +319,7 @@ impl TunnelRunner {
         let mut tunnel_buf = vec![0u8; self.config.buffer_size];
 
         // Start the receive loop from multipath manager
-        let mut recv_rx = self.manager.start_recv_loop();
+        let mut recv_rx = self.manager.try_start_recv_loop()?;
 
         // Start maintenance loop
         self.manager.start_maintenance_loop();
@@ -396,14 +406,19 @@ impl TunnelRunner {
         let flow_id = flow.flow_hash();
 
         // Send through multipath manager
-        match self.manager.send_on_flow(Some(flow_id), &packet_vec).await {
-            Ok(_) => {
+        match tokio::time::timeout(
+            super::io::PACKET_IO_TIMEOUT,
+            self.manager.send_on_flow(Some(flow_id), &packet_vec),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
                 let mut stats = self.stats.write();
                 stats.tunnel_packets_sent += 1;
                 stats.tunnel_bytes_sent += packet_vec.len() as u64;
             }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to send packet through tunnel");
+            result => {
+                tracing::debug!(?result, "Failed to send packet through tunnel");
                 self.stats.write().packets_dropped += 1;
             }
         }
@@ -427,11 +442,17 @@ impl TunnelRunner {
         }
 
         // Write to TUN device
-        match self.tun.handle().write(&packet).await {
-            Ok(len) => {
+        match super::io::complete_packet_write(
+            self.tun.handle().write(&packet),
+            packet.len(),
+            super::io::PACKET_IO_TIMEOUT,
+        )
+        .await
+        {
+            Ok(()) => {
                 let mut stats = self.stats.write();
                 stats.tun_packets_written += 1;
-                stats.tun_bytes_written += len as u64;
+                stats.tun_bytes_written += packet.len() as u64;
             }
             Err(e) => {
                 tracing::debug!(error = %e, "Failed to write packet to TUN");
@@ -442,27 +463,31 @@ impl TunnelRunner {
 
     /// Start background maintenance tasks.
     fn start_background_tasks(&self) {
+        let mut tasks = self.background_tasks.lock();
+        if !tasks.is_empty() {
+            return;
+        }
         let nat = Arc::clone(&self.nat);
         let cleanup_interval = self.config.nat_cleanup_interval;
-        let running = self.running.load(Ordering::SeqCst);
 
         // NAT cleanup task
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(cleanup_interval);
+        tasks.push(tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(cleanup_interval.max(Duration::from_millis(20)));
             loop {
                 interval.tick().await;
                 nat.cleanup_expired();
             }
-        });
+        }));
 
         // DNS server task (if configured)
         if self.config.dns.listen_addr.is_some() {
             let dns = Arc::clone(&self.dns);
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 if let Err(e) = dns.run().await {
                     tracing::error!(error = %e, "DNS interceptor error");
                 }
-            });
+            }));
         }
     }
 }
@@ -470,6 +495,8 @@ impl TunnelRunner {
 impl Drop for TunnelRunner {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        self.stop_background_tasks();
+        let _ = self.manager.close();
         // Remove policy state while the TUN descriptor is still open.
         if let Err(error) = self.routes.teardown() {
             tracing::error!(%error, "Tunnel route cleanup failed");

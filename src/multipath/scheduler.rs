@@ -88,6 +88,10 @@ pub struct SchedulerConfig {
     #[serde(default = "default_sticky")]
     pub sticky_paths: bool,
 
+    /// Maximum retained scheduler-affinity entries.
+    #[serde(default = "default_max_sticky_flows")]
+    pub max_sticky_flows: usize,
+
     /// Stickiness timeout.
     #[serde(default = "default_sticky_timeout", with = "humantime_serde")]
     pub sticky_timeout: Duration,
@@ -156,6 +160,9 @@ fn default_nat_weight() -> f32 {
 fn default_sticky() -> bool {
     true
 }
+fn default_max_sticky_flows() -> usize {
+    4096
+}
 fn default_sticky_timeout() -> Duration {
     Duration::from_secs(5)
 }
@@ -195,6 +202,7 @@ impl Default for SchedulerConfig {
             bandwidth_weight: default_bw_weight(),
             nat_penalty_weight: default_nat_weight(),
             sticky_paths: default_sticky(),
+            max_sticky_flows: default_max_sticky_flows(),
             sticky_timeout: default_sticky_timeout(),
             probe_backup_paths: default_probe(),
             probe_interval: default_probe_interval(),
@@ -216,36 +224,31 @@ struct WrrState {
     current_weight: u32,
 }
 
-/// Path stickiness tracking.
+/// Bounded scheduler affinity; refresh only when a flow is used.
 #[derive(Debug)]
 struct PathStickiness {
-    /// Flow -> (uplink_id, last_used)
-    flows: HashMap<u64, (u16, Instant)>,
+    flows: super::flows::FlowCache,
 }
 
 impl PathStickiness {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
-            flows: HashMap::new(),
+            flows: super::flows::FlowCache::new(capacity),
         }
     }
 
-    fn get(&self, flow_id: u64, timeout: Duration) -> Option<u16> {
-        self.flows.get(&flow_id).and_then(|(uplink, last)| {
-            if last.elapsed() < timeout {
-                Some(*uplink)
-            } else {
-                None
-            }
-        })
+    fn get(&mut self, flow_id: u64, timeout: Duration) -> Option<u16> {
+        let now = Instant::now();
+        self.flows.expire(now, timeout);
+        self.flows.get(flow_id, now)
     }
 
     fn set(&mut self, flow_id: u64, uplink_id: u16) {
-        self.flows.insert(flow_id, (uplink_id, Instant::now()));
+        self.flows.insert(flow_id, uplink_id, Instant::now());
     }
 
     fn cleanup(&mut self, timeout: Duration) {
-        self.flows.retain(|_, (_, last)| last.elapsed() < timeout);
+        self.flows.expire(Instant::now(), timeout);
     }
 }
 
@@ -264,10 +267,11 @@ pub struct Scheduler {
 impl Scheduler {
     /// Create a new scheduler.
     pub fn new(config: SchedulerConfig) -> Self {
+        let stickiness = PathStickiness::new(config.max_sticky_flows);
         Self {
             config,
             wrr_state: RwLock::new(WrrState::default()),
-            stickiness: RwLock::new(PathStickiness::new()),
+            stickiness: RwLock::new(stickiness),
             last_probe: RwLock::new(HashMap::new()),
             throughput_cache: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_millis(100),
@@ -310,7 +314,10 @@ impl Scheduler {
         // Check stickiness first
         if self.config.sticky_paths {
             if let Some(flow) = flow_id {
-                let sticky = self.stickiness.read().get(flow, self.config.sticky_timeout);
+                let sticky = self
+                    .stickiness
+                    .write()
+                    .get(flow, self.config.sticky_timeout);
                 if let Some(sticky_uplink) = sticky {
                     if usable.iter().any(|u| u.numeric_id() == sticky_uplink) {
                         return vec![sticky_uplink];
@@ -764,6 +771,18 @@ mod tests {
     fn test_scheduler_creation() {
         let scheduler = Scheduler::new(SchedulerConfig::default());
         assert_eq!(scheduler.config.strategy, SchedulingStrategy::Adaptive);
+    }
+
+    #[test]
+    fn scheduler_affinity_is_bounded_under_churn_and_expires() {
+        let mut affinity = PathStickiness::new(4);
+        for flow in 0..10000 {
+            affinity.set(flow, 1);
+            assert!(affinity.flows.len() <= 4);
+        }
+        assert_eq!(affinity.get(9999, Duration::from_secs(5)), Some(1));
+        assert_eq!(affinity.get(9999, Duration::ZERO), None);
+        assert_eq!(affinity.flows.len(), 0);
     }
 
     #[test]

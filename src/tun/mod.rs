@@ -58,6 +58,7 @@
 
 mod device;
 mod dns;
+pub(crate) mod io;
 mod nat;
 mod packet;
 mod routing;

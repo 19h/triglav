@@ -19,6 +19,19 @@ use crate::tun::{IpPacket, TunConfig, TunDevice};
 use crate::types::{SequenceNumber, SessionId};
 use crate::{Error, Result};
 
+const MAX_PROXY_SOURCE_KEYS: usize = 1024;
+
+fn count_proxy_source(sources: &mut std::collections::BTreeMap<String, u64>, address: IpAddr) {
+    let key = address.to_string();
+    let key = if sources.contains_key(&key) || sources.len() < MAX_PROXY_SOURCE_KEYS {
+        key
+    } else {
+        "_other".to_string()
+    };
+    let counter = sources.entry(key).or_default();
+    *counter = counter.saturating_add(1);
+}
+
 #[derive(Debug, Clone)]
 pub struct ExitConfig {
     pub listen: SocketAddr,
@@ -251,7 +264,7 @@ impl ExitServer {
                     let access_token = self.config.access_token;
                     proxy_tasks.spawn(async move {
                         match crate::proxy::exit_stream::serve(stream, keypair, access_token).await {
-                            Ok(()) => { *sources.lock().entry(peer.ip().to_string()).or_default() += 1; }
+                            Ok(()) => count_proxy_source(&mut sources.lock(), peer.ip()),
                             Err(e) => tracing::debug!(error = %e, "Exit proxy stream closed"),
                         }
                     });
@@ -281,7 +294,7 @@ impl ExitServer {
         let packet = Packet::decode(wire)?;
         if packet.header.packet_type == PacketType::Handshake {
             let reply = self.handshake(&packet, address)?;
-            self.socket.send_to(&reply, address).await?;
+            self.send_wire(&reply, address).await?;
             return Ok(());
         }
         let (payload, response, duplicate) = {
@@ -315,15 +328,6 @@ impl ExitServer {
                     let seq = packet.header.sequence.0;
                     duplicate =
                         session.seen.contains(&seq) || seq.saturating_add(8192) < session.highest;
-                    session.seen.insert(seq);
-                    session.highest = session.highest.max(seq);
-                    let minimum = session.highest.saturating_sub(8192);
-                    while session.seen.first().is_some_and(|n| *n < minimum) {
-                        session.seen.pop_first();
-                    }
-                    if !duplicate {
-                        path.received += 1;
-                    }
                     (
                         PacketType::Ack,
                         bincode::serialize(&vec![seq])
@@ -350,12 +354,42 @@ impl ExitServer {
             )?;
             (payload, response, duplicate)
         };
-        self.socket.send_to(&response, address).await?;
         if packet.header.packet_type == PacketType::Data && !duplicate {
-            self.tun.write(&payload).await?;
+            // Acknowledge only after the kernel accepts the complete IP packet.
+            // A failed/blocked write leaves the logical sequence retryable.
+            crate::tun::io::complete_packet_write(
+                self.tun.write(&payload),
+                payload.len(),
+                crate::tun::io::PACKET_IO_TIMEOUT,
+            )
+            .await?;
+            let mut sessions = self.sessions.lock();
+            let session = sessions
+                .get_mut(&packet.header.session_id)
+                .ok_or(Error::ConnectionClosed)?;
+            let sequence = packet.header.sequence.0;
+            session.seen.insert(sequence);
+            session.highest = session.highest.max(sequence);
+            let minimum = session.highest.saturating_sub(8192);
+            while session.seen.first().is_some_and(|n| *n < minimum) {
+                session.seen.pop_first();
+            }
+            if let Some(path) = session.paths.get_mut(&packet.header.uplink_id) {
+                path.received += 1;
+            }
             self.forwarded.fetch_add(1, Ordering::Relaxed);
         }
+        self.send_wire(&response, address).await?;
         Ok(())
+    }
+
+    async fn send_wire(&self, wire: &[u8], address: SocketAddr) -> Result<()> {
+        crate::tun::io::complete_packet_write(
+            async { Ok(self.socket.send_to(wire, address).await?) },
+            wire.len(),
+            crate::tun::io::PACKET_IO_TIMEOUT,
+        )
+        .await
     }
 
     fn client_ipv6(config: &ExitConfig, ipv4: Ipv4Addr) -> Option<Ipv6Addr> {
@@ -575,7 +609,7 @@ impl ExitServer {
                 address,
             )
         };
-        self.socket.send_to(&record, address).await?;
+        self.send_wire(&record, address).await?;
         self.returned.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -806,5 +840,23 @@ mod recovery_tests {
         sessions.clear();
         establish(&config, &key, &mut sessions, &hello, peer);
         assert_eq!(sessions[&hello.session].ipv4, hello.preferred_ipv4.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_source_churn_has_bounded_cardinality_and_exact_total() {
+        let mut sources = std::collections::BTreeMap::new();
+        for value in 0..10000u32 {
+            count_proxy_source(&mut sources, IpAddr::V4(Ipv4Addr::from(value)));
+        }
+        assert_eq!(sources.len(), MAX_PROXY_SOURCE_KEYS + 1);
+        assert_eq!(sources.values().sum::<u64>(), 10000);
+        assert_eq!(sources["_other"], 10000 - MAX_PROXY_SOURCE_KEYS as u64);
+        count_proxy_source(&mut sources, IpAddr::V4(Ipv4Addr::from(0)));
+        assert_eq!(sources["0.0.0.0"], 2);
     }
 }

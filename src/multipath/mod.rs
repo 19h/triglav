@@ -15,6 +15,7 @@
 
 pub mod aggregator;
 mod flow_hash;
+mod flows;
 mod manager;
 mod nat;
 mod path_discovery;

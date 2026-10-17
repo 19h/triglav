@@ -598,6 +598,14 @@ impl Uplink {
         *self.transport.write() = Some(transport);
     }
 
+    /// Release connection state even when a caller retains this path handle.
+    pub(crate) fn clear_connection(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self.transport.write() = None;
+        *self.noise_session.lock() = None;
+        self.set_connection_state(ConnectionState::Disconnected);
+    }
+
     /// Get the transport (cloned Arc).
     pub fn get_transport(&self) -> Option<Arc<dyn Transport>> {
         self.transport.read().clone()

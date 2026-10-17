@@ -20,8 +20,13 @@ docker run --name "$name" --privileged \
   --mount "type=bind,src=$OUT,dst=/evidence" \
   --mount type=volume,src=triglav-validation-cargo,dst=/usr/local/cargo \
   --mount type=volume,src=triglav-validation-build,dst=/build \
+  -e TRIGLAV_EVIDENCE_UID="$(id -u)" -e TRIGLAV_EVIDENCE_GID="$(id -g)" \
   -e TRIGLAV_EVIDENCE_DIR=/evidence triglav-validation:local bash -c '
     set -euo pipefail
+    # Preserve private key modes while returning all artifacts to their owner,
+    # including evidence from a failed test run.
+    return_artifacts() { chown -R "$TRIGLAV_EVIDENCE_UID:$TRIGLAV_EVIDENCE_GID" /evidence; }
+    trap return_artifacts EXIT
     date -u +%Y-%m-%dT%H:%M:%SZ > /evidence/started-at.txt
     uname -a > /evidence/platform.txt
     rustc -Vv > /evidence/rustc.txt

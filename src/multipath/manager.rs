@@ -64,6 +64,16 @@ pub struct MultipathConfig {
     #[serde(default = "default_inner_mtu")]
     pub inner_mtu: u16,
 
+    /// Maximum retained flow-affinity bindings; zero disables retention.
+    #[serde(default = "default_max_flow_bindings")]
+    pub max_flow_bindings: usize,
+    /// Maximum payloads waiting behind a reordered packet.
+    #[serde(default = "default_max_ready_packets")]
+    pub max_ready_packets: usize,
+    /// Idle time before maintenance expires a flow-affinity binding.
+    #[serde(default = "default_flow_idle_timeout", with = "humantime_serde")]
+    pub flow_idle_timeout: Duration,
+
     /// Retry failed path establishment starting at this delay.
     #[serde(default = "default_reconnect_initial", with = "humantime_serde")]
     pub reconnect_initial_delay: Duration,
@@ -178,6 +188,16 @@ fn default_max_pending_bytes() -> usize {
 fn default_max_pending_age() -> Duration {
     Duration::from_secs(10)
 }
+fn default_max_ready_packets() -> usize {
+    4096
+}
+fn default_max_flow_bindings() -> usize {
+    4096
+}
+fn default_flow_idle_timeout() -> Duration {
+    Duration::from_secs(120)
+}
+
 fn default_inner_mtu() -> u16 {
     1340
 }
@@ -241,6 +261,9 @@ impl Default for MultipathConfig {
             max_pending_bytes: default_max_pending_bytes(),
             max_pending_age: default_max_pending_age(),
             inner_mtu: default_inner_mtu(),
+            max_flow_bindings: default_max_flow_bindings(),
+            max_ready_packets: default_max_ready_packets(),
+            flow_idle_timeout: default_flow_idle_timeout(),
             reconnect_initial_delay: default_reconnect_initial(),
             reconnect_max_delay: default_reconnect_max(),
             peer_silence_timeout: default_peer_silence(),
@@ -338,6 +361,21 @@ pub struct PendingStats {
     pub oldest_age_ms: u64,
 }
 
+struct ReceiveOwner {
+    marker: Arc<AtomicU64>,
+    generation: u64,
+}
+impl Drop for ReceiveOwner {
+    fn drop(&mut self) {
+        let _ = self.marker.compare_exchange(
+            self.generation,
+            u64::MAX,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
 enum ReceiveLoopEvent {
     Packet {
         generation: u64,
@@ -422,6 +460,10 @@ pub struct MultipathManager {
     closing: AtomicBool,
     lifecycle: AtomicU64,
     maintenance_generation: AtomicU64,
+    receive_generation: Arc<AtomicU64>,
+    connect_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    receive_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    maintenance_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Deduplication window for received packets.
     dedup_window: RwLock<DeduplicationWindow>,
     /// Aggregate stats.
@@ -441,7 +483,7 @@ pub struct MultipathManager {
     path_discovery: PathDiscovery,
     /// Connection-to-uplink flow bindings (Dublin Traceroute: flow stickiness).
     /// Maps connection/stream IDs to their assigned uplink for ECMP consistency.
-    flow_bindings: DashMap<u64, u16>,
+    flow_bindings: Mutex<super::flows::FlowCache>,
     /// Next flow ID for new connections.
     next_flow_id: AtomicU64,
     /// Throughput optimizer for maximum bandwidth utilization.
@@ -458,6 +500,7 @@ impl MultipathManager {
         let (event_tx, _) = broadcast::channel(256);
 
         let dedup_size = config.dedup_window_size;
+        let flow_cache = super::flows::FlowCache::new(config.max_flow_bindings);
         let throughput_optimizer = ThroughputOptimizer::new(config.throughput.clone());
         let aggregator = BandwidthAggregator::new(config.aggregator.clone());
 
@@ -483,6 +526,10 @@ impl MultipathManager {
             closing: AtomicBool::new(false),
             lifecycle: AtomicU64::new(0),
             maintenance_generation: AtomicU64::new(u64::MAX),
+            receive_generation: Arc::new(AtomicU64::new(u64::MAX)),
+            connect_tasks: Mutex::new(Vec::new()),
+            receive_task: Mutex::new(None),
+            maintenance_task: Mutex::new(None),
             dedup_window: RwLock::new(DeduplicationWindow::new(dedup_size)),
             stats: RwLock::new(TrafficStats::default()),
             event_tx,
@@ -493,7 +540,7 @@ impl MultipathManager {
             assigned_ipv4: RwLock::new(None),
             assigned_ipv6: RwLock::new(None),
             ready_packets: parking_lot::Mutex::new(VecDeque::new()),
-            flow_bindings: DashMap::new(),
+            flow_bindings: Mutex::new(flow_cache),
             next_flow_id: AtomicU64::new(1),
             next_probe_id: AtomicU64::new(1),
         }
@@ -591,7 +638,15 @@ impl MultipathManager {
         if let Some((_, uplink)) = self.uplinks.remove(&id) {
             self.uplink_ids.remove(uplink.id());
             self.clear_flow_bindings_for_uplink(id);
-            uplink.set_connection_state(ConnectionState::Disconnected);
+            self.reconnect.lock().remove(&id);
+            let mut pending = self.pending.lock();
+            for packet in pending.packets.values_mut() {
+                if packet.attempts.remove(&id).is_some() {
+                    uplink.cancel_in_flight();
+                }
+            }
+            drop(pending);
+            uplink.clear_connection();
 
             // Unregister from throughput optimizer
             if self.config.throughput_optimization {
@@ -702,7 +757,7 @@ impl MultipathManager {
     }
 
     fn clear_flow_bindings_for_uplink(&self, uplink_id: u16) {
-        self.flow_bindings.retain(|_, bound| *bound != uplink_id);
+        self.flow_bindings.lock().remove_uplink(uplink_id);
     }
 
     /// Retain established exit identities through a temporary interface outage.
@@ -724,9 +779,11 @@ impl MultipathManager {
         let replacement = self.select_repair_uplink(failed_uplink);
         let affected_flows: Vec<u64> = self
             .flow_bindings
-            .iter()
-            .filter(|entry| *entry.value() == failed_uplink)
-            .map(|entry| *entry.key())
+            .lock()
+            .snapshot()
+            .into_iter()
+            .filter(|(_, uplink)| *uplink == failed_uplink)
+            .map(|(flow, _)| flow)
             .collect();
 
         if affected_flows.is_empty() {
@@ -739,7 +796,9 @@ impl MultipathManager {
         match replacement {
             Some(replacement) => {
                 for flow_id in &affected_flows {
-                    self.flow_bindings.insert(*flow_id, replacement);
+                    self.flow_bindings
+                        .lock()
+                        .insert(*flow_id, replacement, Instant::now());
                 }
 
                 self.send_fast_probe(replacement).await;
@@ -753,7 +812,7 @@ impl MultipathManager {
             }
             None => {
                 for flow_id in &affected_flows {
-                    self.flow_bindings.remove(flow_id);
+                    self.flow_bindings.lock().remove(*flow_id);
                 }
 
                 tracing::warn!(
@@ -806,6 +865,9 @@ impl MultipathManager {
     }
 
     async fn send_fast_probe(&self, uplink_id: u16) {
+        if self.closing.load(Ordering::Acquire) {
+            return;
+        }
         let Some(uplink) = self.get_uplink(uplink_id) else {
             return;
         };
@@ -842,7 +904,10 @@ impl MultipathManager {
             return;
         };
 
-        if let Err(e) = transport.send(&encoded).await {
+        if let Err(e) = tokio::time::timeout(Duration::from_secs(1), transport.send(&encoded))
+            .await
+            .unwrap_or(Err(Error::ConnectionTimeout))
+        {
             tracing::debug!(
                 uplink = %uplink.id(),
                 error = %e,
@@ -879,7 +944,7 @@ impl MultipathManager {
             let remote_public = remote_public.clone();
             let result_tx = result_tx.clone();
 
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let result = manager.connect_uplink(&uplink, &remote_public).await;
                 if let Err(e) = &result {
                     uplink.set_connection_state(ConnectionState::Failed);
@@ -892,6 +957,13 @@ impl MultipathManager {
                 }
                 let _ = result_tx.send((uplink.numeric_id(), result)).await;
             });
+            let mut tasks = self.connect_tasks.lock();
+            tasks.retain(|task| !task.is_finished());
+            if self.closing.load(Ordering::Acquire) {
+                task.abort();
+            } else {
+                tasks.push(task);
+            }
         }
         drop(result_tx);
 
@@ -1367,8 +1439,10 @@ impl MultipathManager {
         self.track_packet(seq, data, uplink_id)?;
 
         if let Some(uplink) = self.get_uplink(uplink_id) {
-            // Apply pacing if enabled
-            if self.config.throughput_optimization {
+            // Legacy pacing blocks the caller. Production IP traffic already
+            // has kernel congestion control; sleeping here stalls the TUN
+            // receive loop behind unrelated flows and delays its TCP ACKs.
+            if self.config.throughput_optimization && self.assigned_ipv4().is_none() {
                 let pacing_interval = self
                     .throughput_optimizer
                     .pacing_interval(uplink_id, data.len());
@@ -1447,7 +1521,7 @@ impl MultipathManager {
         let data_size = data.len() as u64;
 
         // Check for existing flow binding first
-        let bound_uplink = flow_id.and_then(|fid| self.flow_bindings.get(&fid).map(|r| *r));
+        let bound_uplink = flow_id.and_then(|fid| self.get_flow_binding(fid));
 
         // Create packet
         let uplinks = self.uplinks();
@@ -1462,7 +1536,9 @@ impl MultipathManager {
                     self.scheduler
                         .select_for_size(&uplinks, flow_id, Some(data_size));
                 if let (Some(fid), Some(&new_id)) = (flow_id, new_selection.first()) {
-                    self.flow_bindings.insert(fid, new_id);
+                    self.flow_bindings
+                        .lock()
+                        .insert(fid, new_id, Instant::now());
                 }
                 new_selection
             }
@@ -1472,7 +1548,9 @@ impl MultipathManager {
                 .scheduler
                 .select_for_size(&uplinks, flow_id, Some(data_size));
             if let (Some(fid), Some(&uplink_id)) = (flow_id, selection.first()) {
-                self.flow_bindings.insert(fid, uplink_id);
+                self.flow_bindings
+                    .lock()
+                    .insert(fid, uplink_id, Instant::now());
             }
             selection
         };
@@ -1497,7 +1575,7 @@ impl MultipathManager {
         for uplink_id in &selected {
             if let Some(uplink) = self.get_uplink(*uplink_id) {
                 // Apply pacing if enabled
-                if self.config.throughput_optimization {
+                if self.config.throughput_optimization && self.assigned_ipv4().is_none() {
                     let pacing_interval = self
                         .throughput_optimizer
                         .pacing_interval(*uplink_id, data.len());
@@ -1590,6 +1668,10 @@ impl MultipathManager {
     }
 
     fn track_packet(&self, seq: SequenceNumber, data: &[u8], uplink_id: u16) -> Result<()> {
+        let _lifecycle_guard = self.state.read();
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Error::ConnectionClosed);
+        }
         let mut buffer = self.pending.lock();
         if buffer.packets.len() >= self.config.max_pending_packets
             || data.len() > self.config.max_pending_bytes.saturating_sub(buffer.bytes)
@@ -1616,6 +1698,10 @@ impl MultipathManager {
     }
 
     fn track_attempt(&self, seq: u64, uplink: &Uplink) -> bool {
+        let _lifecycle_guard = self.state.read();
+        if self.closing.load(Ordering::Acquire) {
+            return false;
+        }
         let mut buffer = self.pending.lock();
         let Some(pending) = buffer.packets.get_mut(&seq) else {
             return false; // An earlier hedge was already acknowledged or expired.
@@ -1683,9 +1769,16 @@ impl MultipathManager {
         })?;
 
         if !self.track_attempt(seq.0, uplink) {
-            return Ok(());
+            return if self.closing.load(Ordering::Acquire) {
+                Err(Error::ConnectionClosed)
+            } else {
+                Ok(())
+            };
         }
-        if let Err(error) = transport.send(&encoded).await {
+        if let Err(error) = tokio::time::timeout(Duration::from_secs(1), transport.send(&encoded))
+            .await
+            .unwrap_or(Err(Error::ConnectionTimeout))
+        {
             let mut buffer = self.pending.lock();
             if let Some(pending) = buffer.packets.get_mut(&seq.0) {
                 if pending.attempts.remove(&uplink.numeric_id()).is_some() {
@@ -1783,7 +1876,14 @@ impl MultipathManager {
                     // In practice, we'd want to deliver all ready packets
                     let mut ready_packets = ready_packets.into_iter();
                     if let Some(first) = ready_packets.next() {
-                        self.ready_packets.lock().extend(ready_packets);
+                        let mut queue = self.ready_packets.lock();
+                        for payload in ready_packets {
+                            if queue.len() < self.config.max_ready_packets {
+                                queue.push_back(payload);
+                            } else {
+                                self.stats.write().packets_dropped += 1;
+                            }
+                        }
                         let decrypted_packet = Packet::data(
                             packet.header.sequence,
                             packet.header.session_id,
@@ -1846,6 +1946,9 @@ impl MultipathManager {
     /// Receive data from any uplink.
     /// Returns the decrypted payload and the uplink ID it came from.
     pub async fn recv(&self) -> Result<(Vec<u8>, u16)> {
+        if let Some(payload) = self.ready_packets.lock().pop_front() {
+            return Ok((payload, 0));
+        }
         let uplinks: Vec<_> = self
             .uplinks
             .iter()
@@ -1959,21 +2062,80 @@ impl MultipathManager {
         Ok(())
     }
 
+    async fn deliver_payload(
+        &self,
+        tx: &mpsc::Sender<(Vec<u8>, u16)>,
+        payload: Vec<u8>,
+        uplink: u16,
+    ) -> bool {
+        if self.assigned_ipv4().is_none() {
+            return tx.send((payload, uplink)).await.is_ok();
+        }
+        match tx.try_send((payload, uplink)) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Inner TCP owns reliability; a stalled TUN consumer must not
+                // prevent authenticated keepalives and recovery from being read.
+                self.stats.write().packets_dropped += 1;
+                true
+            }
+        }
+    }
+
     /// Start the receive loop in a background task.
     /// Returns a channel to receive decrypted data from.
     pub fn start_recv_loop(self: &Arc<Self>) -> mpsc::Receiver<(Vec<u8>, u16)> {
+        match self.try_start_recv_loop() {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                tracing::warn!(%error, "Cannot start receive loop");
+                let (_, receiver) = mpsc::channel(1);
+                receiver
+            }
+        }
+    }
+
+    /// Claim the single receive consumer for this connection lifecycle.
+    pub fn try_start_recv_loop(self: &Arc<Self>) -> Result<mpsc::Receiver<(Vec<u8>, u16)>> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Error::ConnectionClosed);
+        }
+        let lifecycle = self.lifecycle.load(Ordering::Acquire);
+        loop {
+            let current = self.receive_generation.load(Ordering::Acquire);
+            if current == lifecycle {
+                return Err(Error::Config("receive loop already running".into()));
+            }
+            if self
+                .receive_generation
+                .compare_exchange(current, lifecycle, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let owner = ReceiveOwner {
+            marker: Arc::clone(&self.receive_generation),
+            generation: lifecycle,
+        };
         let (tx, rx) = mpsc::channel(256);
         let manager = Arc::clone(self);
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            let _owner = owner;
+            let mut receive_tasks = tokio::task::JoinSet::new();
             let (receive_tx, mut receive_rx) = mpsc::channel(256);
             let mut spawned = HashSet::new();
             let mut scan_interval = tokio::time::interval(Duration::from_millis(100));
 
             loop {
                 tokio::select! {
+                    _ = tx.closed() => break,
+                    _ = receive_tasks.join_next(), if !receive_tasks.is_empty() => {},
                     _ = scan_interval.tick() => {
-                        if *manager.state.read() != ConnectionState::Connected || tx.is_closed() {
+                        if *manager.state.read() != ConnectionState::Connected || tx.is_closed()
+                            || manager.lifecycle.load(Ordering::Acquire) != lifecycle {
                             break;
                         }
 
@@ -1985,17 +2147,17 @@ impl MultipathManager {
                         {
                             let uplink_id = uplink.numeric_id();
                             if spawned.insert(uplink_id) {
-                                Self::spawn_uplink_recv_task(
+                                receive_tasks.spawn(Self::receive_uplink_task(
                                     Arc::clone(&manager),
                                     uplink,
                                     receive_tx.clone(),
-                                );
+                                ));
                             }
                         }
                         let mut ready: Vec<_> = manager.ready_packets.lock().drain(..).collect();
                         ready.extend(manager.poll_reorder_buffer());
                         for payload in ready {
-                            if tx.send((payload, 0)).await.is_err() {
+                            if !manager.deliver_payload(&tx, payload, 0).await {
                                 return;
                             }
                         }
@@ -2029,7 +2191,7 @@ impl MultipathManager {
                                             }
                                         }
 
-                                        if tx.send((payload, uplink_id)).await.is_err() {
+                                        if !manager.deliver_payload(&tx, payload, uplink_id).await {
                                             return;
                                         }
                                     }
@@ -2064,57 +2226,61 @@ impl MultipathManager {
             }
         });
 
-        rx
+        let mut current = self.receive_task.lock();
+        if self.closing.load(Ordering::Acquire) {
+            task.abort();
+        } else if let Some(old) = current.replace(task) {
+            old.abort();
+        }
+        Ok(rx)
     }
 
-    fn spawn_uplink_recv_task(
+    async fn receive_uplink_task(
         manager: Arc<Self>,
         uplink: Arc<Uplink>,
         receive_tx: mpsc::Sender<ReceiveLoopEvent>,
     ) {
-        tokio::spawn(async move {
-            let uplink_id = uplink.numeric_id();
-            let uplink_name = uplink.id().clone();
-            let mut buf = vec![0u8; 65536];
+        let uplink_id = uplink.numeric_id();
+        let uplink_name = uplink.id().clone();
+        let mut buf = vec![0u8; 65536];
 
-            loop {
-                if *manager.state.read() != ConnectionState::Connected
-                    || uplink.state().connection_state != ConnectionState::Connected
-                    || receive_tx.is_closed()
-                {
-                    break;
-                }
-
-                let generation = uplink.generation();
-                match tokio::time::timeout(Duration::from_secs(1), uplink.recv(&mut buf)).await {
-                    Ok(Ok(len)) => {
-                        if receive_tx
-                            .send(ReceiveLoopEvent::Packet {
-                                generation,
-                                uplink_id,
-                                uplink_name: uplink_name.clone(),
-                                data: buf[..len].to_vec(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        tracing::debug!(uplink = %uplink_name, error = %e, "Receive error");
-                        uplink.record_failure(&e.to_string());
-                        manager.repair_uplink_paths(uplink_id).await;
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    Err(_) => {}
-                }
+        loop {
+            if *manager.state.read() != ConnectionState::Connected
+                || uplink.state().connection_state != ConnectionState::Connected
+                || receive_tx.is_closed()
+            {
+                break;
             }
 
-            let _ = receive_tx
-                .send(ReceiveLoopEvent::Stopped { uplink_id })
-                .await;
-        });
+            let generation = uplink.generation();
+            match tokio::time::timeout(Duration::from_secs(1), uplink.recv(&mut buf)).await {
+                Ok(Ok(len)) => {
+                    if receive_tx
+                        .send(ReceiveLoopEvent::Packet {
+                            generation,
+                            uplink_id,
+                            uplink_name: uplink_name.clone(),
+                            data: buf[..len].to_vec(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(uplink = %uplink_name, error = %e, "Receive error");
+                    uplink.record_failure(&e.to_string());
+                    manager.repair_uplink_paths(uplink_id).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(_) => {}
+            }
+        }
+
+        let _ = receive_tx
+            .send(ReceiveLoopEvent::Stopped { uplink_id })
+            .await;
     }
 
     /// Retire every copy on the first authenticated acknowledgement.
@@ -2226,6 +2392,9 @@ impl MultipathManager {
 
     /// Retry a bounded snapshot. No buffer lock survives a network operation.
     pub async fn retry_pending(&self) {
+        if self.closing.load(Ordering::Acquire) {
+            return;
+        }
         let Ok(_retry_guard) = self.retry_lock.try_lock() else {
             return;
         };
@@ -2418,6 +2587,9 @@ impl MultipathManager {
     /// Start the maintenance loop in a background task.
     /// This handles retries, keepalives, uplink health monitoring, and throughput optimization.
     pub fn start_maintenance_loop(self: &Arc<Self>) {
+        if self.closing.load(Ordering::Acquire) {
+            return;
+        }
         let lifecycle = self.lifecycle.load(Ordering::Acquire);
         if self
             .maintenance_generation
@@ -2426,77 +2598,82 @@ impl MultipathManager {
         {
             return;
         }
-        let manager = Arc::clone(self);
-
-        tokio::spawn(async move {
+        let weak = Arc::downgrade(self);
+        let config = self.config.clone();
+        let legacy = self.assigned_ipv4().is_none();
+        let task = tokio::spawn(async move {
             let mut reconnect_tasks = tokio::task::JoinSet::new();
-            let mut retry_interval = tokio::time::interval(Duration::from_millis(100));
-            let mut maintenance_interval = tokio::time::interval(
-                manager
-                    .config
-                    .health_check_interval
-                    .max(Duration::from_millis(20)),
-            );
-            let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
-
-            // Path discovery interval (Dublin Traceroute: periodic ECMP probing)
-            let path_discovery_enabled = manager.assigned_ipv4().is_none()
-                && !manager.config.path_discovery_interval.is_zero();
-            let mut path_discovery_interval = tokio::time::interval(if path_discovery_enabled {
-                manager.config.path_discovery_interval
-            } else {
-                Duration::from_secs(3600) // Fallback, won't trigger if disabled
-            });
-
-            // Bandwidth probing interval for throughput optimization
-            let bandwidth_probe_enabled = manager.assigned_ipv4().is_none()
-                && manager.config.throughput_optimization
-                && manager.config.throughput.probing_enabled;
-            let mut bandwidth_probe_interval = tokio::time::interval(if bandwidth_probe_enabled {
-                manager.config.bandwidth_probe_interval
+            let mut retry = tokio::time::interval(Duration::from_millis(100));
+            let mut maintenance =
+                tokio::time::interval(config.health_check_interval.max(Duration::from_millis(20)));
+            let mut ping = tokio::time::interval(Duration::from_secs(5));
+            let discover = legacy && !config.path_discovery_interval.is_zero();
+            let probe =
+                legacy && config.throughput_optimization && config.throughput.probing_enabled;
+            let mut discovery = tokio::time::interval(if discover {
+                config.path_discovery_interval
             } else {
                 Duration::from_secs(3600)
             });
-
+            let mut bandwidth = tokio::time::interval(if probe {
+                config
+                    .bandwidth_probe_interval
+                    .max(Duration::from_millis(20))
+            } else {
+                Duration::from_secs(3600)
+            });
             loop {
-                if *manager.state.read() != ConnectionState::Connected
-                    || manager.closing.load(Ordering::Acquire)
+                let action = tokio::select! {
+                    _ = retry.tick() => 0,
+                    _ = maintenance.tick() => 1,
+                    _ = ping.tick() => 2,
+                    _ = discovery.tick(), if discover => 3,
+                    _ = bandwidth.tick(), if probe => 4,
+                    _ = reconnect_tasks.join_next(), if !reconnect_tasks.is_empty() => 5,
+                };
+                // Idle timers must not keep an otherwise released connection alive.
+                let Some(manager) = weak.upgrade() else {
+                    break;
+                };
+                if manager.closing.load(Ordering::Acquire)
                     || manager.lifecycle.load(Ordering::Acquire) != lifecycle
+                    || manager.state() != ConnectionState::Connected
                 {
                     break;
                 }
-
-                tokio::select! {
-                    _ = reconnect_tasks.join_next(), if !reconnect_tasks.is_empty() => {}
-                    _ = retry_interval.tick() => {
-                        manager.retry_pending().await;
-                    }
-                    _ = maintenance_interval.tick() => {
+                match action {
+                    0 => manager.retry_pending().await,
+                    1 => {
                         manager.periodic_maintenance();
                         manager.start_due_reconnects(&mut reconnect_tasks);
                     }
-                    _ = ping_interval.tick() => {
+                    2 => {
                         for uplink in manager.uplinks() {
                             if uplink.is_noise_ready() {
                                 manager.send_fast_probe(uplink.numeric_id()).await;
                             }
                         }
                     }
-                    _ = path_discovery_interval.tick(), if path_discovery_enabled => {
-                        manager.run_path_discovery().await;
-                    }
-                    _ = bandwidth_probe_interval.tick(), if bandwidth_probe_enabled => {
-                        manager.run_bandwidth_probes().await;
-                    }
+                    3 => manager.run_path_discovery().await,
+                    4 => manager.run_bandwidth_probes().await,
+                    _ => {}
                 }
             }
-            let _ = manager.maintenance_generation.compare_exchange(
-                lifecycle,
-                u64::MAX,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            if let Some(manager) = weak.upgrade() {
+                let _ = manager.maintenance_generation.compare_exchange(
+                    lifecycle,
+                    u64::MAX,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
         });
+        let mut current = self.maintenance_task.lock();
+        if self.closing.load(Ordering::Acquire) {
+            task.abort();
+        } else if let Some(old) = current.replace(task) {
+            old.abort();
+        }
     }
 
     /// Run active bandwidth probes on uplinks that need probing.
@@ -2665,7 +2842,11 @@ impl MultipathManager {
                             payload,
                         )?;
                         packet.set_flag(PacketFlags::ENCRYPTED);
-                        let _ = transport.send(&packet.encode()?).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(1),
+                            transport.send(&packet.encode()?),
+                        )
+                        .await;
                     }
                 }
             }
@@ -2692,6 +2873,15 @@ impl MultipathManager {
         self.lifecycle.fetch_add(1, Ordering::AcqRel);
         let mut state = self.state.write();
         *state = ConnectionState::Disconnecting;
+        for task in self.connect_tasks.lock().drain(..) {
+            task.abort();
+        }
+        if let Some(task) = self.receive_task.lock().take() {
+            task.abort();
+        }
+        if let Some(task) = self.maintenance_task.lock().take() {
+            task.abort();
+        }
 
         // Close all uplinks
         for entry in &self.uplinks {
@@ -2704,7 +2894,12 @@ impl MultipathManager {
         for seq in sequences {
             self.cancel_pending(seq);
         }
+        for entry in &self.uplinks {
+            entry.value().clear_connection();
+        }
+        self.reconnect.lock().clear();
         self.ready_packets.lock().clear();
+        self.flow_bindings.lock().clear();
         *state = ConnectionState::Disconnected;
         let _ = self.event_tx.send(MultipathEvent::Disconnected);
 
@@ -2983,40 +3178,39 @@ impl MultipathManager {
         }
 
         let flow_id = self.allocate_flow();
-        self.flow_bindings.insert(flow_id, uplink_id);
-        Some(flow_id)
+        self.flow_bindings
+            .lock()
+            .insert(flow_id, uplink_id, Instant::now())
+            .then_some(flow_id)
     }
 
     /// Get the uplink bound to a flow.
     pub fn get_flow_binding(&self, flow_id: u64) -> Option<u16> {
-        self.flow_bindings.get(&flow_id).map(|r| *r)
+        self.flow_bindings.lock().get(flow_id, Instant::now())
     }
 
     /// Release a flow binding when connection ends.
     pub fn release_flow(&self, flow_id: u64) {
-        self.flow_bindings.remove(&flow_id);
+        self.flow_bindings.lock().remove(flow_id);
     }
 
     /// Get number of active flow bindings.
     pub fn active_flow_count(&self) -> usize {
-        self.flow_bindings.len()
+        self.flow_bindings.lock().len()
     }
 
     /// Cleanup stale flow bindings (for flows whose uplinks are no longer usable).
     pub fn cleanup_stale_flows(&self) {
-        let stale: Vec<u64> = self
-            .flow_bindings
-            .iter()
-            .filter(|entry| {
-                !self
-                    .get_uplink(*entry.value())
-                    .is_some_and(|u| u.is_usable())
-            })
-            .map(|entry| *entry.key())
+        let mut flows = self.flow_bindings.lock();
+        flows.expire(Instant::now(), self.config.flow_idle_timeout);
+        let stale: Vec<_> = flows
+            .snapshot()
+            .into_iter()
+            .filter(|(_, uplink)| !self.get_uplink(*uplink).is_some_and(|u| u.is_usable()))
+            .map(|(flow, _)| flow)
             .collect();
-
-        for flow_id in stale {
-            self.flow_bindings.remove(&flow_id);
+        for flow in stale {
+            flows.remove(flow);
         }
     }
 }
@@ -3250,3 +3444,17 @@ mod tests {
 #[cfg(test)]
 #[path = "resilience_tests.rs"]
 mod resilience_tests;
+
+impl Drop for MultipathManager {
+    fn drop(&mut self) {
+        for task in self.connect_tasks.get_mut().drain(..) {
+            task.abort();
+        }
+        if let Some(task) = self.receive_task.get_mut().take() {
+            task.abort();
+        }
+        if let Some(task) = self.maintenance_task.get_mut().take() {
+            task.abort();
+        }
+    }
+}

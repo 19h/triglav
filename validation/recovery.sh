@@ -78,7 +78,7 @@ start_exit
 key=$(sed -n 's/^\(tg1[A-Za-z0-9_-]*\).*/\1/p' "$OUT/server.log" | head -1)
 [[ -n "$key" ]]
 kill -TERM "$server"; wait "$server"
-ip netns exec tgrecov-client "$BIN/triglav" --log-level debug tun "$key" --interface up1 --interface up2 --aggregate --route 198.18.0.0/24 --route 2001:db8:85::/64 >"$OUT/client.log" 2>&1 &
+ip netns exec tgrecov-client "$BIN/triglav" --log-level debug tun "$key" --interface up1 --interface up2 --route 198.18.0.0/24 --route 2001:db8:85::/64 >"$OUT/client.log" 2>&1 &
 client=$!; pids+=("$client")
 sleep 1
 kill -0 "$client" # An unavailable exit must not terminate client startup.
@@ -119,8 +119,13 @@ for n in 1 2; do ip netns exec "tgrecov-r$n" iptables -D FORWARD -j DROP; done
 wait_progress "$before"
 client_status >"$OUT/client-after-outage.json"
 
-# Restart the exit with the same key while the same inner TCP stream is open.
-kill -TERM "$server"; wait "$server"
+# Crash the exit while the same inner TCP stream is open; retain key material.
+kill -KILL "$server"
+set +e
+wait "$server"
+crash_status=$?
+set -e
+[[ $crash_status == 137 ]]
 sleep 2
 before=$(progress)
 start_exit
@@ -160,6 +165,9 @@ for round in {1..10}; do
   [[ $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["paths"]))' "$OUT/generation-after.json") == 2 ]]
   before=$(progress); wait_progress "$before"
 done
+# Exercise flow affinity past its capacity while the recovered TCP stream stays open.
+ip netns exec tgrecov-client python3 "$ROOT/validation/soak.py" "$OUT" >"$OUT/soak.log" 2>&1
+before=$(progress); wait_progress "$before"
 touch "$OUT/stop-flow"; wait "$flow"
 client_status >"$OUT/client-after.json"
 exit_status >"$OUT/exit-after.json"
@@ -187,7 +195,8 @@ summary = {'result': 'PASS', 'same_client_process': True, 'same_session': True,
            'one_tcp_connection': True, 'frames': flow['frames'], 'address_replacement_rounds': 10,
            'maximum_frame_round_trip_s': max(r['elapsed_s'] for r in flow['results']),
            'destination_records': len(records), 'bytes_each_direction': sum(r['size'] for r in records),
-           'outage_seconds': 20, 'exit_restarted': True, 'nat_addresses_rebound': 2,
+           'outage_seconds': 20, 'exit_restarted': True, 'exit_crash_signal': 9, 'nat_addresses_rebound': 2,
+           'soak': load('soak-summary.json'),
            'final_paths': load('exit-after.json')['paths']}
 (out/'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
 print(json.dumps(summary, indent=2))

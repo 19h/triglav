@@ -207,7 +207,10 @@ accepts existing `TG2` clients.
 The client status response includes pending-packet count, retained payload bytes
 and their configured limits. Defaults cap retransmission storage at 4096 logical
 packets, 8 MiB of payload and 10 s of age; these limits do not bound all process
-memory. See the [resilience acceptance contract](docs/resilience.md).
+memory. The manager retains at most 4096 flow bindings by default and expires idle
+entries after 120 s; the separate scheduler-affinity cache also has a hard cap. The status response includes the active binding count.
+Receive queues are bounded, and shutdown cancels owned tunnel tasks. See the
+[resilience acceptance contract](docs/resilience.md).
 
 The default inner MTU is 1340 bytes. `--mtu` on the TUN client or exit sets a
 ceiling from 1280 to 1367 bytes. Clients account for their interface MTUs and
@@ -239,8 +242,9 @@ concurrent clients, proxies, loss and reordering, path failure and recovery,
 admission rejection, replay rejection and routing cleanup.
 
 A separate recovery lane keeps one TCP connection open through a 20 s total
-outage, an exit restart, changed NAT addresses and twenty local path replacements.
-It checks process/session continuity and samples pending-buffer bounds under load.
+outage, a forced exit crash, changed NAT addresses and twenty local path replacements.
+It checks process/session continuity, then runs 60 s of source-port churn while
+sampling flow counts, pending-buffer bounds and process memory.
 A smaller-MTU lane keeps IPv4 and IPv6 TCP connections open during a live MTU
 reduction and audits the resulting UDP packet sizes.
 
@@ -271,7 +275,7 @@ workflow runs the same command.
 | Physical NIC, modem and ISP behavior | Outside the namespace validation results |
 | NAT rebinding, changing uplink addresses and exit restart | Covered by the controlled recovery lab; restart continuity requires the same key/prefix and an available lease |
 | Live MTU reduction | Controlled IPv6 underlay reduction to 1430 bytes; negotiated inner MTU 1289 bytes |
-| Arbitrary MTUs and long-duration load | Outside the recorded acceptance profile |
+| Load duration | Controlled 60 s flow-churn workload; longer-duration and physical-deployment behavior remain unmeasured |
 
 The protocol uses a Noise NK handshake with X25519 and ChaCha20-Poly1305. Its
 custom resolver maps the BLAKE2s pattern name to BLAKE3; standard Noise BLAKE2s

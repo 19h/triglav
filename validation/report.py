@@ -69,6 +69,10 @@ assert recovery['same_client_process'] and recovery['same_session'] and recovery
 assert recovery['outage_seconds'] == 20 and recovery['exit_restarted']
 assert recovery['address_replacement_rounds'] == 10 and recovery['nat_addresses_rebound'] == 2
 assert len(recovery['final_paths']) == 2
+assert recovery['exit_crash_signal'] == 9
+assert recovery['soak']['duration_s'] >= 60
+assert recovery['soak']['peak_flow_bindings'] == 4096
+assert recovery['soak']['tcp_frames_during_churn'] >= 10
 mtu = load('mtu/outer-ipv6/summary.json')
 assert mtu['result'] == 'PASS'
 assert mtu['dynamic_mtu']['outer_mtu'] == 1430 and mtu['dynamic_mtu']['inner_mtu'] == 1289

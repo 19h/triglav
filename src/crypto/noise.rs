@@ -134,6 +134,9 @@ pub struct NoiseSession {
     role: HandshakeRole,
     remote_public: Option<PublicKey>,
     handshake_complete: bool,
+    datagrams: bool,
+    received_nonces: std::collections::BTreeSet<u64>,
+    highest_nonce: u64,
 }
 
 impl NoiseSession {
@@ -162,6 +165,9 @@ impl NoiseSession {
             role: HandshakeRole::Initiator,
             remote_public: Some(*remote_public),
             handshake_complete: false,
+            datagrams: false,
+            received_nonces: Default::default(),
+            highest_nonce: 0,
         })
     }
 
@@ -186,6 +192,9 @@ impl NoiseSession {
             role: HandshakeRole::Responder,
             remote_public: None,
             handshake_complete: false,
+            datagrams: false,
+            received_nonces: Default::default(),
+            highest_nonce: 0,
         })
     }
 
@@ -329,6 +338,88 @@ impl NoiseSession {
             NoiseState::Transport(ts) => Some(ts.sending_nonce()),
             _ => None,
         }
+    }
+
+    /// Enable the explicitly negotiated datagram record format. Legacy stream
+    /// records remain available for compatibility with protocol-v1 peers.
+    pub fn enable_datagrams(&mut self) {
+        self.datagrams = true;
+    }
+
+    pub fn uses_datagrams(&self) -> bool {
+        self.datagrams
+    }
+
+    /// Authenticate the record type and sequence inside the ciphertext. The
+    /// explicit Noise nonce permits packet loss and reordering on UDP paths.
+    pub fn encrypt_packet(
+        &mut self,
+        data: &[u8],
+        sequence: u64,
+        kind: u8,
+    ) -> Result<Vec<u8>, CryptoError> {
+        if !self.datagrams {
+            return self.encrypt(data);
+        }
+        let nonce = self
+            .nonce_counter()
+            .ok_or_else(|| CryptoError::EncryptionFailed("no transport".into()))?;
+        let mut plaintext = Vec::with_capacity(data.len() + 9);
+        plaintext.push(kind);
+        plaintext.extend_from_slice(&sequence.to_be_bytes());
+        plaintext.extend_from_slice(data);
+        let mut record = nonce.to_be_bytes().to_vec();
+        record.extend_from_slice(&self.encrypt(&plaintext)?);
+        Ok(record)
+    }
+
+    pub fn decrypt_packet(
+        &mut self,
+        data: &[u8],
+        sequence: u64,
+        kind: u8,
+    ) -> Result<Vec<u8>, CryptoError> {
+        if !self.datagrams {
+            return self.decrypt(data);
+        }
+        if data.len() < 33 {
+            return Err(CryptoError::InvalidCiphertextLength);
+        }
+        let nonce = u64::from_be_bytes(data[..8].try_into().unwrap());
+        // Bound memory while accepting a 4096-record reordering window. Do not
+        // advance the window until authentication and header binding succeed.
+        if self.received_nonces.contains(&nonce) || nonce.saturating_add(4096) < self.highest_nonce
+        {
+            return Err(CryptoError::DecryptionFailed(
+                "replayed or stale datagram".into(),
+            ));
+        }
+        let old_nonce = match &mut self.state {
+            NoiseState::Transport(ts) => {
+                let old = ts.receiving_nonce();
+                ts.set_receiving_nonce(nonce);
+                old
+            }
+            _ => return Err(CryptoError::DecryptionFailed("no transport".into())),
+        };
+        let result = self.decrypt(&data[8..]);
+        if let NoiseState::Transport(ts) = &mut self.state {
+            ts.set_receiving_nonce(old_nonce);
+        }
+        let plaintext = result?;
+        if plaintext.len() < 9 || plaintext[0] != kind || plaintext[1..9] != sequence.to_be_bytes()
+        {
+            return Err(CryptoError::DecryptionFailed(
+                "record header mismatch".into(),
+            ));
+        }
+        self.received_nonces.insert(nonce);
+        self.highest_nonce = self.highest_nonce.max(nonce);
+        let minimum = self.highest_nonce.saturating_sub(4096);
+        while self.received_nonces.first().is_some_and(|n| *n < minimum) {
+            self.received_nonces.pop_first();
+        }
+        Ok(plaintext[9..].to_vec())
     }
 
     /// Rekey the session (for long-lived connections).

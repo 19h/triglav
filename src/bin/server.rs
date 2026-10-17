@@ -1,205 +1,88 @@
-//! Triglav standalone server binary.
+//! Standalone entry point for the production dual-stack exit service.
+use clap::Parser;
+use std::{path::PathBuf, sync::Arc};
+use triglav::{
+    crypto::{KeyPair, SecretKey},
+    server::{serve_exit_status, ExitConfig, ExitServer},
+    Result,
+};
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-
-use tracing::{info, warn};
-
-use triglav::config::{init_logging, ServerConfig};
-use triglav::crypto::{KeyPair, SecretKey};
-use triglav::error::{Error, Result};
-use triglav::server::{daemonize, DaemonConfig, PidFileGuard, ServerRuntimeOptions};
-use triglav::types::AuthKey;
-
-#[derive(Debug)]
+#[derive(Parser)]
+#[command(name = "triglav-server", about = "Multi-uplink single-exit IP service")]
 struct Args {
-    listen_addr: SocketAddr,
-    metrics_addr: SocketAddr,
-    key_path: Option<PathBuf>,
+    #[arg(long, env = "TRIGLAV_ACCESS_TOKEN", hide_env_values = true)]
+    access_token: Option<String>,
+    #[arg(short, long, default_value = "0.0.0.0:7443")]
+    listen: std::net::SocketAddr,
+    #[arg(short, long, default_value = "127.0.0.1:9090")]
+    metrics: std::net::SocketAddr,
+    #[arg(short, long)]
+    key: Option<PathBuf>,
+    #[arg(long)]
     generate_key: bool,
-    daemon_mode: bool,
-    pid_file: Option<PathBuf>,
-}
-
-impl Args {
-    fn parse() -> Result<Option<Self>> {
-        let args: Vec<String> = std::env::args().collect();
-
-        let mut parsed = Self {
-            listen_addr: "0.0.0.0:7443".parse().unwrap(),
-            metrics_addr: "0.0.0.0:9090".parse().unwrap(),
-            key_path: None,
-            generate_key: false,
-            daemon_mode: false,
-            pid_file: None,
-        };
-
-        let mut i = 1;
-        while i < args.len() {
-            match args[i].as_str() {
-                "-l" | "--listen" => {
-                    parsed.listen_addr = parse_next(&args, &mut i, "--listen")?;
-                }
-                "-m" | "--metrics" => {
-                    parsed.metrics_addr = parse_next(&args, &mut i, "--metrics")?;
-                }
-                "-k" | "--key" => {
-                    parsed.key_path = Some(PathBuf::from(next_arg(&args, &mut i, "--key")?));
-                }
-                "--generate-key" => {
-                    parsed.generate_key = true;
-                }
-                "-d" | "--daemon" => {
-                    parsed.daemon_mode = true;
-                }
-                "--pid-file" => {
-                    parsed.pid_file = Some(PathBuf::from(next_arg(&args, &mut i, "--pid-file")?));
-                }
-                "-h" | "--help" => {
-                    print_help();
-                    return Ok(None);
-                }
-                unknown => {
-                    return Err(Error::Config(format!("Unknown argument: {unknown}")));
-                }
-            }
-            i += 1;
-        }
-
-        Ok(Some(parsed))
-    }
+    #[arg(long, default_value = "tg-exit")]
+    tun_name: String,
+    #[arg(long, default_value = "10.0.85.254")]
+    tun_ipv4: std::net::Ipv4Addr,
+    #[arg(long, default_value = "fd00:7472:6967::ffff")]
+    tun_ipv6: std::net::Ipv6Addr,
+    #[arg(long)]
+    ipv4_only: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let Some(args) = Args::parse()? else {
-        return Ok(());
-    };
-
-    let _pid_guard = if args.daemon_mode {
-        let daemon_config = DaemonConfig {
-            pid_file: args.pid_file.clone(),
-            work_dir: PathBuf::from("/"),
-            user: None,
-            group: None,
-            umask: Some(0o027),
-            close_fds: true,
-        };
-
-        daemonize(&daemon_config)?;
-        args.pid_file
-            .as_ref()
-            .map(|path| PidFileGuard::new(path).expect("Failed to create PID file"))
-    } else {
-        None
-    };
-
-    init_logging(&triglav::config::LoggingConfig::default())?;
-
-    let keypair = load_or_generate_keypair(args.key_path.as_ref(), args.generate_key)?;
-
-    let config = ServerConfig {
-        enabled: true,
-        listen_addrs: vec![args.listen_addr],
-        ..Default::default()
-    };
-
-    let advertised_addrs = triglav::util::advertised_server_addrs(&[args.listen_addr]);
-    let auth_key = AuthKey::new(*keypair.public.as_bytes(), advertised_addrs.clone());
-
-    if !args.daemon_mode {
-        println!();
-        println!("╔══════════════════════════════════════════╗");
-        println!("║     TRIGLAV SERVER                       ║");
-        println!(
-            "║     Version {}                         ║",
-            triglav::VERSION
-        );
-        println!("╚══════════════════════════════════════════╝");
-        println!();
-        println!("Listening on: {}", args.listen_addr);
-        println!("Advertised endpoints:");
-        for addr in &advertised_addrs {
-            println!("  {}", addr);
-        }
-        println!("Metrics at:   http://{}", args.metrics_addr);
-        println!();
-        println!("Client Connection Key:");
-        println!("{}", auth_key);
-        println!();
-    }
-
-    info!("Triglav server starting");
-    info!(
-        "Listen: {}, Metrics: {}",
-        args.listen_addr, args.metrics_addr
-    );
-
-    triglav::server::run_server(ServerRuntimeOptions {
-        config,
-        keypair,
-        metrics_addr: args.metrics_addr,
-    })
-    .await?;
-
-    info!("Triglav server stopped");
-    Ok(())
-}
-
-fn load_or_generate_keypair(path: Option<&PathBuf>, generate_key: bool) -> Result<KeyPair> {
-    if let Some(path) = path {
-        if path.exists() {
-            let content = std::fs::read_to_string(path)?;
-            let secret = SecretKey::from_base64(content.trim())?;
-            Ok(KeyPair::from_secret(secret))
-        } else if generate_key {
+    let args = Args::parse();
+    triglav::config::init_logging(&triglav::config::LoggingConfig::default())?;
+    let keypair = match args.key {
+        Some(path) if path.exists() => KeyPair::from_secret(SecretKey::from_base64(
+            std::fs::read_to_string(path)?.trim(),
+        )?),
+        path if args.generate_key => {
             let keypair = KeyPair::generate();
-            std::fs::write(path, keypair.secret.to_base64())?;
-            info!("Generated new keypair at {}", path.display());
-            Ok(keypair)
-        } else {
-            Err(Error::Config(format!(
-                "Key file not found: {}",
-                path.display()
-            )))
+            if let Some(path) = path {
+                use std::io::Write;
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                options
+                    .open(path)?
+                    .write_all(keypair.secret.to_base64().as_bytes())?;
+            }
+            keypair
         }
-    } else if generate_key {
-        warn!("Using ephemeral keypair (not saved)");
-        Ok(KeyPair::generate())
+        _ => {
+            return Err(triglav::Error::Config(
+                "Provide --key or --generate-key".into(),
+            ))
+        }
+    };
+    let mut config = ExitConfig::default();
+    config.listen = args.listen;
+    config.access_token = triglav::server::parse_access_token(args.access_token.as_deref())?;
+    config.tun.name = args.tun_name;
+    config.tun.ipv4_addr = Some(args.tun_ipv4);
+    config.tun.ipv6_addr = if args.ipv4_only {
+        None
     } else {
-        Err(Error::Config("No key specified".into()))
+        Some(args.tun_ipv6)
+    };
+    let server = Arc::new(ExitServer::new(config, keypair.clone()).await?);
+    println!(
+        "{}",
+        triglav::types::AuthKey::new(
+            *keypair.public.as_bytes(),
+            triglav::util::advertised_server_addrs(&[server.local_addr()?])
+        )
+    );
+    tokio::select! {
+        result = server.run() => result?,
+        result = serve_exit_status(Arc::clone(&server), args.metrics) => result?,
+        _ = triglav::server::shutdown_signal() => server.shutdown(),
     }
-}
-
-fn parse_next<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str) -> Result<T>
-where
-    T::Err: std::fmt::Display,
-{
-    let value = next_arg(args, i, flag)?;
-    value
-        .parse()
-        .map_err(|e| Error::Config(format!("Invalid value for {flag}: {e}")))
-}
-
-fn next_arg(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
-    if *i + 1 >= args.len() {
-        return Err(Error::Config(format!("Missing value for {flag}")));
-    }
-    *i += 1;
-    Ok(args[*i].clone())
-}
-
-fn print_help() {
-    println!("Triglav Server");
-    println!();
-    println!("Usage: triglav-server [OPTIONS]");
-    println!();
-    println!("Options:");
-    println!("  -l, --listen <ADDR>    Listen address (default: 0.0.0.0:7443)");
-    println!("  -m, --metrics <ADDR>   Metrics HTTP address (default: 0.0.0.0:9090)");
-    println!("  -k, --key <PATH>       Path to key file");
-    println!("      --generate-key     Generate new key if not exists");
-    println!("  -d, --daemon           Run as daemon");
-    println!("      --pid-file <PATH>  PID file path (for daemon mode)");
-    println!("  -h, --help             Show this help");
+    Ok(())
 }

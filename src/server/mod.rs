@@ -25,3 +25,22 @@ pub use daemon::*;
 pub use runtime::*;
 pub use sessions::*;
 pub use signals::*;
+
+mod exit;
+pub use exit::*;
+
+/// Service-manager termination and interactive interruption share cleanup.
+pub async fn shutdown_signal() -> crate::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}

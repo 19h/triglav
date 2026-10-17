@@ -323,6 +323,11 @@ pub struct MultipathManager {
     state: RwLock<ConnectionState>,
     /// Local keypair.
     local_keypair: KeyPair,
+    join_token: [u8; 32],
+    access_token: RwLock<Option<[u8; 32]>>,
+    assigned_ipv4: RwLock<Option<std::net::Ipv4Addr>>,
+    assigned_ipv6: RwLock<Option<std::net::Ipv6Addr>>,
+    ready_packets: parking_lot::Mutex<VecDeque<Vec<u8>>>,
     /// Path discovery for ECMP-aware routing (Dublin Traceroute technique).
     path_discovery: PathDiscovery,
     /// Connection-to-uplink flow bindings (Dublin Traceroute: flow stickiness).
@@ -365,6 +370,11 @@ impl MultipathManager {
             event_tx,
             state: RwLock::new(ConnectionState::Disconnected),
             local_keypair,
+            join_token: rand::random(),
+            access_token: RwLock::new(None),
+            assigned_ipv4: RwLock::new(None),
+            assigned_ipv6: RwLock::new(None),
+            ready_packets: parking_lot::Mutex::new(VecDeque::new()),
             flow_bindings: DashMap::new(),
             next_flow_id: AtomicU64::new(1),
             next_probe_id: AtomicU64::new(1),
@@ -374,6 +384,23 @@ impl MultipathManager {
     /// Get the session ID.
     pub fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    /// Address allocated by the production exit for this logical client.
+    pub fn assigned_ipv4(&self) -> Option<std::net::Ipv4Addr> {
+        *self.assigned_ipv4.read()
+    }
+
+    pub fn assigned_ipv6(&self) -> Option<std::net::Ipv6Addr> {
+        *self.assigned_ipv6.read()
+    }
+
+    pub fn set_access_token(&self, token: Option<[u8; 32]>) {
+        *self.access_token.write() = token;
+    }
+
+    pub(crate) fn access_token(&self) -> Option<[u8; 32]> {
+        *self.access_token.read()
     }
 
     /// Get the connection ID.
@@ -488,13 +515,22 @@ impl MultipathManager {
                     && existing.config().remote_addr == config.remote_addr
                     && existing.config().protocol == config.protocol
                 {
+                    if matches!(
+                        existing.state().connection_state,
+                        ConnectionState::Connecting | ConnectionState::Handshaking
+                    ) {
+                        // The concurrent startup handshake already owns this path.
+                        return Ok(existing_id);
+                    }
                     if existing.state().connection_state != ConnectionState::Connected {
                         if let Err(e) = self.connect_uplink(&existing, remote_public).await {
+                            existing.set_connection_state(ConnectionState::Failed);
                             existing.record_failure(&e.to_string());
                             return Err(e);
                         }
-                        self.send_fast_probe(existing_id).await;
                     }
+                    *self.state.write() = ConnectionState::Connected;
+                    self.send_fast_probe(existing_id).await;
                     return Ok(existing_id);
                 }
 
@@ -505,6 +541,7 @@ impl MultipathManager {
         let id = self.add_uplink(config)?;
         if let Some(uplink) = self.get_uplink(id) {
             if let Err(e) = self.connect_uplink(&uplink, remote_public).await {
+                uplink.set_connection_state(ConnectionState::Failed);
                 uplink.record_failure(&e.to_string());
                 return Err(e);
             }
@@ -524,6 +561,20 @@ impl MultipathManager {
 
     fn clear_flow_bindings_for_uplink(&self, uplink_id: u16) {
         self.flow_bindings.retain(|_, bound| *bound != uplink_id);
+    }
+
+    /// Retain established exit identities through a temporary interface outage.
+    /// A successful authenticated probe re-enables the same encrypted path.
+    pub fn suspend_uplinks_for_interface(&self, interface: &str) -> usize {
+        let mut count = 0;
+        for uplink in self.uplinks() {
+            if uplink.config().interface.as_deref() == Some(interface) {
+                uplink.mark_unavailable();
+                self.clear_flow_bindings_for_uplink(uplink.numeric_id());
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Move flow bindings off a degraded/failed path and quickly probe the replacement.
@@ -596,9 +647,22 @@ impl MultipathManager {
         };
 
         let seq = SequenceNumber(self.next_seq.fetch_add(1, Ordering::SeqCst));
-        let Ok(ping) = Packet::ping(seq, self.session_id, uplink.numeric_id()) else {
+        let Ok(mut ping) = Packet::ping(seq, self.session_id, uplink.numeric_id()) else {
             return;
         };
+        ping.payload = ping.header.timestamp.to_be_bytes().to_vec();
+        if self.assigned_ipv4().is_some() {
+            let Ok(payload) = uplink.encrypt_packet(&ping.payload, seq.0, PacketType::Ping as u8)
+            else {
+                return;
+            };
+            ping.payload = payload;
+            ping.header.payload_len = ping.payload.len() as u16;
+            ping.set_flag(PacketFlags::ENCRYPTED);
+        } else {
+            ping.header.payload_len = ping.payload.len() as u16;
+            ping.set_flag(0);
+        }
         let Ok(encoded) = ping.encode() else {
             return;
         };
@@ -639,6 +703,7 @@ impl MultipathManager {
             tokio::spawn(async move {
                 let result = manager.connect_uplink(&uplink, &remote_public).await;
                 if let Err(e) = &result {
+                    uplink.set_connection_state(ConnectionState::Failed);
                     tracing::warn!(
                         uplink = %uplink.id(),
                         error = %e,
@@ -679,13 +744,36 @@ impl MultipathManager {
         let config = uplink.config();
 
         // Create transport
-        let transport = connect(
-            config.protocol,
-            config.remote_addr,
-            config.local_addr,
-            &self.config.transport,
-        )
-        .await?;
+        let local_addr = if config.local_addr.is_some() {
+            config.local_addr
+        } else if let Some(interface) = &config.interface {
+            Some(crate::util::interface_bind_address(
+                interface,
+                config.remote_addr,
+            )?)
+        } else {
+            None
+        };
+        let transport: Box<dyn Transport> =
+            if config.protocol == crate::transport::TransportProtocol::Udp {
+                Box::new(
+                    crate::transport::UdpTransport::connect_on_interface(
+                        config.remote_addr,
+                        local_addr,
+                        &self.config.transport,
+                        config.interface.as_deref(),
+                    )
+                    .await?,
+                )
+            } else {
+                connect(
+                    config.protocol,
+                    config.remote_addr,
+                    local_addr,
+                    &self.config.transport,
+                )
+                .await?
+            };
 
         // Wrap in Arc for sharing across async operations
         let transport: Arc<dyn Transport> = Arc::from(transport);
@@ -697,7 +785,14 @@ impl MultipathManager {
         let mut noise = NoiseSession::new_initiator(&self.local_keypair.secret, remote_public)?;
 
         // Write handshake message 1 (e, es)
-        let msg1 = noise.write_handshake(&[])?;
+        let mut hello = b"TG2".to_vec();
+        hello.extend_from_slice(&self.join_token);
+        hello.extend_from_slice(&self.session_id.0);
+        hello.extend_from_slice(&uplink.numeric_id().to_be_bytes());
+        if let Some(token) = self.access_token() {
+            hello.extend_from_slice(&token);
+        }
+        let msg1 = noise.write_handshake(&hello)?;
 
         // Create handshake packet
         let handshake_packet = Packet::new(
@@ -739,7 +834,38 @@ impl MultipathManager {
         }
 
         // Process handshake message 2
-        let _ = noise.read_handshake(&response_packet.payload)?;
+        if response_packet.header.session_id != self.session_id
+            || response_packet.header.uplink_id != uplink.numeric_id()
+        {
+            return Err(Error::InvalidPacket("Handshake identity mismatch".into()));
+        }
+        let response = noise.read_handshake(&response_packet.payload)?;
+        if response.starts_with(b"TG2") {
+            if !matches!(response.len(), 7 | 23) {
+                return Err(Error::InvalidPacket("Invalid exit handshake".into()));
+            }
+            let address =
+                std::net::Ipv4Addr::new(response[3], response[4], response[5], response[6]);
+            let ipv6 = if response.len() == 23 {
+                Some(std::net::Ipv6Addr::from(
+                    <[u8; 16]>::try_from(&response[7..23]).unwrap(),
+                ))
+            } else {
+                None
+            };
+            let mut assigned = self.assigned_ipv4.write();
+            if assigned.is_some() && *self.assigned_ipv6.read() != ipv6 {
+                return Err(Error::InvalidPacket(
+                    "Exit changed client IPv6 address".into(),
+                ));
+            }
+            if assigned.is_some_and(|old| old != address) {
+                return Err(Error::InvalidPacket("Exit changed client address".into()));
+            }
+            *assigned = Some(address);
+            *self.assigned_ipv6.write() = ipv6;
+            noise.enable_datagrams();
+        }
 
         if !noise.is_transport() {
             return Err(Error::Crypto(crate::error::CryptoError::NoiseProtocol(
@@ -931,7 +1057,7 @@ impl MultipathManager {
                     self.repair_uplink_paths(uplink_id).await;
 
                     // Try fallback to another uplink
-                    self.send_aggregated_fallback(data, uplink_id).await
+                    self.send_aggregated_fallback(data, uplink_id, seq).await
                 }
             }
         } else {
@@ -940,7 +1066,12 @@ impl MultipathManager {
     }
 
     /// Fallback when primary stripe uplink fails - try next available.
-    async fn send_aggregated_fallback(&self, data: &[u8], failed_uplink: u16) -> Result<u64> {
+    async fn send_aggregated_fallback(
+        &self,
+        data: &[u8],
+        failed_uplink: u16,
+        seq: SequenceNumber,
+    ) -> Result<u64> {
         let uplinks = self.uplinks();
 
         for uplink in &uplinks {
@@ -950,8 +1081,6 @@ impl MultipathManager {
             if !uplink.is_usable() {
                 continue;
             }
-
-            let seq = SequenceNumber(self.aggregator.current_seq());
 
             match self.send_on_uplink(uplink, seq, data).await {
                 Ok(_) => {
@@ -1121,7 +1250,7 @@ impl MultipathManager {
         data: &[u8],
     ) -> Result<()> {
         // Encrypt the payload using the uplink's noise session
-        let encrypted_payload = uplink.encrypt(data)?;
+        let encrypted_payload = uplink.encrypt_packet(data, seq.0, PacketType::Data as u8)?;
 
         // Create packet with encrypted payload
         let mut packet =
@@ -1150,15 +1279,12 @@ impl MultipathManager {
         );
 
         // Track pending packet for retry (store original data for potential retransmission)
-        self.pending.insert(
-            seq.0,
-            PendingPacket {
-                packet: Packet::data(seq, self.session_id, uplink.numeric_id(), data.to_vec())?,
-                sent_at: Instant::now(),
-                retries: 0,
-                uplink_id: uplink.numeric_id(),
-            },
-        );
+        self.pending.entry(seq.0).or_insert(PendingPacket {
+            packet: Packet::data(seq, self.session_id, uplink.numeric_id(), data.to_vec())?,
+            sent_at: Instant::now(),
+            retries: 0,
+            uplink_id: uplink.numeric_id(),
+        });
 
         Ok(())
     }
@@ -1167,7 +1293,7 @@ impl MultipathManager {
     /// When aggregation is enabled, packets are passed through the reorder buffer
     /// to handle out-of-order arrival from different uplinks.
     pub fn handle_packet(&self, data: &[u8], from_uplink: u16) -> Result<Option<Vec<u8>>> {
-        let packet = Packet::decode(data)?;
+        let mut packet = Packet::decode(data)?;
 
         // Verify session
         if packet.header.session_id != self.session_id {
@@ -1179,12 +1305,29 @@ impl MultipathManager {
             ));
         }
 
-        // Deduplication using O(1) sliding window
-        if self.config.deduplication {
-            let mut dedup = self.dedup_window.write();
-            if dedup.is_duplicate(packet.header.sequence.0) {
-                return Ok(None); // Duplicate
-            }
+        if packet.header.uplink_id != from_uplink {
+            return Err(Error::InvalidPacket("Uplink identity mismatch".into()));
+        }
+        if packet.header.flags.has(PacketFlags::ENCRYPTED) {
+            let uplink = self
+                .get_uplink(from_uplink)
+                .ok_or(Error::NoAvailableUplinks)?;
+            packet.payload = uplink.decrypt_packet(
+                &packet.payload,
+                packet.header.sequence.0,
+                packet.header.packet_type as u8,
+            )?;
+        } else if self.assigned_ipv4().is_some() {
+            return Err(Error::InvalidPacket("Unauthenticated exit packet".into()));
+        }
+        if packet.header.packet_type == PacketType::Data
+            && self.config.deduplication
+            && self
+                .dedup_window
+                .write()
+                .is_duplicate(packet.header.sequence.0)
+        {
+            return Ok(None);
         }
 
         // Update uplink stats
@@ -1203,16 +1346,7 @@ impl MultipathManager {
         // Handle by packet type
         match packet.header.packet_type {
             PacketType::Data => {
-                // Decrypt if encrypted
-                let payload = if packet.header.flags.has(PacketFlags::ENCRYPTED) {
-                    if let Some(uplink) = self.get_uplink(from_uplink) {
-                        uplink.decrypt(&packet.payload)?
-                    } else {
-                        packet.payload.clone()
-                    }
-                } else {
-                    packet.payload.clone()
-                };
+                let payload = packet.payload.clone();
 
                 // Check if aggregation is enabled - use reorder buffer
                 let use_aggregation =
@@ -1226,7 +1360,9 @@ impl MultipathManager {
 
                     // Return the first ready packet (others will be picked up by poll)
                     // In practice, we'd want to deliver all ready packets
-                    if let Some(first) = ready_packets.into_iter().next() {
+                    let mut ready_packets = ready_packets.into_iter();
+                    if let Some(first) = ready_packets.next() {
+                        self.ready_packets.lock().extend(ready_packets);
                         let decrypted_packet = Packet::data(
                             packet.header.sequence,
                             packet.header.session_id,
@@ -1359,6 +1495,11 @@ impl MultipathManager {
     }
 
     fn data_sequence_to_ack(&self, data: &[u8]) -> Result<Option<u64>> {
+        // The TUN exit uses the inner transport's reliability. The older relay
+        // runtime requires outer acknowledgements for its retransmit queue.
+        if self.assigned_ipv4().is_some() {
+            return Ok(None);
+        }
         let packet = Packet::decode(data)?;
         if packet.header.session_id != self.session_id {
             return Err(Error::Protocol(
@@ -1406,19 +1547,19 @@ impl MultipathManager {
         tokio::spawn(async move {
             let (receive_tx, mut receive_rx) = mpsc::channel(256);
             let mut spawned = HashSet::new();
-            let mut scan_interval = tokio::time::interval(Duration::from_millis(250));
+            let mut scan_interval = tokio::time::interval(Duration::from_millis(100));
 
             loop {
                 tokio::select! {
                     _ = scan_interval.tick() => {
-                        if *manager.state.read() != ConnectionState::Connected {
+                        if *manager.state.read() != ConnectionState::Connected || tx.is_closed() {
                             break;
                         }
 
                         for uplink in manager
                             .uplinks
                             .iter()
-                            .filter(|entry| entry.value().is_usable())
+                            .filter(|entry| entry.value().state().connection_state == ConnectionState::Connected)
                             .map(|entry| entry.value().clone())
                         {
                             let uplink_id = uplink.numeric_id();
@@ -1428,6 +1569,13 @@ impl MultipathManager {
                                     uplink,
                                     receive_tx.clone(),
                                 );
+                            }
+                        }
+                        let mut ready: Vec<_> = manager.ready_packets.lock().drain(..).collect();
+                        ready.extend(manager.poll_reorder_buffer());
+                        for payload in ready {
+                            if tx.send((payload, 0)).await.is_err() {
+                                return;
                             }
                         }
                     }
@@ -1508,7 +1656,10 @@ impl MultipathManager {
             let mut buf = vec![0u8; 65536];
 
             loop {
-                if *manager.state.read() != ConnectionState::Connected || !uplink.is_usable() {
+                if *manager.state.read() != ConnectionState::Connected
+                    || uplink.state().connection_state != ConnectionState::Connected
+                    || receive_tx.is_closed()
+                {
                     break;
                 }
 
@@ -1615,7 +1766,7 @@ impl MultipathManager {
             if now_us > ping_ts {
                 let rtt = Duration::from_micros(now_us - ping_ts);
                 if let Some(uplink) = self.get_uplink(from_uplink) {
-                    uplink.record_rtt(rtt);
+                    uplink.record_probe_success(rtt);
 
                     // Also record with throughput optimizer
                     if self.config.throughput_optimization {
@@ -1795,7 +1946,8 @@ impl MultipathManager {
             let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
 
             // Path discovery interval (Dublin Traceroute: periodic ECMP probing)
-            let path_discovery_enabled = !manager.config.path_discovery_interval.is_zero();
+            let path_discovery_enabled = manager.assigned_ipv4().is_none()
+                && !manager.config.path_discovery_interval.is_zero();
             let mut path_discovery_interval = tokio::time::interval(if path_discovery_enabled {
                 manager.config.path_discovery_interval
             } else {
@@ -1803,8 +1955,9 @@ impl MultipathManager {
             });
 
             // Bandwidth probing interval for throughput optimization
-            let bandwidth_probe_enabled =
-                manager.config.throughput_optimization && manager.config.throughput.probing_enabled;
+            let bandwidth_probe_enabled = manager.assigned_ipv4().is_none()
+                && manager.config.throughput_optimization
+                && manager.config.throughput.probing_enabled;
             let mut bandwidth_probe_interval = tokio::time::interval(if bandwidth_probe_enabled {
                 manager.config.bandwidth_probe_interval
             } else {
@@ -1827,10 +1980,20 @@ impl MultipathManager {
                         // Send ping on all uplinks for quality measurement
                         for uplink_ref in &manager.uplinks {
                             let uplink = uplink_ref.value();
-                            if uplink.is_usable() {
+                            if uplink.is_noise_ready() {
                                 if let Some(transport) = uplink.get_transport() {
                                     let seq = SequenceNumber(manager.next_seq.fetch_add(1, Ordering::SeqCst));
-                                    if let Ok(ping) = Packet::ping(seq, manager.session_id, uplink.numeric_id()) {
+                                    if let Ok(mut ping) = Packet::ping(seq, manager.session_id, uplink.numeric_id()) {
+                                        ping.payload = ping.header.timestamp.to_be_bytes().to_vec();
+                                        ping.header.payload_len = ping.payload.len() as u16;
+                                        ping.header.checksum = 0; // Recomputed by set_flag below, also for legacy peers.
+                                        ping.set_flag(0);
+                                        if manager.assigned_ipv4().is_some() {
+                                            match uplink.encrypt_packet(&ping.payload, seq.0, PacketType::Ping as u8) {
+                                                Ok(payload) => { ping.payload = payload; ping.header.payload_len = ping.payload.len() as u16; ping.set_flag(PacketFlags::ENCRYPTED); }
+                                                Err(_) => continue,
+                                            }
+                                        }
                                         if let Ok(encoded) = ping.encode() {
                                             let _ = transport.send(&encoded).await;
                                         }
@@ -1998,6 +2161,42 @@ impl MultipathManager {
             paths_found: paths.len(),
             diversity_score: diversity.diversity_score,
         });
+    }
+
+    /// Notify the production exit on every path before stopping local tasks.
+    pub async fn disconnect(&self) -> Result<()> {
+        if self.assigned_ipv4().is_some() {
+            for uplink in self.uplinks() {
+                if let Some(transport) = uplink.get_transport() {
+                    let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(payload) = uplink.encrypt_packet(&[], seq, PacketType::Close as u8) {
+                        let mut packet = Packet::new(
+                            PacketType::Close,
+                            SequenceNumber(seq),
+                            self.session_id,
+                            uplink.numeric_id(),
+                            payload,
+                        )?;
+                        packet.set_flag(PacketFlags::ENCRYPTED);
+                        let _ = transport.send(&packet.encode()?).await;
+                    }
+                }
+            }
+        }
+        self.close()
+    }
+
+    pub(crate) fn stream_uplinks(&self) -> Vec<Arc<Uplink>> {
+        let mut uplinks = self.uplinks();
+        let selected = self.scheduler.select(&uplinks, Some(self.allocate_flow()));
+        uplinks.retain(|u| u.is_usable());
+        uplinks.sort_by_key(|u| {
+            (
+                selected.first().copied() != Some(u.numeric_id()),
+                u.numeric_id(),
+            )
+        });
+        uplinks
     }
 
     /// Close the connection.
@@ -2442,7 +2641,7 @@ mod tests {
         assert!(is_hedged_packet(&dns_packet, 0));
 
         let tcp_syn = [
-            0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0xc0, 0xa8,
+            0x45, 0x00, 0x00, 0x28, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0xc0, 0xa8,
             0x01, 0x01, 0x08, 0x08, 0x08, 0x08, 0x04, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];

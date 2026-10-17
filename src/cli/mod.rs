@@ -88,7 +88,11 @@ pub enum Commands {
 /// Server command arguments
 #[derive(Args, Debug)]
 pub struct ServerArgs {
-    /// Listen addresses (can be specified multiple times)
+    /// Deployment access token (64 hexadecimal digits)
+    #[arg(long, env = "TRIGLAV_ACCESS_TOKEN", hide_env_values = true)]
+    pub access_token: Option<String>,
+
+    /// Listen address for UDP tunnel records and TCP proxy streams
     #[arg(short, long, default_value = "0.0.0.0:7443")]
     pub listen: Vec<SocketAddr>,
 
@@ -104,12 +108,12 @@ pub struct ServerArgs {
     #[arg(long)]
     pub print_key: bool,
 
-    /// Maximum concurrent connections
-    #[arg(long, default_value = "10000")]
+    /// Maximum concurrent logical sessions (IPv4 address pool permits at most 252)
+    #[arg(long, default_value = "252")]
     pub max_connections: usize,
 
-    /// Enable TCP fallback
-    #[arg(long, default_value = "true")]
+    /// Request TCP fallback (currently unsupported by the exit service)
+    #[arg(long)]
     pub tcp_fallback: bool,
 
     /// Daemonize (run in background)
@@ -119,12 +123,36 @@ pub struct ServerArgs {
     /// PID file path (for daemon mode)
     #[arg(long)]
     pub pid_file: Option<PathBuf>,
+
+    /// Exit TUN device name
+    #[arg(long, default_value = "tg-exit")]
+    pub tun_name: String,
+
+    /// Exit TUN IPv4 gateway (/24)
+    #[arg(long, default_value = "10.0.85.254")]
+    pub tun_ipv4: std::net::Ipv4Addr,
+
+    /// Exit TUN IPv6 gateway (/64)
+    #[arg(long, default_value = "fd00:7472:6967::ffff")]
+    pub tun_ipv6: std::net::Ipv6Addr,
+
+    /// Disable IPv6 forwarding (full-tunnel clients require IPv6)
+    #[arg(long)]
+    pub ipv4_only: bool,
+
+    /// Exit HTTP status endpoint
+    #[arg(long, default_value = "127.0.0.1:9090")]
+    pub metrics_addr: SocketAddr,
 }
 
 /// TUN tunnel command arguments (recommended mode)
 #[derive(Args, Debug)]
 pub struct TunArgs {
-    /// Server key (tg1...)
+    /// Deployment access token (64 hexadecimal digits)
+    #[arg(long, env = "TRIGLAV_ACCESS_TOKEN", hide_env_values = true)]
+    pub access_token: Option<String>,
+
+    /// Server key (tg1...; legacy tg1_... also accepted)
     pub key: String,
 
     /// Local HTTP status and metrics address
@@ -136,7 +164,7 @@ pub struct TunArgs {
     pub interface: Vec<String>,
 
     /// Auto-discover network interfaces
-    #[arg(long, default_value = "true")]
+    #[arg(long)]
     pub auto_discover: bool,
 
     /// TUN device name (e.g., tun0, utun3)
@@ -154,6 +182,10 @@ pub struct TunArgs {
     /// Route all traffic through tunnel (full VPN mode)
     #[arg(long)]
     pub full_tunnel: bool,
+
+    /// Stripe packets from a single flow across uplinks
+    #[arg(long)]
+    pub aggregate: bool,
 
     /// Specific routes to tunnel (can be specified multiple times)
     #[arg(long)]
@@ -187,7 +219,11 @@ pub struct TunArgs {
 /// Connect command arguments (legacy proxy mode)
 #[derive(Args, Debug)]
 pub struct ConnectArgs {
-    /// Server key (tg1...)
+    /// Deployment access token (64 hexadecimal digits)
+    #[arg(long, env = "TRIGLAV_ACCESS_TOKEN", hide_env_values = true)]
+    pub access_token: Option<String>,
+
+    /// Server key (tg1...; legacy tg1_... also accepted)
     pub key: String,
 
     /// Local HTTP status and metrics address

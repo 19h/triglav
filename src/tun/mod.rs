@@ -73,7 +73,7 @@ pub use runner::{TunnelConfig, TunnelRunner, TunnelStats};
 use crate::error::Result;
 
 /// Default MTU for TUN device.
-pub const DEFAULT_TUN_MTU: u16 = 1420;
+pub const DEFAULT_TUN_MTU: u16 = 1340;
 
 /// Default tunnel IP address (internal side).
 pub const DEFAULT_TUNNEL_IPV4: &str = "10.0.85.1";

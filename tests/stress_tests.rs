@@ -191,7 +191,7 @@ async fn test_high_message_throughput() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     let uplink_config = UplinkConfig {
@@ -300,8 +300,8 @@ async fn test_concurrent_clients() {
 
         handles.push(tokio::spawn(async move {
             let client_keypair = KeyPair::generate();
-            let config = MultipathConfig::default();
-            let manager = MultipathManager::new(config, client_keypair);
+            let config = legacy_fixture_config();
+            let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
             let uplink_config = UplinkConfig {
                 id: UplinkId::new(&format!("client-{}-uplink", client_id)),
@@ -381,7 +381,7 @@ async fn test_large_message_volume() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     let uplink_config = UplinkConfig {
@@ -455,7 +455,7 @@ async fn test_many_flows() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -592,11 +592,11 @@ async fn test_scheduler_under_load() {
 #[tokio::test]
 async fn test_deduplication_under_load() {
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.deduplication = true;
     config.dedup_window_size = 10000;
 
-    let manager = MultipathManager::new(config, client_keypair);
+    let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     // Simulate receiving many packets with varying sequence numbers
     let iterations = 50_000;
@@ -635,7 +635,7 @@ async fn test_memory_not_leaked_on_flow_churn() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -705,7 +705,7 @@ async fn test_long_running_stability() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     let uplink_config = UplinkConfig {
@@ -853,4 +853,13 @@ fn test_encryption_stress() {
         rate > 10_000.0,
         "Should handle >10k encrypt/decrypt per second"
     );
+}
+
+// These echo/forwarding fixtures predate record-level deduplication. Keep their
+// flow-stickiness contract explicit; production hedging is tested separately.
+fn legacy_fixture_config() -> MultipathConfig {
+    MultipathConfig {
+        hedged_packets: false,
+        ..MultipathConfig::default()
+    }
 }

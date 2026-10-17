@@ -112,7 +112,7 @@ impl std::fmt::Display for SocksAddr {
 pub struct Socks5Server {
     config: Socks5Config,
     manager: Arc<MultipathManager>,
-    active_connections: AtomicU64,
+    active_connections: Arc<AtomicU64>,
 }
 
 impl Socks5Server {
@@ -121,7 +121,7 @@ impl Socks5Server {
         Self {
             config,
             manager,
-            active_connections: AtomicU64::new(0),
+            active_connections: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -151,10 +151,12 @@ impl Socks5Server {
                     let config = self.config.clone();
                     let manager = Arc::clone(&self.manager);
 
+                    let active = Arc::clone(&self.active_connections);
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(stream, addr, &config, &manager).await {
                             debug!("Client {} error: {}", addr, e);
                         }
+                        active.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(e) => {
@@ -179,6 +181,23 @@ impl Socks5Server {
         // Read request
         let target = Self::read_request(&mut stream).await?;
         debug!("SOCKS5 CONNECT request to {}", target);
+
+        if manager.assigned_ipv4().is_some() {
+            match super::exit_stream::open(
+                manager,
+                &target.to_string(),
+                std::time::Duration::from_secs(config.connect_timeout_secs),
+            )
+            .await
+            {
+                Ok(mut tunnel) => {
+                    Self::send_reply(&mut stream, REPLY_SUCCEEDED, &target).await?;
+                    tokio::io::copy_bidirectional(&mut stream, &mut tunnel).await?;
+                }
+                Err(e) => Self::send_reply(&mut stream, Self::error_to_reply(&e), &target).await?,
+            }
+            return Ok(());
+        }
 
         // Connect through multipath
         match Self::connect_through_multipath(&target, manager).await {

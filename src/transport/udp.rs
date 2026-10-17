@@ -48,6 +48,16 @@ impl UdpTransport {
         bind_addr: Option<SocketAddr>,
         config: &TransportConfig,
     ) -> Result<Self> {
+        Self::connect_on_interface(remote_addr, bind_addr, config, None).await
+    }
+
+    /// Bind the actual socket to the requested physical interface.
+    pub async fn connect_on_interface(
+        remote_addr: SocketAddr,
+        bind_addr: Option<SocketAddr>,
+        config: &TransportConfig,
+        interface: Option<&str>,
+    ) -> Result<Self> {
         // Determine bind address based on remote address family
         let bind = bind_addr.unwrap_or_else(|| {
             if remote_addr.is_ipv6() {
@@ -57,7 +67,8 @@ impl UdpTransport {
             }
         });
 
-        let socket_config = SocketConfig::from_transport_config(config);
+        let mut socket_config = SocketConfig::from_transport_config(config);
+        socket_config.bind_interface = interface.map(str::to_owned);
         let std_socket = super::socket::create_udp_socket(bind, &socket_config)?;
 
         let socket = TokioUdpSocket::from_std(std_socket.into()).map_err(|e| {

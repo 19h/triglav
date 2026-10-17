@@ -1,599 +1,159 @@
 # Triglav
 
-A multi-path VPN that bonds multiple network interfaces into a single encrypted tunnel. It creates a virtual network interface (TUN) that transparently captures all IP traffic and distributes it across WiFi, Ethernet, and cellular connections to improve reliability and throughput.
+Triglav carries IP traffic from multiple client uplinks through one Linux exit
+node. Each uplink has an independently encrypted UDP session. With aggregation
+enabled, packets from one inner connection can use multiple uplinks; the exit
+forwards them through its TUN interface and the host kernel's routing/NAT.
 
-## The Problem
-
-You're on a train. Your laptop has WiFi (spotty), a phone hotspot (metered), and occasionally picks up station WiFi. Traditional VPNs use one connection at a time. When your current connection degrades, your SSH session hangs, your video call freezes, and you wait for a timeout before failover kicks in.
-
-Triglav uses all available connections simultaneously. When WiFi signal drops, traffic shifts to cellular instantly—no reconnection, no timeout, no interruption. When WiFi recovers, traffic shifts back. Your connections stay alive through tunnels, across NATs, and between networks.
-
-## Key Features
-
-- **True VPN**: Virtual TUN interface captures all IP traffic transparently
-- **Bandwidth Aggregation**: Stripe packets across ALL uplinks for combined throughput (not just load balancing)
-- **Multi-path**: Use WiFi, cellular, ethernet simultaneously with automatic failover
-- **ECMP-aware**: Flow-based routing maintains TCP connection consistency
-- **Encrypted**: Noise NK protocol with per-uplink cryptographic sessions
-- **NAT traversal**: Works behind NATs with Dublin Traceroute-style probing
-- **Reorder Buffer**: Handles out-of-order packets from asymmetric paths
-- **Cross-platform**: Linux, macOS (Windows in progress)
-- **Zero config**: Auto-discovers network interfaces
-- **Split tunneling**: Route specific networks through tunnel, bypass others
-
-## Quick Start
-
-**Server** (on a VPS or any machine with a public IP):
-
-```bash
-triglav server --generate-key --listen 0.0.0.0:7443
-# Prints an alphanumeric key starting with tg1
+```text
+client applications
+       |
+    client TUN
+       +---- uplink 1 ----+
+       +---- uplink 2 ----+---- exit TUN ---- kernel routing/NAT ---- destination
 ```
 
-**Client** (on your laptop):
+SOCKS5 and HTTP CONNECT are also available. Each proxy connection uses a separate
+authenticated TCP stream through the exit, bound to a selected uplink. An
+established proxy stream does not migrate when its outer TCP connection fails.
 
-```bash
-# Full VPN mode (recommended) - routes ALL traffic through tunnel
-sudo triglav tun tg1KEY --full-tunnel --auto-discover
+## Reproducible production validation
 
-# Split tunnel - only route specific networks
-sudo triglav tun tg1KEY --route 10.0.0.0/8 --route 192.168.0.0/16
-
-# Legacy proxy mode (no root required)
-triglav connect tg1KEY --socks 1080 --auto-discover
+```sh
+bash validation/run.sh
 ```
 
-With TUN mode, all applications automatically use the tunnel—no proxy configuration needed. Your browser, SSH, curl, games, everything just works.
+This builds and tests the actual release binaries in a disposable Linux Docker
+container, then connects them through independent network namespaces to a
+separate destination. It requires a working Docker daemon; privileged operations
+affect the container's network namespaces, not the host's routing configuration.
 
-## Installation
+The mandatory acceptance checks cover:
 
-```bash
-# From source
-git clone https://github.com/triglav/triglav
-cd triglav
-cargo build --release
-sudo ./target/release/triglav tun --help
+- Two source-NATed IPv4 uplinks and, separately, two IPv6-only outer paths.
+- Full and split IPv4/IPv6 forwarding, destination-observed exit addresses, exact
+  binary payload comparisons, and matching independent SHA-256 observations.
+- Single-flow striping, concurrent TCP/UDP traffic, IPv4 fragmentation, packet
+  loss/reordering, path blackholes, interface-down operation and path recovery.
+- A rate-capped single-uplink control versus aggregation.
+- Concurrent SOCKS5 and HTTP CONNECT streams, half-close and failed destinations.
+- Separate clients, access-token rejection, session isolation, packet mutation,
+  replay rejection, and successful traffic after invalid records.
+- Graceful shutdown, route rollback, preservation of pre-existing namespaces and
+  tables, and refusal of full-tunnel mode when the exit provides only IPv4.
+
+Artifacts include the tested source archive, executed binaries, SHA-256 manifests,
+compiler/image identity, packet captures, application observations and JSON
+results. Failures return nonzero. The older Rust end-to-end fixtures use a test
+server and are not substitutes for this production-binary acceptance suite.
+
+See the [validation contract](validation/README.md) for exact workload, assumptions,
+falsification probes and resource bounds, and the [observed report](validation/REPORT.md)
+for the identified completed run. Finite test results establish behavior in the
+recorded configurations; they are not formal verification of arbitrary networks.
+
+## Build
+
+```sh
+cargo build --locked --release --bins
+cargo test --locked --all-targets -- --test-threads=1
 ```
 
-### Privileges
+The client executable is `target/release/triglav`; the standalone exit executable
+is `target/release/triglav-server`. `triglav server` uses the same exit implementation.
 
-TUN mode requires elevated privileges to create virtual network interfaces:
+## Linux exit configuration
 
-```bash
-# Linux: Either run as root or grant capabilities
-sudo setcap cap_net_admin+ep ./target/release/triglav
+The exit host needs a TUN device, kernel forwarding and egress NAT or equivalent
+routing. Replace `SERVER_IP` with the server's reachable local address and `eth0`
+with its actual egress interface. The example uses the default address pools.
 
-# macOS: Must run as root
-sudo triglav tun ...
+```sh
+export TRIGLAV_ACCESS_TOKEN=$(openssl rand -hex 32)
+sudo sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
+sudo iptables -t nat -A POSTROUTING -s 10.0.85.0/24 -o eth0 -j MASQUERADE
+sudo ip6tables -t nat -A POSTROUTING -s fd00:7472:6967::/64 -o eth0 -j MASQUERADE
+sudo --preserve-env=TRIGLAV_ACCESS_TOKEN target/release/triglav-server \
+  --listen SERVER_IP:7443 --key /etc/triglav/server.key --generate-key
 ```
 
-### Feature Flags
+The server prints a base58 `tg1...` connection key (legacy `tg1_...` keys are also accepted) containing its public key and listen
+address. Distribute that connection key and the deployment access token to the
+client. The access token is a separate 256-bit bearer capability. A public key
+identifies the exit; it does not authorize a client. Omitting the server's access
+token allows public client admission.
 
-```bash
-cargo build --release                    # Default: CLI + metrics + server
-cargo build --release --no-default-features --features cli  # Client only
-cargo build --release --features full    # Everything
+The server key file is created with mode `0600` on Unix. An existing key file is
+loaded on subsequent starts. Both UDP and TCP port 7443 must be reachable for
+TUN and proxy modes respectively. The status service defaults to loopback port
+9090. Full-tunnel clients require an IPv6-capable exit; an exit started with
+`--ipv4-only` supports explicit IPv4 split routing.
+
+The service runs in the foreground. Use the host's service manager for process
+supervision; daemon mode and UDP-to-TCP fallback are not implemented by this exit.
+The commands below show the directly tested CLI configuration path. Configuration
+file and GUI workflows are outside the production acceptance contract.
+
+## Client configuration
+
+Set the same `TRIGLAV_ACCESS_TOKEN` in the client environment. Replace
+`CONNECTION_KEY`, `IFACE1` and `IFACE2` with the actual values.
+
+```sh
+# Split routing, with single-flow packet aggregation.
+sudo --preserve-env=TRIGLAV_ACCESS_TOKEN target/release/triglav tun CONNECTION_KEY \
+  --interface IFACE1 --interface IFACE2 --aggregate --strategy wrr \
+  --route 198.18.0.0/24 --route 2001:db8:85::/64
+
+# Full dual-stack routing.
+sudo --preserve-env=TRIGLAV_ACCESS_TOKEN target/release/triglav tun CONNECTION_KEY \
+  --interface IFACE1 --interface IFACE2 --aggregate --full-tunnel
+
+# SOCKS5 and HTTP CONNECT. The client ports listen on loopback.
+target/release/triglav connect CONNECTION_KEY \
+  --interface IFACE1 --interface IFACE2 --strategy wrr \
+  --socks 1080 --http-proxy 8080
 ```
 
-## How It Works
-
-### TUN Virtual Interface
-
-Triglav creates a TUN device (e.g., `tg0` on Linux, `utun3` on macOS) that operates at Layer 3 (IP). The kernel routes packets to this interface, Triglav reads them, encrypts and sends them through one or more physical uplinks, and the server decrypts and forwards them to their destination.
-
-```
-Application → Kernel → TUN Device → Triglav → [WiFi|LTE|Ethernet] → Server → Internet
-                                         ↓
-                              NAT + Encrypt + Schedule
-```
-
-Unlike proxy-based VPNs, this captures **all** IP traffic: TCP, UDP, ICMP, DNS, everything. No application configuration required.
-
-### NAT Translation
-
-Triglav performs NAT between your local network and the tunnel:
-
-- **Outbound**: Local IP (192.168.1.x) → Tunnel IP (10.0.85.1)
-- **Inbound**: Tunnel IP → Original local IP
-
-This allows proper routing of return traffic and supports multiple simultaneous connections with port translation.
-
-### Bandwidth Aggregation
-
-Unlike traditional VPNs that use one path at a time, Triglav can stripe packets across ALL available uplinks to achieve combined bandwidth:
-
-```
-                    ┌─────────────────────────────────────────┐
-                    │           Single TCP Download           │
-                    └─────────────────────────────────────────┘
-                                        │
-                    ┌───────────────────┼───────────────────┐
-                    ▼                   ▼                   ▼
-              ┌──────────┐       ┌──────────┐       ┌──────────┐
-              │  WiFi    │       │   LTE    │       │ Ethernet │
-              │ 100 Mbps │       │ 50 Mbps  │       │ 100 Mbps │
-              └──────────┘       └──────────┘       └──────────┘
-                    │                   │                   │
-                    └───────────────────┴───────────────────┘
-                                        │
-                              Combined: ~250 Mbps
-```
-
-**Aggregation Modes:**
-
-| Mode | Behavior |
-|------|----------|
-| `none` | Flow-sticky load balancing (each flow uses one uplink) |
-| `full` | Stripe ALL packets across ALL uplinks (maximum throughput) |
-| `adaptive` | Aggregate only when path latencies are within 100ms of each other |
-
-The receiver uses a **reorder buffer** to reassemble packets that arrive out of order due to different path latencies.
-
-### Flow-Based Routing
-
-For applications sensitive to packet ordering (like TCP), Triglav can hash the 5-tuple (src IP, dst IP, src port, dst port, protocol) and bind each flow to a specific uplink:
-
-```rust
-let flow_id = hash(src_ip, dst_ip, src_port, dst_port, protocol);
-// Packets with same flow_id always use the same uplink (unless it fails)
-```
-
-This prevents packet reordering that would confuse TCP congestion control. Use `aggregation_mode = "none"` for this behavior.
-
-### Uplink Management
-
-Each network interface becomes an "uplink." Triglav monitors each uplink independently:
-
-- **RTT**: Measured via ping/pong, using Jacobson/Karels algorithm for smoothing
-- **Packet Loss**: Sliding window of last N packets, tracking send/ack ratio
-- **Bandwidth**: Exponential moving average (α=0.2) of observed throughput
-- **NAT Type**: Dublin Traceroute-style detection (Full Cone, Restricted, Symmetric, etc.)
-
-Health state machine:
-
-```
-Unknown ──[success]──> Healthy
-Healthy ──[3 failures]──> Degraded
-Degraded ──[3 more failures]──> Unhealthy
-Unhealthy ──[4 more failures]──> Down
-Any state ──[success]──> Healthy
-
-Additionally:
-- Loss >10% OR RTT >1s → Degraded
-- Loss >30% OR RTT >5s → Unhealthy
-```
-
-### Scheduling Strategies
-
-The scheduler decides which uplink(s) to use for each packet:
-
-| Strategy | Description |
-|----------|-------------|
-| `adaptive` (default) | Multi-factor scoring: RTT (35%) + Loss (35%) + Bandwidth (20%) + NAT penalty (10%) |
-| `lowest_latency` | Always pick the uplink with lowest RTT |
-| `lowest_loss` | Always pick the uplink with lowest packet loss |
-| `weighted_round_robin` | Distribute by configured weights |
-| `bandwidth_proportional` | Route proportional to available bandwidth |
-| `redundant` | Send on ALL uplinks (for critical traffic) |
-| `primary_backup` | Use primary; failover to secondary on failure |
-| `ecmp_aware` | Flow-sticky hashing, mimics ECMP router behavior |
-
-### Encryption
-
-All traffic is encrypted using the Noise NK protocol:
-
-```
-Pattern: Noise_NK_25519_ChaChaPoly_BLAKE3
-
-Client                              Server
-  |                                    |
-  |──── e, es ────────────────────────>|  (client ephemeral, DH with server static)
-  |<─── e, ee ─────────────────────────|  (server ephemeral, DH with client ephemeral)
-  |                                    |
-  |<═══════ encrypted channel ════════>|
-```
-
-Each uplink maintains its own Noise session. If one uplink is compromised, others remain secure. The server's public key is embedded in the connection key (`tg1...`), enabling trust-on-first-use without a PKI.
-
-### Protocol
-
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Applications (Any Protocol)                  │
-│              (TCP, UDP, ICMP, DNS - all traffic)                │
-├─────────────────────────────────────────────────────────────────┤
-│                      Kernel TCP/IP Stack                        │
-├─────────────────────────────────────────────────────────────────┤
-│                    TUN Virtual Interface                        │
-│                 (utun/tun0 - Layer 3 IP packets)                │
-├─────────────────────────────────────────────────────────────────┤
-│                        TunnelRunner                             │
-│  ┌──────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
-│  │  IP Parser   │──│    NAT      │──│  MultipathManager       │ │
-│  │  (5-tuple)   │  │ Translation │  │  (encryption, routing)  │ │
-│  └──────────────┘  └─────────────┘  └─────────────────────────┘ │
-├─────────────────────────────────────────────────────────────────┤
-│                   Multi-Path Connection Manager                 │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐         │
-│  │ Uplink 1 │  │ Uplink 2 │  │ Uplink 3 │  │ Uplink N │         │
-│  │  (WiFi)  │  │(Cellular)│  │(Ethernet)│  │   ...    │         │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘         │
-├─────────────────────────────────────────────────────────────────┤
-│              Quality Metrics & Prediction Engine                │
-├─────────────────────────────────────────────────────────────────┤
-│                    Noise NK Encryption Layer                    │
-├─────────────────────────────────────────────────────────────────┤
-│               Transport (UDP Fast Path / TCP Fallback)          │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## CLI Reference
-
-### TUN Mode (Recommended)
-
-```bash
-# Full tunnel - route all traffic
-sudo triglav tun <key> --full-tunnel
-
-# Split tunnel - specific routes only
-sudo triglav tun <key> --route 10.0.0.0/8 --route 172.16.0.0/12
-
-# Exclude specific networks (bypass tunnel)
-sudo triglav tun <key> --full-tunnel --exclude 192.168.1.0/24
-
-# Custom TUN device name and IP
-sudo triglav tun <key> --tun-name tg0 --ipv4 10.0.85.1
-
-# Use specific interfaces
-sudo triglav tun <key> -i en0 -i en1 --full-tunnel
-
-# Enable DNS through tunnel
-sudo triglav tun <key> --full-tunnel --dns
-
-# Scheduling strategy
-sudo triglav tun <key> --full-tunnel --strategy latency
-```
-
-### Legacy Proxy Mode
-
-```bash
-# SOCKS5 proxy (no root required)
-triglav connect <key> --socks 1080 --auto-discover
-
-# HTTP proxy
-triglav connect <key> --http-proxy 8080
-
-# Both proxies
-triglav connect <key> --socks 1080 --http-proxy 8080
-```
-
-### Server
-
-```bash
-triglav server --listen 0.0.0.0:7443 --key /path/to/key
-triglav server --generate-key --print-key    # Generate and display key
-triglav server --daemon --pid-file /var/run/triglav.pid
-```
-
-### Operations
-
-```bash
-triglav status --watch --interval 1
-triglav status --detailed --json
-triglav uplink list
-triglav uplink show en0
-triglav diagnose --full --connectivity
-triglav benchmark <key> --duration 30 --streams 8
-triglav keygen --output server.key --address 1.2.3.4:7443
-triglav config --server --output server.toml
-triglav completions bash > /etc/bash_completion.d/triglav
-```
-
-## Configuration
-
-Triglav works with CLI flags, config files, or a mix of both. Config files are TOML.
-
-### Server Configuration
-
-```toml
-[server]
-listen = ["0.0.0.0:7443", "[::]:7443"]
-key_file = "/etc/triglav/server.key"
-max_connections = 10000
-idle_timeout = "5m"
-tcp_fallback = true
-
-[transport]
-send_buffer_size = 2097152  # 2 MB
-recv_buffer_size = 2097152
-connect_timeout = "10s"
-tcp_nodelay = true
-tcp_keepalive = "30s"
-
-[metrics]
-enabled = true
-listen = "127.0.0.1:9090"
-```
-
-### Client Configuration (TUN Mode)
-
-```toml
-[client]
-auth_key = "tg1..."
-auto_discover = true
-
-[tun]
-name = "tg0"
-ipv4_addr = "10.0.85.1"
-ipv4_netmask = 24
-mtu = 1420
-
-[routing]
-full_tunnel = true
-exclude_routes = ["192.168.1.0/24"]  # Local network bypass
-dns_servers = ["1.1.1.1", "8.8.8.8"]
-
-[nat]
-tunnel_ipv4 = "10.0.85.1"
-udp_timeout = "3m"
-tcp_timeout = "2h"
-port_range_start = 32768
-port_range_end = 61000
-
-[multipath]
-max_uplinks = 16
-retry_delay = "100ms"
-max_retries = 3
-aggregation_mode = "full"  # none, full, or adaptive
-
-[multipath.aggregator]
-enabled = true
-reorder_buffer_size = 1024
-reorder_timeout = "500ms"
-
-[multipath.scheduler]
-strategy = "adaptive"
-rtt_weight = 0.35
-loss_weight = 0.35
-bandwidth_weight = 0.2
-nat_penalty_weight = 0.1
-```
-
-### Client Configuration (Proxy Mode)
-
-```toml
-[client]
-auth_key = "tg1..."
-auto_discover = true
-socks_port = 1080
-http_proxy_port = 8080
-
-# Specific interfaces (if not auto-discovering)
-uplinks = ["en0", "en1", "pdp_ip0"]
-```
-
-## The AuthKey Format
-
-The auth key is the `tg1` prefix followed by a base58 payload. It encodes:
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│ Server Public Key (32 bytes)                                 │
-├──────────────────────────────────────────────────────────────┤
-│ Address 1: [type:1][ip:4|16][port:2]                         │
-│ Address 2: [type:1][ip:4|16][port:2]                         │
-│ ...                                                          │
-└──────────────────────────────────────────────────────────────┘
-type: 4 = IPv4, 6 = IPv6
-```
-
-This single string contains everything a client needs: the server's identity (public key) and how to reach it (addresses). Share it via QR code, messaging, or anywhere you'd share a URL.
-
-## Metrics & Monitoring
-
-Triglav exposes Prometheus metrics at `/metrics`:
-
-```
-# Uplink health
-triglav_uplink_health{uplink="en0"} 1
-triglav_uplink_rtt_seconds{uplink="en0"} 0.023
-triglav_uplink_loss_ratio{uplink="en0"} 0.001
-
-# Traffic
-triglav_bytes_sent_total{uplink="en0"} 1234567
-triglav_bytes_received_total{uplink="en0"} 7654321
-triglav_packets_sent_total{uplink="en0"} 12345
-triglav_packets_retransmitted_total{uplink="en0"} 12
-
-# TUN statistics
-triglav_tun_packets_read_total 123456
-triglav_tun_packets_written_total 123400
-triglav_nat_active_entries 42
-
-# Connection
-triglav_connection_state 1
-triglav_active_uplinks 3
-```
-
-## Protocol Details
-
-### Packet Format
-
-60-byte header + payload:
-
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|    Version    |     Type      |            Flags              |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Sequence Number                         |
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         Timestamp                             |
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-|                        Session ID (32 bytes)                  |
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|          Uplink ID            |        Payload Length         |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                          Checksum                             |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         Payload...                            |
-```
-
-**Packet Types**: Data, Control, Ack, Nack, Ping, Pong, Handshake, Close, Error
-
-**Flags**: `NEED_ACK`, `RETRANSMIT`, `FRAGMENT`, `LAST_FRAGMENT`, `ENCRYPTED`, `COMPRESSED`, `PRIORITY`, `PROBE`
-
-Maximum payload: 65,475 bytes (can be fragmented). Default MTU: 1,500 bytes (1,436 bytes payload after headers and encryption overhead).
-
-### Deduplication
-
-Packets may arrive on multiple uplinks (especially with `redundant` strategy). A sliding window deduplicator (O(1) lookup via HashSet, O(1) eviction via VecDeque) tracks the last 1,000 sequence numbers.
-
-### Reorder Buffer
-
-When aggregating across paths with different latencies, packets arrive out of order. The reorder buffer handles this:
-
-```
-Receive order:  [3] [1] [5] [2] [4]  (due to path latency differences)
-After buffer:   [1] [2] [3] [4] [5]  (delivered in sequence)
-```
-
-- **Buffer size**: Configurable (default 1024 packets)
-- **Timeout**: Packets delivered after timeout even if gaps exist (default 500ms)
-- **Memory**: O(n) where n = buffer size
-- **Lookup**: O(log n) using BTreeMap for ordered storage
-
-## Testing & Simulation
-
-### Unit and Integration Tests
-
-```bash
-cargo test                              # All tests (~300 tests)
-cargo test --lib                        # Unit tests only (119 tests)
-cargo test --test e2e_multipath         # End-to-end multipath tests
-cargo test --test aggregation_impairment # Bandwidth aggregation with network simulation
-cargo test --test scheduler_strategies
-cargo test --test security_edge_cases
-cargo test --test stress_tests
-```
-
-### Physical Interface Tests
-
-Tests using real network interfaces (requires multiple NICs):
-
-```bash
-# Run all physical tests
-cargo test --test physical_multipath -- --ignored --nocapture
-
-# Individual tests
-cargo test --test physical_multipath test_interface_discovery -- --ignored --nocapture
-cargo test --test physical_multipath test_bandwidth_measurement -- --ignored --nocapture
-cargo test --test physical_multipath test_latency_distribution -- --ignored --nocapture
-```
-
-### TUN Device Tests
-
-Tests requiring root privileges:
-
-```bash
-sudo cargo test --test tun_test -- --nocapture
-# or
-sudo ./target/debug/tun_test
-```
-
-### Network Impairment Simulation
-
-The `simulation/` directory contains a Monte Carlo simulation framework:
-
-```bash
-cd simulation
-cargo run --release
-```
-
-This runs 100,000+ iterations across 50+ network scenarios:
-
-- **High-speed rail**: ICE, TGV, Shinkansen handoffs
-- **Stationary**: Home office, cafe, data center
-- **Infrastructure failures**: Fiber cuts, power outages, BGP flaps
-- **Mobile**: Cross-border roaming, highway driving
-- **Urban**: Walking, cycling, public transit
-- **Stress**: Flash crowds, DDoS, simultaneous uplink failure
-
-### Docker Test Environment
-
-```bash
-cd docker/testnet
-docker-compose up
-```
-
-Spins up:
-- Triglav server
-- Multiple clients with simulated network conditions
-- Routers with configurable latency/loss/jitter
-- Chaos agent for dynamic impairment injection
-- Prometheus + Grafana for monitoring
-
-## Design Notes
-
-### Why TUN Instead of Proxy?
-
-Proxies (SOCKS5, HTTP) require application-level configuration. Each application must be told to use the proxy, and some applications don't support proxies at all. TUN operates at the kernel level, capturing all IP traffic transparently. Every application—browsers, games, SSH, custom protocols—automatically uses the tunnel.
-
-### Why Per-Uplink Noise Sessions?
-
-Each uplink has its own cryptographic session. If an attacker compromises one path (e.g., WiFi MITM), they cannot decrypt traffic on other paths. This is defense in depth: even with a compromised uplink, traffic that went through other uplinks remains confidential.
-
-### Why Flow Stickiness?
-
-TCP expects packets in order. If packets for a single TCP connection take different paths with different latencies, they arrive out of order. The receiver buffers and reorders, but this adds latency and can confuse congestion control. Flow stickiness keeps a TCP connection on one uplink unless that uplink fails.
-
-### Why NAT in the Client?
-
-The TUN interface has its own IP (e.g., 10.0.85.1). Applications send packets to real destinations (e.g., 8.8.8.8), but these packets arrive at the TUN with the local machine's IP as source. NAT translates this to the tunnel IP, ensuring proper routing of return traffic.
-
-## Constants
-
-```rust
-PROTOCOL_VERSION: 1
-MAX_MTU: 1500
-MAX_PAYLOAD: 1436        // After headers + crypto overhead
-DEFAULT_PORT: 7443
-HEADER_SIZE: 60
-MAX_PAYLOAD_SIZE: 65475  // For fragmented packets
-EMA_ALPHA: 0.2           // Bandwidth smoothing
-DEFAULT_TUN_MTU: 1420    // TUN interface MTU
-DEFAULT_TUNNEL_IPV4: "10.0.85.1"
-```
-
-## Platform Support
-
-| Platform | TUN Support | Interface Discovery | Notes |
-|----------|-------------|-------------------|-------|
-| Linux | Yes (`/dev/net/tun`) | rtnetlink | Full support |
-| macOS | Yes (`utun`) | system-configuration | Full support |
-| Windows | Planned (WinTUN) | - | In progress |
-| BSD | Untested | - | Should work |
-
-## Comparison
-
-| Feature | Triglav | WireGuard | OpenVPN | Tailscale | MPTCP |
-|---------|---------|-----------|---------|-----------|-------|
-| Multi-path | Yes | No | No | No | Yes |
-| True bandwidth aggregation | Yes | No | No | No | Partial* |
-| Seamless failover | <1ms | Manual | Manual | Partial | Yes |
-| TUN interface | Yes | Yes | Yes | Yes | Kernel |
-| Works with UDP | Yes | Yes | Yes | Yes | No |
-| Per-uplink encryption | Yes | No | No | No | No |
-| Reorder buffer | Yes | N/A | N/A | N/A | Yes |
-| User-space | Yes | Kernel | User | User | Kernel |
-
-*MPTCP only aggregates TCP connections and requires kernel support on both ends.
+The example destination prefixes are reserved for tests/documentation; substitute
+actual destination networks. Explicit interface selection binds the underlying
+sockets. On Linux this uses source-address binding and `SO_BINDTODEVICE`; the
+latter requires appropriate privileges. Source-only binding without that
+capability requires suitable host policy routing. The acceptance suite runs with
+the privileges needed for interface binding.
+
+The exit assigns each logical client an IPv4 address and, when enabled, an IPv6
+address shared by its uplinks. The default inner MTU is 1340 bytes. Its protected
+UDP packet needs 1461 bytes over outer IPv4 or 1481 bytes over outer IPv6, assuming
+no additional outer encapsulation. Smaller path MTUs require separate validation.
+
+Ctrl-C and SIGTERM stop the service and remove owned client routes. Underlay
+configuration is external: for example, Linux can remove static routes when an
+interface is administratively brought down. Those routes must be restored before
+the path can carry traffic again.
+
+## Protocol and operational boundaries
+
+The record layer explicitly authenticates packet type and logical sequence,
+uses an explicit nonce for reordered UDP delivery, and rejects replayed records.
+The implementation inherits a custom Noise hash resolver mapping the BLAKE2s
+pattern name to BLAKE3. It is not wire-compatible with standard Noise
+implementations using BLAKE2s. The [protocol notes](validation/README.md#wire-and-resource-invariants)
+describe the handshake, size budget and bounded state.
+
+| Environment or behavior | Evidence boundary |
+| --- | --- |
+| Linux TUN, IPv4/IPv6 underlay, IPv4/IPv6 payloads | Production namespace acceptance suite |
+| macOS | Build and nonprivileged tests; privileged TUN operation remains unverified |
+| Windows TUN | Not implemented |
+| Physical NICs, radios and independent ISPs | Not established by virtual network tests |
+| NAT rebinding or changing interface addresses | Outside the validated contract |
+| Failure latency | Measured per run; no sub-millisecond or interruption-free guarantee |
+| Long-duration load, DNS resolver policy, arbitrary MTUs | Separate validation required |
+| Proxy connection migration | Not provided; each stream remains on its selected outer TCP connection |
+
+Legacy diagnostic scripts are described in [physical_tests](physical_tests/README.md).
+They do not silently extend the production claims above.
 
 ## License
 

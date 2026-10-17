@@ -361,10 +361,14 @@ impl BandwidthAggregator {
                 continue;
             }
 
-            let bw = uplink.bandwidth().bytes_per_sec;
-            if bw < self.config.min_uplink_bandwidth {
-                continue;
-            }
+            // A connected path has no measured bandwidth before its first
+            // packet. Keep a positive bootstrap weight to avoid a circular
+            // dependency between scheduling and measurement.
+            let bw = uplink
+                .bandwidth()
+                .bytes_per_sec
+                .max(self.config.min_uplink_bandwidth)
+                .max(1.0);
 
             total_bw += bw;
             weights.push(UplinkWeight {
@@ -401,7 +405,9 @@ impl BandwidthAggregator {
     /// Returns (uplink_id, sequence_number) or None if no uplinks available.
     pub fn next_stripe(&self, uplinks: &[Arc<Uplink>]) -> Option<(u16, u64)> {
         // Check if we need to update weights
-        if self.last_weight_update.read().elapsed() > self.config.weight_update_interval {
+        if self.weights.read().is_empty()
+            || self.last_weight_update.read().elapsed() > self.config.weight_update_interval
+        {
             self.update_weights(uplinks);
         }
 

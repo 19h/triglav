@@ -956,7 +956,7 @@ async fn test_multi_uplink_aggregation() {
 
     // Create client with multiple uplinks
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
 
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
@@ -1114,7 +1114,7 @@ async fn test_flow_stickiness_through_exit() {
 
     // Create client with ECMP awareness
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
 
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
@@ -1218,7 +1218,7 @@ async fn test_complete_data_path() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     // Add single uplink for simplicity
@@ -1301,7 +1301,7 @@ async fn test_parallel_flows_different_uplinks() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -1419,7 +1419,7 @@ async fn test_uplink_failover() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -1512,7 +1512,7 @@ async fn test_data_through_multipath() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     let uplink_config = UplinkConfig {
@@ -1585,7 +1585,7 @@ async fn test_session_aggregates_uplinks() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     // Add 3 uplinks
@@ -1662,7 +1662,7 @@ async fn test_bandwidth_aggregation() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -1839,7 +1839,7 @@ async fn test_ecmp_flow_hash_consistency() {
 
     // Create client with ECMP-aware configuration
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -2039,7 +2039,7 @@ async fn test_noise_encryption_per_uplink() {
 
     // Create client with multiple uplinks
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -2235,7 +2235,7 @@ async fn test_return_path_validation() {
 
     // Create client with multiple uplinks
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -2441,7 +2441,7 @@ async fn test_session_state_consistency() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -2617,7 +2617,7 @@ async fn test_uplink_failover_with_rerouting() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -2792,7 +2792,7 @@ async fn test_distinct_local_addresses() {
 
     // Create client with multiple uplinks
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -2976,7 +2976,7 @@ async fn test_real_remote_endpoint_forwarding() {
 
     // Create client with multiple uplinks
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -3126,7 +3126,7 @@ async fn test_data_consistency_across_uplinks() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -3266,7 +3266,7 @@ async fn test_ecmp_flow_distribution() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -3398,7 +3398,7 @@ async fn test_encryption_overhead_validation() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     let uplink_config = UplinkConfig {
@@ -3532,11 +3532,11 @@ async fn test_crypto_isolation() {
     let client1_keypair = KeyPair::generate();
     let client2_keypair = KeyPair::generate();
 
-    let mut config1 = MultipathConfig::default();
+    let mut config1 = legacy_fixture_config();
     config1.ecmp_aware = true;
     let manager1 = Arc::new(MultipathManager::new(config1, client1_keypair));
 
-    let mut config2 = MultipathConfig::default();
+    let mut config2 = legacy_fixture_config();
     config2.ecmp_aware = true;
     let manager2 = Arc::new(MultipathManager::new(config2, client2_keypair));
 
@@ -3685,7 +3685,7 @@ async fn test_out_of_order_packet_handling() {
 
     // Create client with 3 uplinks to maximize out-of-order potential
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -3839,7 +3839,7 @@ async fn test_failover_timing_and_latency() {
 
     // Create client
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -3988,4 +3988,13 @@ async fn test_failover_timing_and_latency() {
 
     server.shutdown();
     exit.shutdown();
+}
+
+// These echo/forwarding fixtures predate record-level deduplication. Keep their
+// flow-stickiness contract explicit; production hedging is tested separately.
+fn legacy_fixture_config() -> MultipathConfig {
+    MultipathConfig {
+        hedged_packets: false,
+        ..MultipathConfig::default()
+    }
 }

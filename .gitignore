@@ -29,3 +29,6 @@ apps/macos/build/
 *.xcuserdata/
 
 .DS_Store
+
+# Reproducible network validation outputs
+validation/artifacts/

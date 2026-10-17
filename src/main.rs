@@ -9,7 +9,6 @@ use clap::Parser;
 use colored::Colorize;
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use tokio::signal;
 use tokio::sync::broadcast;
 #[cfg(feature = "metrics")]
 use triglav::metrics::{start_client_status_server, ClientRuntimeConfig, TunnelRuntimeConfig};
@@ -63,7 +62,7 @@ async fn main() -> Result<()> {
 }
 
 /// Run the server
-async fn run_server(args: ServerArgs, config: Config) -> Result<()> {
+async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
     println!(
         "{}",
         "╔══════════════════════════════════════════╗".bright_cyan()
@@ -125,13 +124,6 @@ async fn run_server(args: ServerArgs, config: Config) -> Result<()> {
         return Ok(());
     }
 
-    let metrics_addr: SocketAddr = config.metrics.http_bind.parse().map_err(|e| {
-        triglav::Error::Config(format!(
-            "Invalid metrics HTTP bind address '{}': {e}",
-            config.metrics.http_bind
-        ))
-    })?;
-
     // Print listen addresses
     println!("{}", "Listening on:".bright_white());
     for addr in &args.listen {
@@ -140,48 +132,35 @@ async fn run_server(args: ServerArgs, config: Config) -> Result<()> {
     }
     println!();
 
-    println!("{}", "Advertised endpoints:".bright_white());
-    for addr in &advertised_addrs {
-        println!("  {} {}", "→".cyan(), addr);
+    if args.listen.len() != 1 || args.tcp_fallback || args.daemon {
+        return Err(triglav::Error::Config(
+            "Exit supports one UDP listen address in foreground mode".into(),
+        ));
     }
-    println!();
-
-    println!("{} Server running. Press Ctrl+C to stop.", "●".green());
-    println!(
-        "  {} {}",
-        "Metrics:".cyan(),
-        format!("http://{metrics_addr}")
-    );
-    println!();
-
-    let mut server_config = config.server.clone();
-    server_config.enabled = true;
-    server_config.listen_addrs = args.listen.clone();
-    server_config.max_connections = args.max_connections;
-    server_config.key_file = args.key.clone();
-    server_config.tcp_fallback = args.tcp_fallback;
-
-    #[cfg(feature = "metrics")]
-    triglav::server::run_server(triglav::server::ServerRuntimeOptions {
-        config: server_config,
-        keypair,
-        metrics_addr,
-    })
-    .await?;
-
-    #[cfg(not(feature = "metrics"))]
-    return Err(triglav::Error::Config(
-        "server runtime requires the metrics feature".into(),
-    ));
-
-    println!();
-    println!("{} Server stopped.", "●".yellow());
-
+    let mut exit_config = triglav::server::ExitConfig::default();
+    exit_config.listen = args.listen[0];
+    exit_config.access_token = triglav::server::parse_access_token(args.access_token.as_deref())?;
+    exit_config.max_sessions = args.max_connections;
+    exit_config.tun.name = args.tun_name;
+    exit_config.tun.ipv4_addr = Some(args.tun_ipv4);
+    exit_config.tun.ipv6_addr = if args.ipv4_only {
+        None
+    } else {
+        Some(args.tun_ipv6)
+    };
+    let server = Arc::new(triglav::server::ExitServer::new(exit_config, keypair).await?);
+    let status = triglav::server::serve_exit_status(Arc::clone(&server), args.metrics_addr);
+    let forwarding = server.run();
+    tokio::select! {
+        result = status => result?,
+        result = forwarding => result?,
+        _ = triglav::server::shutdown_signal() => { server.shutdown(); }
+    }
     Ok(())
 }
 
 fn discover_client_interfaces(auto_discover: bool, configured: &[String]) -> Vec<String> {
-    if !auto_discover && !configured.is_empty() {
+    if !configured.is_empty() {
         return configured.to_vec();
     }
 
@@ -357,6 +336,10 @@ async fn reconcile_interface(
 }
 
 fn remove_interface_uplinks(manager: Arc<MultipathManager>, interface: &str) {
+    if manager.assigned_ipv4().is_some() {
+        manager.suspend_uplinks_for_interface(interface);
+        return;
+    }
     let removed = manager.remove_uplinks_for_interface(interface);
     if !removed.is_empty() {
         tracing::info!(
@@ -440,15 +423,17 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
 
     // Exclude server addresses from tunnel
     for addr in server_addrs {
-        route_config
-            .exclude_routes
-            .push(format!("{}/32", addr.ip()));
+        route_config.exclude_routes.push(format!(
+            "{}/{}",
+            addr.ip(),
+            if addr.is_ipv4() { 32 } else { 128 }
+        ));
     }
 
     let mut multipath_config = MultipathConfig::default();
     multipath_config.scheduler.strategy = args.strategy.into();
 
-    let tunnel_config = TunnelConfig {
+    let mut tunnel_config = TunnelConfig {
         tun: tun_config,
         nat: nat_config,
         routing: route_config,
@@ -456,8 +441,18 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
         ..Default::default()
     };
 
+    tunnel_config.multipath.scheduler.strategy = args.strategy.into();
+    if args.aggregate {
+        tunnel_config.multipath.aggregation_mode = triglav::multipath::AggregationMode::Full;
+    }
+
     // Create tunnel runner
     let mut runner = TunnelRunner::new(tunnel_config)?;
+    runner
+        .manager()
+        .set_access_token(triglav::server::parse_access_token(
+            args.access_token.as_deref(),
+        )?);
 
     println!(
         "{} TUN device: {}",
@@ -489,6 +484,12 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
     match runner.connect(remote_public).await {
         Ok(_) => {
             println!("{} Connected!", "✓".green());
+            if let Some(ip) = runner.manager().assigned_ipv4() {
+                println!("  Assigned IPv4: {ip}");
+            }
+            if let Some(ip) = runner.manager().assigned_ipv6() {
+                println!("  Assigned IPv6: {ip}");
+            }
         }
         Err(e) => {
             println!("{} Connection failed: {}", "✗".red(), e);
@@ -537,24 +538,25 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
 
     tokio::spawn(async move {
-        let _ = signal::ctrl_c().await;
+        let _ = triglav::server::shutdown_signal().await;
         let _ = shutdown_tx.send(());
     });
 
     // Run tunnel
-    tokio::select! {
+    let result = tokio::select! {
         result = runner.run() => {
-            if let Err(e) = result {
-                println!("{} Tunnel error: {}", "✗".red(), e);
-            }
+            result
         }
         _ = shutdown_rx.recv() => {
             println!();
             println!("{} Shutting down...", "→".yellow());
+            Ok(())
         }
-    }
+    };
 
+    runner.manager().disconnect().await?;
     runner.stop();
+    result?;
 
     println!("{} Tunnel stopped.", "●".yellow());
 
@@ -609,6 +611,9 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
     mp_config.scheduler.strategy = args.strategy.into();
 
     let manager = Arc::new(MultipathManager::new(mp_config, keypair));
+    manager.set_access_token(triglav::server::parse_access_token(
+        args.access_token.as_deref(),
+    )?);
 
     // Add uplinks
     for uplink_cfg in uplinks {
@@ -655,6 +660,11 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
             tunnel: None,
         },
     );
+
+    if manager.assigned_ipv4().is_some() {
+        let mut incoming = manager.start_recv_loop();
+        tokio::spawn(async move { while incoming.recv().await.is_some() {} });
+    }
 
     // Start maintenance loop for health checks, retries, and pings
     manager.start_maintenance_loop();
@@ -727,7 +737,7 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
     let _shutdown_tx2 = shutdown_tx.clone();
 
     tokio::spawn(async move {
-        let _ = signal::ctrl_c().await;
+        let _ = triglav::server::shutdown_signal().await;
         let _ = shutdown_tx.send(());
     });
 
@@ -769,7 +779,7 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
     // Disconnect
     println!();
     println!("{} Disconnecting...", "→".yellow());
-    manager.close()?;
+    manager.disconnect().await?;
     println!("{} Disconnected.", "●".yellow());
 
     Ok(())
@@ -953,7 +963,11 @@ async fn run_status(args: StatusArgs) -> Result<()> {
             println!(
                 "  {} {} | include: {} | exclude: {}",
                 "Mode:".cyan(),
-                if full_tunnel { "full tunnel" } else { "split tunnel" },
+                if full_tunnel {
+                    "full tunnel"
+                } else {
+                    "split tunnel"
+                },
                 include_routes,
                 exclude_routes
             );
@@ -1311,6 +1325,16 @@ fn load_keypair(path: &PathBuf) -> Result<KeyPair> {
 
 /// Save keypair to file
 fn save_keypair(keypair: &KeyPair, path: &PathBuf) -> Result<()> {
-    std::fs::write(path, keypair.secret.to_base64())?;
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)?
+        .write_all(keypair.secret.to_base64().as_bytes())?;
     Ok(())
 }

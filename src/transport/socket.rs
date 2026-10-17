@@ -91,7 +91,7 @@ pub fn create_udp_socket(addr: SocketAddr, config: &SocketConfig) -> Result<Sock
     }
 
     // Bind to interface if specified
-    bind_to_interface(&socket, config)?;
+    bind_to_interface(&socket, config, addr.is_ipv6())?;
 
     // Set fwmark if specified (Linux only)
     #[cfg(target_os = "linux")]
@@ -165,7 +165,7 @@ pub fn create_tcp_socket(addr: SocketAddr, config: &SocketConfig) -> Result<Sock
     }
 
     // Bind to interface if specified
-    bind_to_interface(&socket, config)?;
+    bind_to_interface(&socket, config, addr.is_ipv6())?;
 
     // Set fwmark if specified (Linux only)
     #[cfg(target_os = "linux")]
@@ -226,7 +226,7 @@ fn configure_socket(socket: &Socket, config: &SocketConfig) -> Result<()> {
 }
 
 /// Bind socket to a specific interface.
-fn bind_to_interface(socket: &Socket, config: &SocketConfig) -> Result<()> {
+fn bind_to_interface(socket: &Socket, config: &SocketConfig, _ipv6: bool) -> Result<()> {
     let interface = match &config.bind_interface {
         Some(iface) => iface,
         None => return Ok(()),
@@ -283,8 +283,16 @@ fn bind_to_interface(socket: &Socket, config: &SocketConfig) -> Result<()> {
         let ret = unsafe {
             libc::setsockopt(
                 socket.as_raw_fd(),
-                libc::IPPROTO_IP,
-                libc::IP_BOUND_IF,
+                if _ipv6 {
+                    libc::IPPROTO_IPV6
+                } else {
+                    libc::IPPROTO_IP
+                },
+                if _ipv6 {
+                    libc::IPV6_BOUND_IF
+                } else {
+                    libc::IP_BOUND_IF
+                },
                 &idx as *const u32 as *const libc::c_void,
                 std::mem::size_of::<u32>() as libc::socklen_t,
             )

@@ -40,7 +40,7 @@ impl Default for HttpProxyConfig {
 pub struct HttpProxyServer {
     config: HttpProxyConfig,
     manager: Arc<MultipathManager>,
-    active_connections: AtomicU64,
+    active_connections: Arc<AtomicU64>,
 }
 
 impl HttpProxyServer {
@@ -49,7 +49,7 @@ impl HttpProxyServer {
         Self {
             config,
             manager,
-            active_connections: AtomicU64::new(0),
+            active_connections: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -81,10 +81,13 @@ impl HttpProxyServer {
                     self.active_connections.fetch_add(1, Ordering::Relaxed);
                     let manager = Arc::clone(&self.manager);
 
+                    let active = Arc::clone(&self.active_connections);
+                    let timeout = std::time::Duration::from_secs(self.config.connect_timeout_secs);
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_client(stream, addr, &manager).await {
+                        if let Err(e) = Self::handle_client(stream, addr, &manager, timeout).await {
                             debug!("Client {} error: {}", addr, e);
                         }
+                        active.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(e) => {
@@ -99,6 +102,7 @@ impl HttpProxyServer {
         stream: TcpStream,
         addr: SocketAddr,
         manager: &MultipathManager,
+        timeout: std::time::Duration,
     ) -> Result<()> {
         debug!("New HTTP proxy connection from {}", addr);
 
@@ -131,19 +135,13 @@ impl HttpProxyServer {
             ));
         }
 
-        // Parse target (host:port)
-        let target_parts: Vec<&str> = target.split(':').collect();
-        if target_parts.len() != 2 {
-            Self::send_error(&mut writer, 400, "Bad Request").await?;
-            return Err(Error::Protocol(
-                crate::error::ProtocolError::MalformedHeader,
-            ));
-        }
-
-        let host = target_parts[0];
-        let port: u16 = target_parts[1]
+        let target = target.to_string();
+        let (host, port) = target
+            .rsplit_once(':')
+            .ok_or_else(|| Error::Config("invalid CONNECT target".into()))?;
+        let port: u16 = port
             .parse()
-            .map_err(|_| Error::Protocol(crate::error::ProtocolError::MalformedHeader))?;
+            .map_err(|_| Error::Config("invalid CONNECT port".into()))?;
 
         // Read and discard remaining headers until empty line
         loop {
@@ -155,6 +153,28 @@ impl HttpProxyServer {
         }
 
         debug!("HTTP CONNECT request to {}:{}", host, port);
+
+        if manager.assigned_ipv4().is_some() {
+            match super::exit_stream::open(manager, &target, timeout).await {
+                Ok(mut tunnel) => {
+                    writer
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await?;
+                    let (mut tunnel_read, mut tunnel_write) = tokio::io::split(&mut tunnel);
+                    let upstream = async {
+                        tokio::io::copy(&mut reader, &mut tunnel_write).await?;
+                        tunnel_write.shutdown().await
+                    };
+                    let downstream = async {
+                        tokio::io::copy(&mut tunnel_read, &mut writer).await?;
+                        writer.shutdown().await
+                    };
+                    tokio::try_join!(upstream, downstream)?;
+                }
+                Err(_) => Self::send_error(&mut writer, 502, "Bad Gateway").await?,
+            }
+            return Ok(());
+        }
 
         // Send connect request through multipath
         let connect_req = format!("CONNECT {host}:{port}\r\n");

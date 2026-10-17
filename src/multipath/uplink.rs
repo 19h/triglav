@@ -469,6 +469,9 @@ pub struct Uplink {
     cwnd: AtomicU32,
     /// NAT detection state (Dublin Traceroute-inspired).
     nat_state: RwLock<UplinkNatState>,
+    /// Authenticated liveness probes let a recovered path leave quarantine
+    /// while historical loss measurements age out.
+    last_probe_success: RwLock<Option<Instant>>,
 }
 
 impl Uplink {
@@ -488,6 +491,7 @@ impl Uplink {
             in_flight: AtomicU32::new(0),
             cwnd: AtomicU32::new(10), // Initial cwnd
             nat_state: RwLock::new(UplinkNatState::default()),
+            last_probe_success: RwLock::new(None),
         }
     }
 
@@ -696,6 +700,39 @@ impl Uplink {
         Ok(session.encrypt(data)?)
     }
 
+    pub fn encrypt_packet(
+        &self,
+        data: &[u8],
+        sequence: u64,
+        kind: u8,
+    ) -> crate::error::Result<Vec<u8>> {
+        let mut noise = self.noise_session.lock();
+        Ok(noise
+            .as_mut()
+            .ok_or_else(|| crate::error::CryptoError::NoiseProtocol("no noise session".into()))?
+            .encrypt_packet(data, sequence, kind)?)
+    }
+
+    pub fn decrypt_packet(
+        &self,
+        data: &[u8],
+        sequence: u64,
+        kind: u8,
+    ) -> crate::error::Result<Vec<u8>> {
+        let mut noise = self.noise_session.lock();
+        Ok(noise
+            .as_mut()
+            .ok_or_else(|| crate::error::CryptoError::NoiseProtocol("no noise session".into()))?
+            .decrypt_packet(data, sequence, kind)?)
+    }
+
+    pub(crate) fn remote_public_key(&self) -> Option<crate::crypto::PublicKey> {
+        self.noise_session
+            .lock()
+            .as_ref()
+            .and_then(|s| s.remote_public().copied())
+    }
+
     /// Write handshake message.
     pub fn write_handshake(&self, payload: &[u8]) -> crate::error::Result<Vec<u8>> {
         let mut noise = self.noise_session.lock();
@@ -803,6 +840,16 @@ impl Uplink {
         };
     }
 
+    /// Mark a transport temporarily unavailable without discarding its keys.
+    pub fn mark_unavailable(&self) {
+        let mut state = self.state.write();
+        state.health = UplinkHealth::Down;
+        state.consecutive_failures = 11;
+        state.recovery_successes = 0;
+        state.last_failure = Some(Instant::now());
+        state.last_error = Some("interface unavailable".into());
+    }
+
     /// Record a successful operation (resets failure counter).
     pub fn record_success(&self) {
         let mut state = self.state.write();
@@ -836,6 +883,24 @@ impl Uplink {
             }
             _ => {}
         }
+    }
+
+    /// A control probe is not a data acknowledgement and must not decrement
+    /// the data congestion window's in-flight count.
+    pub fn record_probe_success(&self, rtt: Duration) {
+        *self.last_probe_success.write() = Some(Instant::now());
+        self.rtt.write().add_sample(rtt);
+        self.record_success();
+        // An authenticated response proves the path is reachable even when
+        // old data-loss statistics would otherwise hold it in recovery.
+        {
+            let mut state = self.state.write();
+            state.consecutive_failures = 0;
+            state.recovery_successes = 0;
+            state.health = UplinkHealth::Healthy;
+        }
+        self.update_health();
+        self.update_priority();
     }
 
     /// Update priority score based on current metrics.
@@ -878,14 +943,20 @@ impl Uplink {
         let loss = self.loss.loss_ratio();
         let rtt = self.rtt.read().smoothed();
 
+        let recently_probed = self
+            .last_probe_success
+            .read()
+            .is_some_and(|time| time.elapsed() < Duration::from_secs(6));
+
         let mut state = self.state.write();
 
-        let metric_health = if loss > 0.3 || rtt > Duration::from_secs(5) {
+        let metric_health = if state.consecutive_failures > 5
+            || (loss > 0.3 && !recently_probed)
+            || rtt > Duration::from_secs(5)
+        {
             UplinkHealth::Unhealthy
         } else if loss > 0.1 || rtt > Duration::from_secs(1) {
             UplinkHealth::Degraded
-        } else if state.consecutive_failures > 5 {
-            UplinkHealth::Unhealthy
         } else {
             UplinkHealth::Healthy
         };

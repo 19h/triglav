@@ -176,7 +176,7 @@ async fn test_single_uplink_failure() {
 
     // Create client with single uplink
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     let uplink_config = UplinkConfig {
@@ -222,7 +222,7 @@ async fn test_all_uplinks_fail_event() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     // Subscribe to events
@@ -280,7 +280,7 @@ async fn test_uplink_failover_to_backup() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
@@ -352,7 +352,7 @@ async fn test_server_stops_responding() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     let uplink_config = UplinkConfig {
@@ -418,7 +418,7 @@ async fn test_server_resumes_responding() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     let uplink_config = UplinkConfig {
@@ -473,11 +473,11 @@ async fn test_retry_pending_packets() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.send_retries = 3;
     config.retry_delay = Duration::from_millis(50);
 
-    let manager = MultipathManager::new(config, client_keypair);
+    let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     let uplink_config = UplinkConfig {
         id: UplinkId::new("test-uplink"),
@@ -520,8 +520,8 @@ async fn test_graceful_close() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
-    let manager = MultipathManager::new(config, client_keypair);
+    let config = legacy_fixture_config();
+    let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     let uplink_config = UplinkConfig {
         id: UplinkId::new("test-uplink"),
@@ -614,9 +614,9 @@ async fn test_cleanup_stale_flows() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let mut config = MultipathConfig::default();
+    let mut config = legacy_fixture_config();
     config.ecmp_aware = true;
-    let manager = MultipathManager::new(config, client_keypair);
+    let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     let uplink_config = UplinkConfig {
         id: UplinkId::new("test-uplink"),
@@ -670,7 +670,7 @@ async fn test_event_broadcasting() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     // Subscribe before any operations
@@ -739,7 +739,7 @@ async fn test_multiple_event_subscribers() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_keypair = KeyPair::generate();
-    let config = MultipathConfig::default();
+    let config = legacy_fixture_config();
     let manager = Arc::new(MultipathManager::new(config, client_keypair));
 
     // Multiple subscribers
@@ -779,4 +779,13 @@ async fn test_multiple_event_subscribers() {
     assert_eq!(count2, count3);
 
     server.shutdown();
+}
+
+// These echo/forwarding fixtures predate record-level deduplication. Keep their
+// flow-stickiness contract explicit; production hedging is tested separately.
+fn legacy_fixture_config() -> MultipathConfig {
+    MultipathConfig {
+        hedged_packets: false,
+        ..MultipathConfig::default()
+    }
 }

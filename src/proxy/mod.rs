@@ -8,3 +8,5 @@ mod socks5;
 
 pub use http::{HttpProxyConfig, HttpProxyServer};
 pub use socks5::{Socks5Config, Socks5Server};
+
+pub(crate) mod exit_stream;

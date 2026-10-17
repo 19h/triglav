@@ -226,12 +226,30 @@ impl TunnelRunner {
     }
 
     /// Connect to a remote server.
-    pub async fn connect(&self, remote_public: PublicKey) -> Result<()> {
-        // Configure TUN device
-        self.tun.configure_addresses()?;
-
+    pub async fn connect(&mut self, remote_public: PublicKey) -> Result<()> {
         // Connect multipath manager
         self.manager.connect(remote_public).await?;
+        if let Some(ipv4) = self.manager.assigned_ipv4() {
+            self.tun.set_ipv4_address(ipv4);
+            self.config.tun.ipv4_addr = Some(ipv4);
+            self.config.nat.tunnel_ipv4 = ipv4;
+            self.config.nat.server_ipv4 = ipv4;
+            self.nat = Arc::new(NatTable::new(self.config.nat.clone()));
+        }
+        if let Some(ipv6) = self.manager.assigned_ipv6() {
+            self.tun.set_ipv6_address(ipv6);
+            self.config.tun.ipv6_addr = Some(ipv6);
+            self.config.nat.tunnel_ipv6 = Some(ipv6);
+            self.config.nat.server_ipv6 = Some(ipv6);
+            self.nat = Arc::new(NatTable::new(self.config.nat.clone()));
+            self.routes.enable_ipv6();
+        } else if self.config.routing.full_tunnel {
+            self.manager.disconnect().await?;
+            return Err(Error::Config(
+                "Full tunnel requires an IPv6-capable exit to prevent bypass".into(),
+            ));
+        }
+        self.tun.configure_addresses()?;
 
         let _ = self.event_tx.send(TunnelEvent::Connected);
         Ok(())
@@ -353,10 +371,22 @@ impl TunnelRunner {
 
         // NAT outbound translation
         let mut packet_vec = packet.to_vec();
-        if let Err(e) = self.nat.translate_outbound(&mut packet_vec) {
-            tracing::trace!(error = %e, "NAT outbound translation failed");
-            self.stats.write().nat_errors += 1;
+        // Locally originated packets already carry the exit-assigned address.
+        // Preserve native transport headers and IPv4 fragmentation unchanged.
+        let native_source = self.manager.assigned_ipv4().map(IpAddr::V4) == Some(flow.src_addr)
+            || self.manager.assigned_ipv6().map(IpAddr::V6) == Some(flow.src_addr);
+        // Link-local control traffic does not belong on a routed IP exit.
+        if matches!(flow.src_addr, IpAddr::V6(ip) if ip.is_unicast_link_local())
+            || matches!(flow.dst_addr, IpAddr::V6(ip) if ip.is_multicast())
+        {
             return;
+        }
+        if !native_source {
+            if let Err(e) = self.nat.translate_outbound(&mut packet_vec) {
+                tracing::trace!(error = %e, "NAT outbound translation failed");
+                self.stats.write().nat_errors += 1;
+                return;
+            }
         }
 
         // Calculate flow hash for ECMP consistency
@@ -437,7 +467,10 @@ impl TunnelRunner {
 impl Drop for TunnelRunner {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        // Route cleanup happens in RouteManager::drop
+        // Remove policy state while the TUN descriptor is still open.
+        if let Err(error) = self.routes.teardown() {
+            tracing::error!(%error, "Tunnel route cleanup failed");
+        }
     }
 }
 

@@ -268,7 +268,14 @@ impl NatTable {
             existing.clone()
         } else {
             // Create new entry
-            let translated_port = self.allocate_port()?;
+            let translated_port = if matches!(
+                flow.protocol,
+                TransportProtocol::Tcp | TransportProtocol::Udp
+            ) {
+                self.allocate_port()?
+            } else {
+                flow.src_port
+            };
             let translated_addr = self.get_tunnel_address(flow.src_addr);
 
             let entry = NatEntry::new(
@@ -471,19 +478,19 @@ impl NatTable {
 
     fn is_tunnel_address(&self, addr: IpAddr) -> bool {
         match addr {
-            IpAddr::V4(ipv4) => ipv4 == self.config.tunnel_ipv4,
-            IpAddr::V6(ipv6) => self.config.tunnel_ipv6.map_or(false, |t| t == ipv6),
+            IpAddr::V4(ipv4) => ipv4 == self.config.server_ipv4,
+            IpAddr::V6(ipv6) => self.config.server_ipv6.map_or(false, |t| t == ipv6),
         }
     }
 
     fn get_tunnel_address(&self, original: IpAddr) -> IpAddr {
         match original {
-            IpAddr::V4(_) => IpAddr::V4(self.config.tunnel_ipv4),
+            IpAddr::V4(_) => IpAddr::V4(self.config.server_ipv4),
             IpAddr::V6(_) => self
                 .config
-                .tunnel_ipv6
+                .server_ipv6
                 .map(IpAddr::V6)
-                .unwrap_or_else(|| IpAddr::V4(self.config.tunnel_ipv4)),
+                .unwrap_or_else(|| IpAddr::V4(self.config.server_ipv4)),
         }
     }
 
@@ -522,8 +529,8 @@ impl NatTable {
 
         match protocol {
             TransportProtocol::Tcp | TransportProtocol::Udp => {
+                update_port_checksum(packet, header_len, protocol, header_len, port)?;
                 packet[header_len..header_len + 2].copy_from_slice(&port.to_be_bytes());
-                // Note: checksum update is handled separately
             }
             _ => {}
         }
@@ -544,14 +551,48 @@ impl NatTable {
 
         match protocol {
             TransportProtocol::Tcp | TransportProtocol::Udp => {
+                update_port_checksum(packet, header_len, protocol, header_len + 2, port)?;
                 packet[header_len + 2..header_len + 4].copy_from_slice(&port.to_be_bytes());
-                // Note: checksum update is handled separately
             }
             _ => {}
         }
 
         Ok(())
     }
+}
+
+// RFC 1624 equation 3, including UDP's reserved zero-checksum encoding.
+fn update_port_checksum(
+    packet: &mut [u8],
+    header: usize,
+    protocol: TransportProtocol,
+    port_offset: usize,
+    new: u16,
+) -> Result<()> {
+    let offset = header
+        + if protocol == TransportProtocol::Tcp {
+            16
+        } else {
+            6
+        };
+    if packet.len() < offset + 2 {
+        return Err(Error::InvalidPacket("truncated transport header".into()));
+    }
+    let checksum = u16::from_be_bytes(packet[offset..offset + 2].try_into().unwrap());
+    if protocol == TransportProtocol::Udp && checksum == 0 {
+        return Ok(());
+    }
+    let old = u16::from_be_bytes(packet[port_offset..port_offset + 2].try_into().unwrap());
+    let mut sum = u32::from(!checksum) + u32::from(!old) + u32::from(new);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let mut result = !(sum as u16);
+    if protocol == TransportProtocol::Udp && result == 0 {
+        result = 0xffff;
+    }
+    packet[offset..offset + 2].copy_from_slice(&result.to_be_bytes());
+    Ok(())
 }
 
 #[cfg(test)]

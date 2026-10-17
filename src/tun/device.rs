@@ -212,6 +212,16 @@ impl TunDevice {
         Ok(())
     }
 
+    /// Set the server-assigned address before configuring this device.
+    pub fn set_ipv4_address(&mut self, address: Ipv4Addr) {
+        self.config.ipv4_addr = Some(address);
+    }
+
+    /// Set the negotiated IPv6 address before configuring the device.
+    pub fn set_ipv6_address(&mut self, address: Ipv6Addr) {
+        self.config.ipv6_addr = Some(address);
+    }
+
     // Platform-specific implementations
 
     #[cfg(target_os = "linux")]
@@ -271,6 +281,7 @@ impl TunDevice {
         let handle = Arc::new(TunHandle {
             inner: LinuxTunHandle {
                 fd: tun_fd.as_raw_fd(),
+                readiness: tokio::io::unix::AsyncFd::new(tun_fd.as_raw_fd())?,
                 _file: tun_fd,
             },
         });
@@ -393,7 +404,10 @@ impl TunDevice {
         );
 
         let handle = Arc::new(TunHandle {
-            inner: MacOsTunHandle { fd },
+            inner: MacOsTunHandle {
+                fd,
+                readiness: tokio::io::unix::AsyncFd::new(fd)?,
+            },
         });
 
         let mut device = Self {
@@ -423,6 +437,12 @@ impl TunDevice {
         {
             use std::process::Command;
 
+            #[cfg(target_os = "linux")]
+            let output = Command::new("ip")
+                .args(["link", "set", "dev", &self.name, "mtu", &mtu.to_string()])
+                .output()
+                .map_err(Error::Io)?;
+            #[cfg(not(target_os = "linux"))]
             let output = Command::new("ifconfig")
                 .args([&self.name, "mtu", &mtu.to_string()])
                 .output()
@@ -442,6 +462,12 @@ impl TunDevice {
             use std::process::Command;
 
             let flag = if up { "up" } else { "down" };
+            #[cfg(target_os = "linux")]
+            let output = Command::new("ip")
+                .args(["link", "set", "dev", &self.name, flag])
+                .output()
+                .map_err(Error::Io)?;
+            #[cfg(not(target_os = "linux"))]
             let output = Command::new("ifconfig")
                 .args([&self.name, flag])
                 .output()
@@ -519,7 +545,7 @@ impl TunDevice {
 
             let cidr = format!("{}/{}", addr, prefix);
             let output = Command::new("ip")
-                .args(["-6", "addr", "add", &cidr, "dev", &self.name])
+                .args(["-6", "addr", "add", &cidr, "dev", &self.name, "nodad"])
                 .output()
                 .map_err(|e| Error::Io(e))?;
 
@@ -581,15 +607,14 @@ impl TunHandle {
 #[derive(Debug)]
 struct LinuxTunHandle {
     fd: std::os::unix::io::RawFd,
+    readiness: tokio::io::unix::AsyncFd<std::os::unix::io::RawFd>,
     _file: std::fs::File,
 }
 
 #[cfg(target_os = "linux")]
 impl LinuxTunHandle {
     async fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        use tokio::io::unix::AsyncFd;
-
-        let async_fd = AsyncFd::new(self.fd).map_err(|e| Error::Io(e))?;
+        let async_fd = &self.readiness;
 
         loop {
             let mut guard = async_fd.readable().await.map_err(|e| Error::Io(e))?;
@@ -609,9 +634,7 @@ impl LinuxTunHandle {
     }
 
     async fn write(&self, buf: &[u8]) -> Result<usize> {
-        use tokio::io::unix::AsyncFd;
-
-        let async_fd = AsyncFd::new(self.fd).map_err(|e| Error::Io(e))?;
+        let async_fd = &self.readiness;
 
         loop {
             let mut guard = async_fd.writable().await.map_err(|e| Error::Io(e))?;
@@ -635,6 +658,7 @@ impl LinuxTunHandle {
 #[derive(Debug)]
 struct MacOsTunHandle {
     fd: std::os::unix::io::RawFd,
+    readiness: tokio::io::unix::AsyncFd<std::os::unix::io::RawFd>,
 }
 
 #[cfg(target_os = "macos")]
@@ -648,13 +672,11 @@ impl Drop for MacOsTunHandle {
 #[cfg(target_os = "macos")]
 impl MacOsTunHandle {
     async fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        use tokio::io::unix::AsyncFd;
-
         // macOS utun prepends a 4-byte header (AF_INET/AF_INET6)
         // We need to strip this when reading
         let mut full_buf = vec![0u8; buf.len() + 4];
 
-        let async_fd = unsafe { AsyncFd::new(self.fd) }.map_err(|e| Error::Io(e))?;
+        let async_fd = &self.readiness;
 
         loop {
             let mut guard = async_fd.readable().await.map_err(|e| Error::Io(e))?;
@@ -682,8 +704,6 @@ impl MacOsTunHandle {
     }
 
     async fn write(&self, buf: &[u8]) -> Result<usize> {
-        use tokio::io::unix::AsyncFd;
-
         // macOS utun requires a 4-byte header
         // Determine AF from IP version
         let af: u32 = if !buf.is_empty() {
@@ -700,7 +720,7 @@ impl MacOsTunHandle {
         full_buf[..4].copy_from_slice(&af.to_be_bytes());
         full_buf[4..].copy_from_slice(buf);
 
-        let async_fd = unsafe { AsyncFd::new(self.fd) }.map_err(|e| Error::Io(e))?;
+        let async_fd = &self.readiness;
 
         loop {
             let mut guard = async_fd.writable().await.map_err(|e| Error::Io(e))?;
@@ -763,7 +783,7 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = TunConfig::default();
-        assert_eq!(config.mtu, 1420);
+        assert_eq!(config.mtu, 1340);
         assert!(config.ipv4_addr.is_some());
     }
 }

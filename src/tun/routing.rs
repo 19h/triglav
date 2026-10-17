@@ -16,6 +16,10 @@ pub struct RouteConfig {
     #[serde(default)]
     pub full_tunnel: bool,
 
+    /// Install IPv6 policy routes when the exit supplies an IPv6 address.
+    #[serde(default)]
+    pub ipv6: bool,
+
     /// Specific networks to route through the tunnel.
     #[serde(default)]
     pub include_routes: Vec<String>,
@@ -49,6 +53,7 @@ impl Default for RouteConfig {
     fn default() -> Self {
         Self {
             full_tunnel: false,
+            ipv6: false,
             include_routes: Vec::new(),
             exclude_routes: Vec::new(),
             dns_servers: Vec::new(),
@@ -116,6 +121,10 @@ pub struct RouteManager {
 
     /// Whether routes have been set up.
     is_setup: bool,
+    full_table_created: bool,
+    full_rule_created: bool,
+    full_ipv6_table_created: bool,
+    full_ipv6_rule_created: bool,
 }
 
 impl RouteManager {
@@ -127,14 +136,31 @@ impl RouteManager {
             added_routes: Vec::new(),
             original_default_gw: None,
             is_setup: false,
+            full_table_created: false,
+            full_rule_created: false,
+            full_ipv6_table_created: false,
+            full_ipv6_rule_created: false,
         }
+    }
+
+    pub fn enable_ipv6(&mut self) {
+        self.config.ipv6 = true;
     }
 
     /// Set up all routes according to configuration.
     pub fn setup(&mut self) -> Result<()> {
+        let result = self.setup_routes();
+        if result.is_err() {
+            let _ = self.teardown();
+        }
+        result
+    }
+
+    fn setup_routes(&mut self) -> Result<()> {
         if self.is_setup {
             return Ok(());
         }
+        self.is_setup = true;
 
         // Save original default gateway before any modifications
         if self.config.full_tunnel || self.config.modify_default_route {
@@ -149,6 +175,14 @@ impl RouteManager {
         let exclude_routes = self.config.exclude_routes.clone();
         let original_gw = self.original_default_gw.clone();
         for network in &exclude_routes {
+            #[cfg(target_os = "linux")]
+            if network.contains(':') {
+                let route = self.ipv6_bypass_route(network)?;
+                if self.add_route_impl(&route)? {
+                    self.added_routes.push(route);
+                }
+                continue;
+            }
             if let Some((gw, iface)) = &original_gw {
                 self.add_route_via_gateway(network, *gw, iface)?;
             }
@@ -166,7 +200,7 @@ impl RouteManager {
 
         // Add DNS routes
         for dns in &self.config.dns_servers.clone() {
-            let network = format!("{}/32", dns);
+            let network = format!("{}/{}", dns, if dns.is_ipv4() { 32 } else { 128 });
             self.add_route(&network)?;
         }
 
@@ -192,7 +226,73 @@ impl RouteManager {
             }
         }
 
-        // Restore original default gateway
+        #[cfg(target_os = "linux")]
+        {
+            let table = self.config.table_id.to_string();
+            if self.full_ipv6_rule_created {
+                let mark = self.config.fwmark.map(|m| m.to_string());
+                let mut args = vec!["-6", "rule", "del", "priority", "100", "table", &table];
+                if let Some(mark) = mark.as_deref() {
+                    args.extend(["fwmark", mark]);
+                }
+                let result = Command::new("ip").args(args).output()?;
+                if !result.status.success() {
+                    return Err(Error::Config("Failed to remove owned IPv6 rule".into()));
+                }
+                self.full_ipv6_rule_created = false;
+            }
+            if self.full_ipv6_table_created {
+                let result = Command::new("ip")
+                    .args([
+                        "-6",
+                        "route",
+                        "del",
+                        "default",
+                        "dev",
+                        &self.interface,
+                        "table",
+                        &table,
+                    ])
+                    .output()?;
+                if !result.status.success() {
+                    return Err(Error::Config("Failed to remove owned IPv6 default".into()));
+                }
+                self.full_ipv6_table_created = false;
+            }
+            if self.full_rule_created {
+                let mut args = vec!["rule", "del", "priority", "100", "table", &table];
+                let mark = self.config.fwmark.map(|m| m.to_string());
+                if let Some(ref mark) = mark {
+                    args.extend(["fwmark", mark]);
+                }
+                let result = Command::new("ip").args(args).output()?;
+                if !result.status.success() {
+                    return Err(Error::Config("Failed to remove owned routing rule".into()));
+                }
+                self.full_rule_created = false;
+            }
+            if self.full_table_created {
+                let result = Command::new("ip")
+                    .args([
+                        "route",
+                        "del",
+                        "default",
+                        "dev",
+                        &self.interface,
+                        "table",
+                        &table,
+                    ])
+                    .output()?;
+                if !result.status.success() {
+                    return Err(Error::Config(
+                        "Failed to remove owned routing table entry".into(),
+                    ));
+                }
+                self.full_table_created = false;
+            }
+            self.original_default_gw = None;
+        }
+        #[cfg(not(target_os = "linux"))]
         if let Some((gw, iface)) = self.original_default_gw.take() {
             self.restore_default_gateway(gw, &iface)?;
         }
@@ -204,8 +304,9 @@ impl RouteManager {
     /// Add a route through the TUN interface.
     pub fn add_route(&mut self, destination: &str) -> Result<()> {
         let route = Route::via_interface(destination, &self.interface);
-        self.add_route_impl(&route)?;
-        self.added_routes.push(route);
+        if self.add_route_impl(&route)? {
+            self.added_routes.push(route);
+        }
         Ok(())
     }
 
@@ -217,8 +318,9 @@ impl RouteManager {
         interface: &str,
     ) -> Result<()> {
         let route = Route::via_gateway(destination, gateway, interface);
-        self.add_route_impl(&route)?;
-        self.added_routes.push(route);
+        if self.add_route_impl(&route)? {
+            self.added_routes.push(route);
+        }
         Ok(())
     }
 
@@ -253,6 +355,16 @@ impl RouteManager {
         // Use policy routing to avoid breaking connectivity to server
         let table = self.config.table_id.to_string();
 
+        // Reserve a table without inheriting routes owned by another service.
+        let existing = Command::new("ip")
+            .args(["route", "show", "table", &table])
+            .output()?;
+        if !existing.stdout.is_empty() {
+            return Err(Error::Config(format!(
+                "Cannot reserve routing table {table}: table is not empty"
+            )));
+        }
+
         // Add default route to our table
         let output = Command::new("ip")
             .args([
@@ -268,19 +380,27 @@ impl RouteManager {
             .map_err(|e| Error::Io(e))?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("File exists") {
-                return Err(Error::Config(format!(
-                    "Failed to add default route: {}",
-                    stderr
-                )));
-            }
+            return Err(Error::Config(format!(
+                "Cannot reserve routing table {}: {}",
+                table,
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
+        self.full_table_created = true;
 
         // Add rule to use our table
         if let Some(mark) = self.config.fwmark {
             let output = Command::new("ip")
-                .args(["rule", "add", "fwmark", &mark.to_string(), "table", &table])
+                .args([
+                    "rule",
+                    "add",
+                    "fwmark",
+                    &mark.to_string(),
+                    "table",
+                    &table,
+                    "priority",
+                    "100",
+                ])
                 .output()
                 .map_err(|e| Error::Io(e))?;
 
@@ -313,12 +433,10 @@ impl RouteManager {
             }
         }
 
-        self.added_routes.push(Route {
-            destination: "default".to_string(),
-            gateway: None,
-            interface: self.interface.clone(),
-            metric: None,
-        });
+        self.full_rule_created = true;
+        if self.config.ipv6 {
+            self.setup_full_tunnel_ipv6_linux()?;
+        }
 
         tracing::info!(
             interface = %self.interface,
@@ -327,6 +445,84 @@ impl RouteManager {
         );
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn setup_full_tunnel_ipv6_linux(&mut self) -> Result<()> {
+        let table = self.config.table_id.to_string();
+        let existing = Command::new("ip")
+            .args(["-6", "route", "show", "table", &table])
+            .output()?;
+        if !existing.stdout.is_empty() {
+            return Err(Error::Config(format!(
+                "Cannot reserve IPv6 routing table {table}: table is not empty"
+            )));
+        }
+        let result = Command::new("ip")
+            .args([
+                "-6",
+                "route",
+                "add",
+                "default",
+                "dev",
+                &self.interface,
+                "table",
+                &table,
+            ])
+            .output()?;
+        if !result.status.success() {
+            return Err(Error::Config(format!(
+                "Cannot install IPv6 default: {}",
+                String::from_utf8_lossy(&result.stderr)
+            )));
+        }
+        self.full_ipv6_table_created = true;
+        let mark = self.config.fwmark.map(|m| m.to_string());
+        let mut args = vec!["-6", "rule", "add", "priority", "100", "table", &table];
+        if let Some(mark) = mark.as_deref() {
+            args.extend(["fwmark", mark]);
+        }
+        let result = Command::new("ip").args(args).output()?;
+        if !result.status.success() {
+            return Err(Error::Config(format!(
+                "Cannot install IPv6 rule: {}",
+                String::from_utf8_lossy(&result.stderr)
+            )));
+        }
+        self.full_ipv6_rule_created = true;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ipv6_bypass_route(&self, network: &str) -> Result<Route> {
+        let address = network.split('/').next().unwrap_or(network);
+        let result = Command::new("ip")
+            .args(["-6", "route", "get", address])
+            .output()?;
+        if !result.status.success() {
+            return Err(Error::Config(format!(
+                "No IPv6 underlay route to {network}"
+            )));
+        }
+        let output = String::from_utf8_lossy(&result.stdout);
+        let parts: Vec<_> = output.split_whitespace().collect();
+        let field = |name| {
+            parts
+                .windows(2)
+                .find(|pair| pair[0] == name)
+                .map(|pair| pair[1])
+        };
+        let interface = field("dev")
+            .ok_or_else(|| Error::Config(format!("No IPv6 underlay interface to {network}")))?;
+        Ok(Route {
+            destination: network.to_string(),
+            gateway: field("via")
+                .map(str::parse)
+                .transpose()
+                .map_err(|_| Error::Config("Invalid IPv6 gateway".into()))?,
+            interface: interface.to_string(),
+            metric: None,
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -385,6 +581,10 @@ impl RouteManager {
 
         self.added_routes
             .push(Route::via_interface("128.0.0.0/1", &self.interface));
+        if self.config.ipv6 {
+            self.add_route("::/1")?;
+            self.add_route("8000::/1")?;
+        }
 
         tracing::info!(
             interface = %self.interface,
@@ -394,7 +594,7 @@ impl RouteManager {
         Ok(())
     }
 
-    fn add_route_impl(&self, route: &Route) -> Result<()> {
+    fn add_route_impl(&self, route: &Route) -> Result<bool> {
         #[cfg(target_os = "linux")]
         {
             self.add_route_linux(route)
@@ -412,7 +612,7 @@ impl RouteManager {
     }
 
     #[cfg(target_os = "linux")]
-    fn add_route_linux(&self, route: &Route) -> Result<()> {
+    fn add_route_linux(&self, route: &Route) -> Result<bool> {
         // Pre-convert values to strings so they live long enough for args references
         let gw_str = route.gateway.map(|gw| gw.to_string());
         let metric_str = route.metric.map(|m| m.to_string());
@@ -439,19 +639,26 @@ impl RouteManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("File exists") {
+            if stderr.contains("File exists") || stderr.contains("already in table") {
+                return Ok(false);
+            }
+            {
                 return Err(Error::Config(format!("Failed to add route: {}", stderr)));
             }
         }
 
         tracing::debug!(destination = %route.destination, interface = %route.interface, "Added route");
-        Ok(())
+        Ok(true)
     }
 
     #[cfg(target_os = "macos")]
-    fn add_route_macos(&self, route: &Route) -> Result<()> {
+    fn add_route_macos(&self, route: &Route) -> Result<bool> {
         let gw_str = route.gateway.map(|gw| gw.to_string());
-        let mut args = vec!["-n", "add", "-net", &route.destination];
+        let mut args = vec!["-n", "add"];
+        if route.destination.contains(':') {
+            args.push("-inet6");
+        }
+        args.extend(["-net", &route.destination]);
 
         if let Some(ref gw) = gw_str {
             args.push("-gateway");
@@ -468,13 +675,16 @@ impl RouteManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("File exists") {
+            if stderr.contains("File exists") || stderr.contains("already in table") {
+                return Ok(false);
+            }
+            {
                 return Err(Error::Config(format!("Failed to add route: {}", stderr)));
             }
         }
 
         tracing::debug!(destination = %route.destination, interface = %route.interface, "Added route");
-        Ok(())
+        Ok(true)
     }
 
     fn remove_route_impl(&self, route: &Route) -> Result<()> {
@@ -514,8 +724,13 @@ impl RouteManager {
 
     #[cfg(target_os = "macos")]
     fn remove_route_macos(&self, route: &Route) -> Result<()> {
+        let mut args = vec!["-n", "delete"];
+        if route.destination.contains(':') {
+            args.push("-inet6");
+        }
+        args.extend(["-net", &route.destination]);
         let output = Command::new("route")
-            .args(["-n", "delete", "-net", &route.destination])
+            .args(args)
             .output()
             .map_err(|e| Error::Io(e))?;
 

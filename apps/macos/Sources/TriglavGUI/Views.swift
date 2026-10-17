@@ -1432,40 +1432,36 @@ private struct InterfaceDetailRow: View {
                 }
             }
 
-            // ── IPv6: addresses on left, gateway on right ──
+            // ── IPv6 ──
             if !iface.ipv6Addresses.isEmpty || iface.ipv6LinkLocal != nil {
                 HStack(alignment: .top, spacing: 0) {
-                    // Left column: label + addresses
-                    HStack(alignment: .top, spacing: 0) {
-                        Text("IPv6")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 50, alignment: .trailing)
-                            .padding(.trailing, 10)
+                    Text("IPv6")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 50, alignment: .trailing)
+                        .padding(.trailing, 10)
 
-                        VStack(alignment: .leading, spacing: 1) {
-                            ForEach(iface.ipv6Addresses, id: \.self) { addr in
-                                Text(addr)
-                                    .font(.system(size: 10.5, design: .monospaced))
-                                    .textSelection(.enabled)
-                            }
-                            if let ll = iface.ipv6LinkLocal {
-                                Text(ll)
-                                    .font(.system(size: 10.5, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                    .textSelection(.enabled)
-                            }
+                    VStack(alignment: .leading, spacing: 1) {
+                        ForEach(iface.ipv6Addresses, id: \.self) { addr in
+                            Text(addr)
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .textSelection(.enabled)
+                        }
+                        if let ll = iface.ipv6LinkLocal {
+                            Text(ll)
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
                         }
                     }
 
-                    // Right column: gateway
-                    VStack(alignment: .leading, spacing: 2) {
-                        if let gw6 = iface.ipv6Gateway {
-                            detailPair("Gateway", gw6)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Spacer(minLength: 0)
                 }
+            }
+
+            // ── IPv6 Gateway (separate row) ──
+            if let gw6 = iface.ipv6Gateway {
+                detailCell(label: "IPv6 GW", value: gw6)
             }
 
             // ── Hardware ──

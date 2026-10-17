@@ -3,7 +3,7 @@
 //! Platform-specific implementations for enumerating network interfaces.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 
 use super::{guess_interface_type, NetworkInterface};
 
@@ -35,6 +35,38 @@ pub fn get_interface_addresses() -> HashMap<String, Vec<IpAddr>> {
     }
 
     map
+}
+
+/// Select an address usable for the remote's scope, rather than the first
+/// address returned by the OS (which is often IPv6 link-local).
+pub fn interface_bind_address(name: &str, remote: SocketAddr) -> crate::error::Result<SocketAddr> {
+    let addresses = get_interface_addresses();
+    let candidates = addresses.get(name).map(Vec::as_slice).unwrap_or_default();
+    let ip = select_source_address(candidates, remote.ip()).ok_or_else(|| {
+        crate::error::Error::Config(format!("No matching address on interface {name}"))
+    })?;
+    Ok(match ip {
+        IpAddr::V6(v6) if v6.is_unicast_link_local() => SocketAddr::V6(SocketAddrV6::new(
+            v6,
+            0,
+            0,
+            super::if_nametoindex(name).unwrap_or(0),
+        )),
+        _ => SocketAddr::new(ip, 0),
+    })
+}
+
+fn select_source_address(addresses: &[IpAddr], remote: IpAddr) -> Option<IpAddr> {
+    addresses.iter().copied().find(|ip| match (*ip, remote) {
+        (IpAddr::V4(local), IpAddr::V4(_)) => !local.is_unspecified() && !local.is_multicast(),
+        (IpAddr::V6(local), IpAddr::V6(peer)) => {
+            !local.is_unspecified()
+                && !local.is_multicast()
+                && local.is_unicast_link_local() == peer.is_unicast_link_local()
+                && (peer.is_loopback() || !local.is_loopback())
+        }
+        _ => false,
+    })
 }
 
 /// Get primary address for an interface.
@@ -466,6 +498,26 @@ fn parse_mac_address(s: &str) -> Option<[u8; 6]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_address_matches_ipv6_scope_and_family() {
+        let addresses =
+            ["fe80::2", "10.0.0.2", "2001:db8::2"].map(|value| value.parse::<IpAddr>().unwrap());
+        for (remote, expected) in [
+            ("2001:db8::1", Some("2001:db8::2")),
+            ("fe80::1", Some("fe80::2")),
+            ("10.0.0.1", Some("10.0.0.2")),
+        ] {
+            assert_eq!(
+                select_source_address(&addresses, remote.parse().unwrap()),
+                expected.map(|value| value.parse().unwrap())
+            );
+        }
+        assert_eq!(
+            select_source_address(&addresses[..1], "2001:db8::1".parse().unwrap()),
+            None
+        );
+    }
 
     #[test]
     fn test_get_network_interfaces() {

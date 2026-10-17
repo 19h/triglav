@@ -171,13 +171,17 @@ impl<'a> IpPacket<'a> {
         let ihl = (data[0] & 0x0f) as usize;
         let header_len = ihl * 4;
 
-        if data.len() < header_len {
+        if header_len < 20 || data.len() < header_len {
             return Err(Error::Protocol(
                 crate::error::ProtocolError::MalformedPacket("IPv4 header truncated".into()),
             ));
         }
 
         let total_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+        if total_len < header_len || total_len > data.len() {
+            return Err(Error::InvalidPacket("Invalid IPv4 total length".into()));
+        }
+        let fragment_offset = u16::from_be_bytes([data[6], data[7]]) & 0x1fff;
         let ttl = data[8];
         let protocol_num = data[9];
         let protocol = TransportProtocol::from_protocol_number(protocol_num);
@@ -186,7 +190,9 @@ impl<'a> IpPacket<'a> {
         let dst_addr = IpAddr::V4(Ipv4Addr::new(data[16], data[17], data[18], data[19]));
 
         // Parse transport layer ports if TCP or UDP
-        let (src_port, dst_port, payload_offset) = if data.len() >= header_len + 4 {
+        let (src_port, dst_port, payload_offset) = if fragment_offset == 0
+            && total_len >= header_len + 4
+        {
             match protocol {
                 TransportProtocol::Tcp | TransportProtocol::Udp => {
                     let sport = u16::from_be_bytes([data[header_len], data[header_len + 1]]);
@@ -196,7 +202,7 @@ impl<'a> IpPacket<'a> {
                     // For UDP, skip 8 bytes
                     let transport_header = match protocol {
                         TransportProtocol::Tcp => {
-                            if data.len() >= header_len + 12 {
+                            if data.len() > header_len + 12 {
                                 let data_offset =
                                     ((data[header_len + 12] >> 4) & 0x0f) as usize * 4;
                                 data_offset
@@ -240,6 +246,9 @@ impl<'a> IpPacket<'a> {
         }
 
         let payload_len = u16::from_be_bytes([data[4], data[5]]) as usize;
+        if payload_len + 40 > data.len() {
+            return Err(Error::InvalidPacket("Invalid IPv6 payload length".into()));
+        }
         let next_header = data[6];
         let hop_limit = data[7];
 
@@ -263,7 +272,7 @@ impl<'a> IpPacket<'a> {
 
                     let transport_header = match protocol {
                         TransportProtocol::Tcp => {
-                            if data.len() >= header_len + 12 {
+                            if data.len() > header_len + 12 {
                                 let data_offset =
                                     ((data[header_len + 12] >> 4) & 0x0f) as usize * 4;
                                 data_offset
@@ -629,7 +638,7 @@ mod tests {
 
     // Sample IPv4 TCP SYN packet
     const IPV4_TCP_SYN: &[u8] = &[
-        0x45, 0x00, 0x00, 0x3c, // Version, IHL, TOS, Total Length
+        0x45, 0x00, 0x00, 0x28, // Version, IHL, TOS, Total Length (40 bytes)
         0x1c, 0x46, 0x40, 0x00, // ID, Flags, Fragment Offset
         0x40, 0x06, 0x00, 0x00, // TTL, Protocol (TCP), Checksum (placeholder)
         0xc0, 0xa8, 0x01, 0x01, // Source IP: 192.168.1.1

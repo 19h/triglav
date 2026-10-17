@@ -4,7 +4,7 @@
 //! Designed for high performance with zero-copy operations where possible.
 
 mod buffer;
-mod socket;
+pub(crate) mod socket;
 mod tcp;
 mod udp;
 

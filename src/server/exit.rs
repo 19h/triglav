@@ -45,6 +45,16 @@ impl Default for ExitConfig {
     }
 }
 
+struct PendingPath {
+    noise: NoiseSession,
+    hello: Vec<u8>,
+    reply: Vec<u8>,
+    address: SocketAddr,
+    created: Instant,
+    next_return_sequence: u64,
+    epoch: u64,
+}
+
 struct Path {
     address: SocketAddr,
     noise: NoiseSession,
@@ -53,6 +63,54 @@ struct Path {
     last_seen: Instant,
     received: u64,
     sent: u64,
+    pending: Option<PendingPath>,
+    generations: u64,
+    confirmed: bool,
+    next_return_sequence: u64,
+    epoch: u64,
+}
+
+impl Path {
+    /// Only an authenticated fresh record may move an endpoint or commit new keys.
+    fn decrypt(&mut self, packet: &Packet, address: SocketAddr) -> Result<Vec<u8>> {
+        if !packet.header.flags.has(PacketFlags::ENCRYPTED) {
+            return Err(Error::Authentication("unencrypted exit record".into()));
+        }
+        let result = self.noise.decrypt_packet(
+            &packet.payload,
+            packet.header.sequence.0,
+            packet.header.packet_type as u8,
+        );
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(original) => {
+                let candidate = self
+                    .pending
+                    .as_mut()
+                    .filter(|p| p.created.elapsed() < Duration::from_secs(30));
+                let Some(candidate) = candidate else {
+                    return Err(original.into());
+                };
+                let payload = candidate.noise.decrypt_packet(
+                    &packet.payload,
+                    packet.header.sequence.0,
+                    packet.header.packet_type as u8,
+                )?;
+                let candidate = self.pending.take().unwrap();
+                self.noise = candidate.noise;
+                self.hello = candidate.hello;
+                self.reply = candidate.reply;
+                self.next_return_sequence = candidate.next_return_sequence;
+                self.epoch = candidate.epoch;
+                self.generations += 1;
+                payload
+            }
+        };
+        self.address = address;
+        self.confirmed = true;
+        self.last_seen = Instant::now();
+        Ok(payload)
+    }
 }
 
 struct Session {
@@ -75,6 +133,7 @@ pub struct ExitPathStatus {
     pub address: SocketAddr,
     pub received: u64,
     pub sent: u64,
+    pub key_generations: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,6 +222,7 @@ impl ExitServer {
                         address: p.address,
                         received: p.received,
                         sent: p.sent,
+                        key_generations: p.generations,
                     })
                 })
                 .collect(),
@@ -230,17 +290,8 @@ impl ExitServer {
                 .paths
                 .get_mut(&packet.header.uplink_id)
                 .ok_or_else(|| Error::Authentication("unknown uplink".into()))?;
-            if path.address != address || !packet.header.flags.has(PacketFlags::ENCRYPTED) {
-                return Err(Error::Authentication(
-                    "unbound address or unencrypted record".into(),
-                ));
-            }
-            let payload = path.noise.decrypt_packet(
-                &packet.payload,
-                packet.header.sequence.0,
-                packet.header.packet_type as u8,
-            )?;
-            path.last_seen = Instant::now();
+            let payload = path.decrypt(&packet, address)?;
+            session.next_sequence = session.next_sequence.max(path.next_return_sequence);
             session.last_seen = Instant::now();
             if packet.header.packet_type == PacketType::Close {
                 sessions.remove(&packet.header.session_id);
@@ -296,67 +347,116 @@ impl ExitServer {
         Ok(())
     }
 
-    fn client_ipv6(&self, ipv4: Ipv4Addr) -> Option<Ipv6Addr> {
-        self.config.tun.ipv6_addr.map(|gateway| {
+    fn client_ipv6(config: &ExitConfig, ipv4: Ipv4Addr) -> Option<Ipv6Addr> {
+        config.tun.ipv6_addr.map(|gateway| {
             let p = gateway.segments();
             Ipv6Addr::new(p[0], p[1], p[2], p[3], 0, 0, 0, u16::from(ipv4.octets()[3]))
         })
     }
 
     fn handshake(&self, packet: &Packet, address: SocketAddr) -> Result<Vec<u8>> {
-        let mut noise = NoiseSession::new_responder(&self.keypair.secret)?;
-        let hello = noise.read_handshake(&packet.payload)?;
-        if !matches!(hello.len(), 69 | 101)
-            || &hello[..3] != b"TG2"
-            || hello[35..67] != packet.header.session_id.0
-            || hello[67..69] != packet.header.uplink_id.to_be_bytes()
-        {
+        Self::negotiate_handshake(
+            &self.config,
+            &self.keypair,
+            &mut self.sessions.lock(),
+            packet,
+            address,
+        )
+    }
+
+    fn negotiate_handshake(
+        config: &ExitConfig,
+        keypair: &KeyPair,
+        sessions: &mut HashMap<SessionId, Session>,
+        packet: &Packet,
+        address: SocketAddr,
+    ) -> Result<Vec<u8>> {
+        use crate::protocol::recovery::{encode_exit_reply, ExitHello};
+        let mut noise = NoiseSession::new_responder(&keypair.secret)?;
+        let hello = ExitHello::decode(&noise.read_handshake(&packet.payload)?)?;
+        if hello.session != packet.header.session_id || hello.uplink != packet.header.uplink_id {
             return Err(Error::Authentication(
                 "invalid exit handshake binding".into(),
             ));
         }
-        if let Some(expected) = self.config.access_token {
-            if hello.len() != 101 || !secure_compare(&expected, &hello[69..101]) {
+        if let Some(expected) = config.access_token {
+            if !hello
+                .access_token
+                .is_some_and(|provided| secure_compare(&expected, &provided))
+            {
                 return Err(Error::Authentication("invalid access token".into()));
             }
         }
-        let mut sessions = self.sessions.lock();
-        let id = packet.header.session_id;
-        let token: [u8; 32] = hello[3..35].try_into().unwrap();
-        if let Some(s) = sessions.get(&id) {
-            if !secure_compare(&s.token, &token) {
+        let id = hello.session;
+        if let Some(session) = sessions.get(&id) {
+            if !secure_compare(&session.token, &hello.token) {
                 return Err(Error::Authentication("invalid session join token".into()));
             }
-            if let Some(path) = s.paths.get(&packet.header.uplink_id) {
+            if let Some(path) = session.paths.get(&hello.uplink) {
                 if path.address == address && path.hello == packet.payload {
                     return Ok(path.reply.clone());
                 }
-                return Err(Error::Authentication("uplink already established".into()));
-            }
-            if s.paths.len() >= 16 {
+                if let Some(pending) = path
+                    .pending
+                    .as_ref()
+                    .filter(|p| p.created.elapsed() < Duration::from_secs(30))
+                {
+                    if pending.address == address && pending.hello == packet.payload {
+                        return Ok(pending.reply.clone());
+                    }
+                }
+                if hello.version >= 3
+                    && (hello.path_epoch <= path.epoch
+                        || path
+                            .pending
+                            .as_ref()
+                            .is_some_and(|p| hello.path_epoch <= p.epoch))
+                {
+                    return Err(Error::Authentication("stale path handshake epoch".into()));
+                }
+            } else if session.paths.len() >= 16 {
                 return Err(Error::Config("uplink limit".into()));
             }
+            if hello
+                .preferred_ipv4
+                .is_some_and(|preferred| preferred != session.ipv4)
+            {
+                return Err(Error::Authentication(
+                    "requested tunnel address differs from existing lease".into(),
+                ));
+            }
         } else {
-            if sessions.len() >= self.config.max_sessions.min(252) {
+            if sessions.len() >= config.max_sessions.min(252) {
                 return Err(Error::Config("session limit".into()));
             }
-            let gateway = self.config.tun.ipv4_addr.unwrap().octets();
-            let address = (1..=254)
-                .map(|last| Ipv4Addr::new(gateway[0], gateway[1], gateway[2], last))
-                .find(|ip| {
-                    *ip != self.config.tun.ipv4_addr.unwrap()
-                        && self
-                            .client_ipv6(*ip)
-                            .map_or(true, |v6| Some(v6) != self.config.tun.ipv6_addr)
-                        && !sessions.values().any(|s| s.ipv4 == *ip)
-                })
-                .ok_or_else(|| Error::Config("address pool exhausted".into()))?;
+            let gateway = config.tun.ipv4_addr.unwrap().octets();
+            let available = |ip: Ipv4Addr| {
+                let octets = ip.octets();
+                octets[..3] == gateway[..3]
+                    && (1..=254).contains(&octets[3])
+                    && Some(ip) != config.tun.ipv4_addr
+                    && Self::client_ipv6(config, ip)
+                        .map_or(true, |v6| Some(v6) != config.tun.ipv6_addr)
+                    && !sessions.values().any(|s| s.ipv4 == ip)
+            };
+            let ipv4 = match hello.preferred_ipv4 {
+                Some(preferred) if available(preferred) => preferred,
+                Some(_) => {
+                    return Err(Error::Authentication(
+                        "requested tunnel address unavailable".into(),
+                    ))
+                }
+                None => (1..=254)
+                    .map(|last| Ipv4Addr::new(gateway[0], gateway[1], gateway[2], last))
+                    .find(|ip| available(*ip))
+                    .ok_or_else(|| Error::Config("address pool exhausted".into()))?,
+            };
             sessions.insert(
                 id,
                 Session {
-                    token,
-                    ipv4: address,
-                    ipv6: self.client_ipv6(address),
+                    token: hello.token,
+                    ipv4,
+                    ipv6: Self::client_ipv6(config, ipv4),
                     paths: HashMap::new(),
                     seen: BTreeSet::new(),
                     highest: 0,
@@ -366,34 +466,48 @@ impl ExitServer {
             );
         }
         let session = sessions.get_mut(&id).unwrap();
-        let mut response = b"TG2".to_vec();
-        response.extend_from_slice(&session.ipv4.octets());
-        if let Some(ipv6) = session.ipv6 {
-            response.extend_from_slice(&ipv6.octets());
-        }
+        let response = encode_exit_reply(hello.version, session.ipv4, session.ipv6);
         let response = noise.write_handshake(&response)?;
         noise.enable_datagrams();
         let reply = Packet::new(
             PacketType::Handshake,
             packet.header.sequence.next(),
             id,
-            packet.header.uplink_id,
+            hello.uplink,
             response,
         )?
         .encode()?;
-        session.paths.insert(
-            packet.header.uplink_id,
-            Path {
-                address,
+        if let Some(path) = session.paths.get_mut(&hello.uplink) {
+            // Do not discard live keys or advance sequence state on an unconfirmed hello.
+            path.pending = Some(PendingPath {
                 noise,
                 hello: packet.payload.clone(),
                 reply: reply.clone(),
-                last_seen: Instant::now(),
-                received: 0,
-                sent: 0,
-            },
-        );
-        tracing::info!(%id, %address, ipv4 = %session.ipv4, uplink = packet.header.uplink_id, "Exit uplink established");
+                address,
+                created: Instant::now(),
+                next_return_sequence: hello.next_return_sequence,
+                epoch: hello.path_epoch,
+            });
+        } else {
+            session.paths.insert(
+                hello.uplink,
+                Path {
+                    address,
+                    noise,
+                    hello: packet.payload.clone(),
+                    reply: reply.clone(),
+                    last_seen: Instant::now(),
+                    received: 0,
+                    sent: 0,
+                    pending: None,
+                    generations: 1,
+                    confirmed: false,
+                    next_return_sequence: hello.next_return_sequence,
+                    epoch: hello.path_epoch,
+                },
+            );
+        }
+        tracing::info!(%id, %address, ipv4 = %session.ipv4, uplink = hello.uplink, "Exit handshake prepared");
         Ok(reply)
     }
 
@@ -434,7 +548,7 @@ impl ExitServer {
             let mut paths: Vec<_> = session
                 .paths
                 .iter()
-                .filter(|(_, p)| p.last_seen.elapsed() < Duration::from_secs(10))
+                .filter(|(_, p)| p.confirmed && p.last_seen.elapsed() < Duration::from_secs(10))
                 .map(|(id, _)| *id)
                 .collect();
             paths.sort_unstable();
@@ -510,4 +624,176 @@ pub fn parse_access_token(value: Option<&str>) -> Result<Option<[u8; 32]>> {
                 .map_err(|_| Error::Config("Access token must contain 32 bytes".into()))
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::protocol::recovery::ExitHello;
+
+    fn establish(
+        config: &ExitConfig,
+        key: &KeyPair,
+        sessions: &mut HashMap<SessionId, Session>,
+        hello: &ExitHello,
+        address: SocketAddr,
+    ) -> (NoiseSession, Packet) {
+        let client = KeyPair::generate();
+        let mut noise = NoiseSession::new_initiator(&client.secret, &key.public).unwrap();
+        let packet = Packet::new(
+            PacketType::Handshake,
+            SequenceNumber(0),
+            hello.session,
+            hello.uplink,
+            noise.write_handshake(&hello.encode()).unwrap(),
+        )
+        .unwrap();
+        let wire =
+            ExitServer::negotiate_handshake(config, key, sessions, &packet, address).unwrap();
+        let response = Packet::decode(&wire).unwrap();
+        assert!(noise
+            .read_handshake(&response.payload)
+            .unwrap()
+            .starts_with(b"TG3"));
+        noise.enable_datagrams();
+        (noise, packet)
+    }
+
+    fn hello() -> ExitHello {
+        ExitHello {
+            token: [12; 32],
+            session: SessionId::generate(),
+            uplink: 4,
+            preferred_ipv4: None,
+            next_return_sequence: 0,
+            path_epoch: 1,
+            access_token: None,
+            version: 3,
+        }
+    }
+
+    fn ping(noise: &mut NoiseSession, hello: &ExitHello, seq: u64) -> Packet {
+        let payload = noise
+            .encrypt_packet(b"probe", seq, PacketType::Ping as u8)
+            .unwrap();
+        let mut packet = Packet::new(
+            PacketType::Ping,
+            SequenceNumber(seq),
+            hello.session,
+            hello.uplink,
+            payload,
+        )
+        .unwrap();
+        packet.set_flag(PacketFlags::ENCRYPTED);
+        packet
+    }
+
+    #[test]
+    fn replayed_handshake_cannot_replace_live_keys_or_move_peer() {
+        let config = ExitConfig::default();
+        let key = KeyPair::generate();
+        let mut sessions = HashMap::new();
+        let hello = hello();
+        let peer = "127.0.0.1:1001".parse().unwrap();
+        let other = "127.0.0.1:1002".parse().unwrap();
+        let (mut active, old_hello) = establish(&config, &key, &mut sessions, &hello, peer);
+        let path = sessions
+            .get_mut(&hello.session)
+            .unwrap()
+            .paths
+            .get_mut(&hello.uplink)
+            .unwrap();
+        let old_record = ping(&mut active, &hello, 1);
+        assert_eq!(path.decrypt(&old_record, peer).unwrap(), b"probe");
+        assert!(
+            ExitServer::negotiate_handshake(&config, &key, &mut sessions, &old_hello, other)
+                .is_err()
+        );
+        let path = sessions
+            .get_mut(&hello.session)
+            .unwrap()
+            .paths
+            .get_mut(&hello.uplink)
+            .unwrap();
+        assert!(path.decrypt(&old_record, other).is_err());
+        assert_eq!(path.address, peer);
+        assert_eq!(path.generations, 1);
+        assert_eq!(
+            path.decrypt(&ping(&mut active, &hello, 2), peer).unwrap(),
+            b"probe"
+        );
+        assert_eq!(path.generations, 1);
+    }
+
+    #[test]
+    fn replacement_requires_new_key_confirmation_and_rejects_old_records() {
+        let config = ExitConfig::default();
+        let key = KeyPair::generate();
+        let mut sessions = HashMap::new();
+        let hello = hello();
+        let old_peer = "127.0.0.1:1001".parse().unwrap();
+        let new_peer = "127.0.0.1:1002".parse().unwrap();
+        let moved_peer = "127.0.0.1:1003".parse().unwrap();
+        let (mut old, _) = establish(&config, &key, &mut sessions, &hello, old_peer);
+        let mut new_hello = hello.clone();
+        new_hello.path_epoch += 1;
+        let (mut new, _) = establish(&config, &key, &mut sessions, &new_hello, new_peer);
+        let path = sessions
+            .get_mut(&hello.session)
+            .unwrap()
+            .paths
+            .get_mut(&hello.uplink)
+            .unwrap();
+        assert_eq!(
+            path.decrypt(&ping(&mut old, &hello, 1), old_peer).unwrap(),
+            b"probe"
+        );
+        assert_eq!(path.generations, 1);
+        assert_eq!(
+            path.decrypt(&ping(&mut new, &hello, 2), new_peer).unwrap(),
+            b"probe"
+        );
+        assert_eq!(path.generations, 2);
+        assert_eq!(path.address, new_peer);
+        assert!(path.decrypt(&ping(&mut old, &hello, 3), old_peer).is_err());
+        assert_eq!(path.address, new_peer);
+        assert_eq!(
+            path.decrypt(&ping(&mut new, &hello, 4), moved_peer)
+                .unwrap(),
+            b"probe"
+        );
+        assert_eq!(path.address, moved_peer);
+        assert_eq!(path.generations, 2);
+    }
+
+    #[test]
+    fn requested_lease_survives_new_registry_and_collisions_are_rejected() {
+        let config = ExitConfig::default();
+        let key = KeyPair::generate();
+        let mut sessions = HashMap::new();
+        let mut hello = hello();
+        hello.preferred_ipv4 = Some("10.0.85.37".parse().unwrap());
+        let peer = "127.0.0.1:1001".parse().unwrap();
+        establish(&config, &key, &mut sessions, &hello, peer);
+        assert_eq!(sessions[&hello.session].ipv4, hello.preferred_ipv4.unwrap());
+        let mut conflicting = hello.clone();
+        conflicting.session = SessionId::generate();
+        let client = KeyPair::generate();
+        let mut noise = NoiseSession::new_initiator(&client.secret, &key.public).unwrap();
+        let packet = Packet::new(
+            PacketType::Handshake,
+            SequenceNumber(0),
+            conflicting.session,
+            conflicting.uplink,
+            noise.write_handshake(&conflicting.encode()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ExitServer::negotiate_handshake(&config, &key, &mut sessions, &packet, peer).is_err()
+        );
+        assert_eq!(sessions.len(), 1);
+        sessions.clear();
+        establish(&config, &key, &mut sessions, &hello, peer);
+        assert_eq!(sessions[&hello.session].ipv4, hello.preferred_ipv4.unwrap());
+    }
 }

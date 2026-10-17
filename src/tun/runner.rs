@@ -228,7 +228,7 @@ impl TunnelRunner {
     /// Connect to a remote server.
     pub async fn connect(&mut self, remote_public: PublicKey) -> Result<()> {
         // Connect multipath manager
-        self.manager.connect(remote_public).await?;
+        self.manager.connect_until_ready(remote_public).await?;
         if let Some(ipv4) = self.manager.assigned_ipv4() {
             self.tun.set_ipv4_address(ipv4);
             self.config.tun.ipv4_addr = Some(ipv4);

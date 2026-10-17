@@ -124,15 +124,14 @@ impl NetworkWatcher {
         // Initial scan
         self.refresh().await;
 
+        // Periodic snapshots recover missed native events and remain necessary
+        // when a netlink connection does not receive multicast notifications.
+        self.start_polling().await;
+
         #[cfg(target_os = "linux")]
         if self.config.use_native_events {
             self.start_netlink_monitor().await;
-        } else {
-            self.start_polling().await;
         }
-
-        #[cfg(not(target_os = "linux"))]
-        self.start_polling().await;
     }
 
     /// Stop watching.

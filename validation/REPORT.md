@@ -1,5 +1,34 @@
 # Observed production validation
 
+## Resilience extension, 2026-10-17
+
+The complete release run in
+`validation/artifacts/20261017-resilience-r2-02/` passes. It adds automatic
+startup/path retry, confirmed rekeying, authenticated NAT rebinding, stable path
+IDs across address changes, and periodic interface snapshots to the earlier
+forwarding profile. The [resilience contract](../docs/resilience.md) records
+assumptions, bounds and remaining MTU/lifecycle work.
+
+| Check | Recorded result |
+|---|---|
+| Rust tests | 348 passed on macOS and Linux; 10 ignored on each |
+| Live admission test | 1 passed separately |
+| Exact destination records, all three lanes | 238 |
+| Exact bytes in each direction | 18,259,398 |
+| Recovery lane | One TCP connection across a 20 s total outage, exit restart, two NAT address changes and 20 path replacements |
+| Recovery identity | Same client process, session and two path IDs |
+| Confirmed generations after restart | 11 per path |
+| Recovery maximum frame round trip | 30.469 s |
+| Rate-capped median goodput ratio | 1.4315, two paths versus one; 3 trials per mode |
+| Source manifest SHA-256 | `b48cde09817938409b86c56d8078e2e414f0c72b022581c9b89f7e9118db1b20` |
+| Client executable SHA-256 | `1af0887997e9e16f761c3369fc2ba7d4cdefb97de1c0a4c290db57e1cfe0ecd2` |
+| Exit executable SHA-256 | `4cb64cbc9d871788f08941d414554ce9efb6426bf1b1882a32cfe01e8a2ff40a` |
+
+The following sections retain the earlier rebase baseline. They describe that
+recorded snapshot rather than the extension's newer counts.
+
+## Earlier rebase baseline
+
 The Linux release profile passes the complete acceptance run identified below.
 The shipped client and both server entry points carried real traffic through
 multiple uplinks to one exit node and an independent destination. The source

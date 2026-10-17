@@ -1,7 +1,7 @@
 //! Multi-path connection manager.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,15 @@ pub struct MultipathConfig {
     /// Absolute retention limit, including periods with no usable uplinks.
     #[serde(default = "default_max_pending_age", with = "humantime_serde")]
     pub max_pending_age: Duration,
+
+    /// Retry failed path establishment starting at this delay.
+    #[serde(default = "default_reconnect_initial", with = "humantime_serde")]
+    pub reconnect_initial_delay: Duration,
+    #[serde(default = "default_reconnect_max", with = "humantime_serde")]
+    pub reconnect_max_delay: Duration,
+    /// Re-establish keys after this long without an authenticated record.
+    #[serde(default = "default_peer_silence", with = "humantime_serde")]
+    pub peer_silence_timeout: Duration,
 
     /// Retry delay base.
     #[serde(default = "default_retry_delay", with = "humantime_serde")]
@@ -165,6 +174,34 @@ fn default_max_pending_bytes() -> usize {
 fn default_max_pending_age() -> Duration {
     Duration::from_secs(10)
 }
+fn default_reconnect_initial() -> Duration {
+    Duration::from_millis(250)
+}
+fn default_reconnect_max() -> Duration {
+    Duration::from_secs(15)
+}
+fn default_peer_silence() -> Duration {
+    Duration::from_secs(15)
+}
+
+fn reconnect_delay(config: &MultipathConfig, failures: u32, jitter: f64) -> Duration {
+    let initial = config
+        .reconnect_initial_delay
+        .max(Duration::from_millis(20));
+    let ceiling = config.reconnect_max_delay.max(initial);
+    let base = initial
+        .saturating_mul(1u32 << failures.min(16))
+        .min(ceiling);
+    base.mul_f64(jitter.clamp(0.8, 1.2)).min(ceiling)
+}
+
+#[derive(Debug)]
+struct ReconnectState {
+    failures: u32,
+    next_attempt: Instant,
+    in_progress: bool,
+}
+
 fn default_retry_delay() -> Duration {
     Duration::from_millis(100)
 }
@@ -195,6 +232,9 @@ impl Default for MultipathConfig {
             max_pending_packets: default_max_pending_packets(),
             max_pending_bytes: default_max_pending_bytes(),
             max_pending_age: default_max_pending_age(),
+            reconnect_initial_delay: default_reconnect_initial(),
+            reconnect_max_delay: default_reconnect_max(),
+            peer_silence_timeout: default_peer_silence(),
             retry_delay: default_retry_delay(),
             auto_discover: false,
             health_check_interval: default_health_interval(),
@@ -291,6 +331,7 @@ pub struct PendingStats {
 
 enum ReceiveLoopEvent {
     Packet {
+        generation: u64,
         uplink_id: u16,
         uplink_name: UplinkId,
         data: Vec<u8>,
@@ -364,6 +405,13 @@ pub struct MultipathManager {
     /// Pending packets (for retry).
     pending: Mutex<PendingBuffer>,
     retry_lock: tokio::sync::Mutex<()>,
+    reconnect: Mutex<HashMap<u16, ReconnectState>>,
+    remote_public: RwLock<Option<PublicKey>>,
+    next_return_sequence: AtomicU64,
+    next_handshake_epoch: AtomicU64,
+    closing: AtomicBool,
+    lifecycle: AtomicU64,
+    maintenance_generation: AtomicU64,
     /// Deduplication window for received packets.
     dedup_window: RwLock<DeduplicationWindow>,
     /// Aggregate stats.
@@ -417,6 +465,13 @@ impl MultipathManager {
             next_uplink_id: AtomicU16::new(0),
             pending: Mutex::new(PendingBuffer::default()),
             retry_lock: tokio::sync::Mutex::new(()),
+            reconnect: Mutex::new(HashMap::new()),
+            remote_public: RwLock::new(None),
+            next_return_sequence: AtomicU64::new(0),
+            next_handshake_epoch: AtomicU64::new(1),
+            closing: AtomicBool::new(false),
+            lifecycle: AtomicU64::new(0),
+            maintenance_generation: AtomicU64::new(u64::MAX),
             dedup_window: RwLock::new(DeduplicationWindow::new(dedup_size)),
             stats: RwLock::new(TrafficStats::default()),
             event_tx,
@@ -561,6 +616,10 @@ impl MultipathManager {
         config: UplinkConfig,
         remote_public: &PublicKey,
     ) -> Result<u16> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Error::ConnectionClosed);
+        }
+        *self.remote_public.write() = Some(*remote_public);
         if let Some(existing_id) = self.uplink_ids.get(&config.id).map(|id| *id) {
             if let Some(existing) = self.get_uplink(existing_id) {
                 if existing.config().local_addr == config.local_addr
@@ -586,7 +645,27 @@ impl MultipathManager {
                     return Ok(existing_id);
                 }
 
-                self.remove_uplink(existing_id);
+                existing.set_connection_state(ConnectionState::Disconnected);
+                self.clear_flow_bindings_for_uplink(existing_id);
+                let replacement = Arc::new(Uplink::new(config, existing_id));
+                {
+                    let mut buffer = self.pending.lock();
+                    for pending in buffer.packets.values_mut() {
+                        if pending.attempts.remove(&existing_id).is_some() {
+                            existing.cancel_in_flight();
+                        }
+                    }
+                }
+                self.uplinks.insert(existing_id, Arc::clone(&replacement));
+                self.reconnect.lock().remove(&existing_id);
+                if let Err(error) = self.connect_uplink(&replacement, remote_public).await {
+                    replacement.set_connection_state(ConnectionState::Failed);
+                    replacement.record_failure(&error.to_string());
+                    return Err(error);
+                }
+                *self.state.write() = ConnectionState::Connected;
+                self.send_fast_probe(existing_id).await;
+                return Ok(existing_id);
             }
         }
 
@@ -736,6 +815,9 @@ impl MultipathManager {
 
     /// Connect all uplinks to the remote server.
     pub async fn connect(self: &Arc<Self>, remote_public: PublicKey) -> Result<()> {
+        self.closing.store(false, Ordering::Release);
+        *self.remote_public.write() = Some(remote_public);
+        let lifecycle = self.lifecycle.load(Ordering::Acquire);
         *self.state.write() = ConnectionState::Connecting;
 
         let uplinks: Vec<_> = self.uplinks.iter().map(|r| r.value().clone()).collect();
@@ -772,6 +854,11 @@ impl MultipathManager {
         while let Some((_uplink_id, result)) = result_rx.recv().await {
             match result {
                 Ok(()) => {
+                    if self.closing.load(Ordering::Acquire)
+                        || self.lifecycle.load(Ordering::Acquire) != lifecycle
+                    {
+                        return Err(Error::ConnectionClosed);
+                    }
                     *self.state.write() = ConnectionState::Connected;
                     let _ = self.event_tx.send(MultipathEvent::Connected);
 
@@ -785,12 +872,55 @@ impl MultipathManager {
             }
         }
 
+        if self.closing.load(Ordering::Acquire)
+            || self.lifecycle.load(Ordering::Acquire) != lifecycle
+        {
+            return Err(Error::ConnectionClosed);
+        }
         *self.state.write() = ConnectionState::Failed;
         Err(last_error.unwrap_or(Error::NoAvailableUplinks))
     }
 
+    /// Wait for an endpoint, retaining interface discovery and a bounded retry rate.
+    pub async fn connect_until_ready(self: &Arc<Self>, remote_public: PublicKey) -> Result<()> {
+        self.closing.store(false, Ordering::Release);
+        let lifecycle = self.lifecycle.load(Ordering::Acquire);
+        let mut failures = 0;
+        loop {
+            if self.closing.load(Ordering::Acquire)
+                || self.lifecycle.load(Ordering::Acquire) != lifecycle
+            {
+                return Err(Error::ConnectionClosed);
+            }
+            match self.connect(remote_public).await {
+                Ok(()) => return Ok(()),
+                Err(Error::ConnectionClosed) => return Err(Error::ConnectionClosed),
+                Err(error) => tracing::warn!(%error, "Waiting for an available exit path"),
+            }
+            let delay = reconnect_delay(&self.config, failures, 0.8 + rand::random::<f64>() * 0.4);
+            failures = failures.saturating_add(1);
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     /// Connect a single uplink.
     async fn connect_uplink(&self, uplink: &Uplink, remote_public: &PublicKey) -> Result<()> {
+        let lifecycle = self.lifecycle.load(Ordering::Acquire);
+        let _handshake = uplink.handshake_lock.lock().await;
+        if self.closing.load(Ordering::Acquire)
+            || !self
+                .get_uplink(uplink.numeric_id())
+                .is_some_and(|current| std::ptr::eq(current.as_ref(), uplink))
+        {
+            return Err(Error::ConnectionClosed);
+        }
+        if uplink.state().connection_state == ConnectionState::Connected
+            && uplink.is_noise_ready()
+            && uplink.silence() < self.config.peer_silence_timeout
+        {
+            return Ok(());
+        }
+
         uplink.set_connection_state(ConnectionState::Connecting);
 
         let config = uplink.config();
@@ -829,7 +959,6 @@ impl MultipathManager {
 
         // Wrap in Arc for sharing across async operations
         let transport: Arc<dyn Transport> = Arc::from(transport);
-        uplink.set_transport(transport.clone());
 
         // Perform Noise handshake
         uplink.set_connection_state(ConnectionState::Handshaking);
@@ -837,13 +966,17 @@ impl MultipathManager {
         let mut noise = NoiseSession::new_initiator(&self.local_keypair.secret, remote_public)?;
 
         // Write handshake message 1 (e, es)
-        let mut hello = b"TG2".to_vec();
-        hello.extend_from_slice(&self.join_token);
-        hello.extend_from_slice(&self.session_id.0);
-        hello.extend_from_slice(&uplink.numeric_id().to_be_bytes());
-        if let Some(token) = self.access_token() {
-            hello.extend_from_slice(&token);
+        let hello = crate::protocol::recovery::ExitHello {
+            token: self.join_token,
+            session: self.session_id,
+            uplink: uplink.numeric_id(),
+            preferred_ipv4: self.assigned_ipv4(),
+            next_return_sequence: self.next_return_sequence.load(Ordering::Acquire),
+            path_epoch: self.next_handshake_epoch.fetch_add(1, Ordering::AcqRel),
+            access_token: self.access_token(),
+            version: 3,
         }
+        .encode();
         let msg1 = noise.write_handshake(&hello)?;
 
         // Create handshake packet
@@ -864,14 +997,20 @@ impl MultipathManager {
             "Sent handshake message 1"
         );
 
-        // Receive handshake response
+        // Retransmit the same hello: the exit caches its reply. A lost UDP
+        // handshake packet does not require waiting for the entire reconnect cycle.
         let mut buf = vec![0u8; 65536];
-        let len = tokio::time::timeout(
-            self.config.transport.connect_timeout,
-            transport.recv(&mut buf),
-        )
-        .await
-        .map_err(|_| Error::ConnectionTimeout)??;
+        let deadline = tokio::time::Instant::now() + self.config.transport.connect_timeout;
+        let len = loop {
+            let retry_at = (tokio::time::Instant::now() + Duration::from_millis(500)).min(deadline);
+            match tokio::time::timeout_at(retry_at, transport.recv(&mut buf)).await {
+                Ok(result) => break result?,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    transport.send(&encoded).await?;
+                }
+                Err(_) => return Err(Error::ConnectionTimeout),
+            }
+        };
 
         // Decode response packet
         let response_packet = Packet::decode(&buf[..len])?;
@@ -892,7 +1031,8 @@ impl MultipathManager {
             return Err(Error::InvalidPacket("Handshake identity mismatch".into()));
         }
         let response = noise.read_handshake(&response_packet.payload)?;
-        if response.starts_with(b"TG2") {
+        let recovery_peer = response.starts_with(b"TG3");
+        if recovery_peer || response.starts_with(b"TG2") {
             if !matches!(response.len(), 7 | 23) {
                 return Err(Error::InvalidPacket("Invalid exit handshake".into()));
             }
@@ -930,6 +1070,73 @@ impl MultipathManager {
             "Handshake complete, noise session ready"
         );
 
+        if recovery_peer {
+            if !self
+                .get_uplink(uplink.numeric_id())
+                .is_some_and(|current| std::ptr::eq(current.as_ref(), uplink))
+            {
+                return Err(Error::ConnectionClosed);
+            }
+            // Proof of possession commits a prepared rekey on the exit. Read the
+            // encrypted confirmation before exposing the new transport to receivers.
+            let sequence = self.next_seq.fetch_add(1, Ordering::SeqCst);
+            let challenge: [u8; 16] = rand::random();
+            let payload = noise.encrypt_packet(&challenge, sequence, PacketType::Ping as u8)?;
+            let mut probe = Packet::new(
+                PacketType::Ping,
+                SequenceNumber(sequence),
+                self.session_id,
+                uplink.numeric_id(),
+                payload,
+            )?;
+            probe.set_flag(PacketFlags::ENCRYPTED);
+            let mut wire = probe.encode()?;
+            let deadline = tokio::time::Instant::now() + self.config.transport.connect_timeout;
+            loop {
+                // Every retry needs a fresh record nonce. The challenge remains bound
+                // to this handshake; unrelated data cannot confirm its keys.
+                transport.send(&wire).await?;
+                let end = (tokio::time::Instant::now() + Duration::from_millis(500)).min(deadline);
+                if let Ok(Ok(len)) = tokio::time::timeout_at(end, transport.recv(&mut buf)).await {
+                    if let Ok(packet) = Packet::decode(&buf[..len]) {
+                        if packet.header.session_id == self.session_id
+                            && packet.header.uplink_id == uplink.numeric_id()
+                            && packet.header.packet_type == PacketType::Pong
+                            && packet.header.flags.has(PacketFlags::ENCRYPTED)
+                            && noise
+                                .decrypt_packet(
+                                    &packet.payload,
+                                    packet.header.sequence.0,
+                                    PacketType::Pong as u8,
+                                )
+                                .is_ok_and(|payload| payload == challenge)
+                        {
+                            break;
+                        }
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::ConnectionTimeout);
+                }
+                // Re-encoding below uses a new nonce so the exit can respond after
+                // a lost Pong without weakening replay protection.
+                let payload = noise.encrypt_packet(&challenge, sequence, PacketType::Ping as u8)?;
+                probe.payload = payload;
+                probe.header.payload_len = probe.payload.len() as u16;
+                probe.set_flag(PacketFlags::ENCRYPTED);
+                wire = probe.encode()?;
+            }
+        }
+        let _lifecycle_guard = self.state.read();
+        if self.closing.load(Ordering::Acquire)
+            || self.lifecycle.load(Ordering::Acquire) != lifecycle
+            || !self
+                .get_uplink(uplink.numeric_id())
+                .is_some_and(|current| std::ptr::eq(current.as_ref(), uplink))
+        {
+            return Err(Error::ConnectionClosed);
+        }
+        uplink.set_transport(Arc::clone(&transport));
         uplink.set_noise_session(noise);
         uplink.set_connection_state(ConnectionState::Connected);
 
@@ -1047,6 +1254,9 @@ impl MultipathManager {
     /// When aggregation is disabled (None), the traditional flow-sticky behavior
     /// is used where each flow is bound to a single uplink.
     pub async fn send_on_flow(&self, flow_id: Option<u64>, data: &[u8]) -> Result<u64> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Error::ConnectionClosed);
+        }
         // Check if bandwidth aggregation is enabled
         let use_aggregation = match self.config.aggregation_mode {
             AggregationMode::Full => true,
@@ -1451,6 +1661,10 @@ impl MultipathManager {
         } else if self.assigned_ipv4().is_some() {
             return Err(Error::InvalidPacket("Unauthenticated exit packet".into()));
         }
+        if packet.header.packet_type == PacketType::Data {
+            self.next_return_sequence
+                .fetch_max(packet.header.sequence.0.saturating_add(1), Ordering::AcqRel);
+        }
         if packet.header.packet_type == PacketType::Data
             && self.config.deduplication
             && self
@@ -1712,7 +1926,8 @@ impl MultipathManager {
                     }
                     event = receive_rx.recv() => {
                         match event {
-                            Some(ReceiveLoopEvent::Packet { uplink_id, uplink_name, data }) => {
+                            Some(ReceiveLoopEvent::Packet { generation, uplink_id, uplink_name, data }) => {
+                                if !manager.get_uplink(uplink_id).is_some_and(|u| u.generation() == generation) { continue; }
                                 let ack_sequence = match manager.data_sequence_to_ack(&data) {
                                     Ok(sequence) => sequence,
                                     Err(e) => {
@@ -1794,10 +2009,12 @@ impl MultipathManager {
                     break;
                 }
 
+                let generation = uplink.generation();
                 match tokio::time::timeout(Duration::from_secs(1), uplink.recv(&mut buf)).await {
                     Ok(Ok(len)) => {
                         if receive_tx
                             .send(ReceiveLoopEvent::Packet {
+                                generation,
                                 uplink_id,
                                 uplink_name: uplink_name.clone(),
                                 data: buf[..len].to_vec(),
@@ -2038,15 +2255,94 @@ impl MultipathManager {
         }
     }
 
+    fn start_due_reconnects(self: &Arc<Self>, tasks: &mut tokio::task::JoinSet<()>) {
+        if self.closing.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(public) = *self.remote_public.read() else {
+            return;
+        };
+        let lifecycle = self.lifecycle.load(Ordering::Acquire);
+        for uplink in self.uplinks() {
+            let state = uplink.state().connection_state;
+            if matches!(
+                state,
+                ConnectionState::Connecting | ConnectionState::Handshaking
+            ) || (state == ConnectionState::Connected
+                && uplink.silence() < self.config.peer_silence_timeout)
+            {
+                continue;
+            }
+            let id = uplink.numeric_id();
+            {
+                let mut retries = self.reconnect.lock();
+                let retry = retries.entry(id).or_insert(ReconnectState {
+                    failures: 0,
+                    next_attempt: Instant::now(),
+                    in_progress: false,
+                });
+                if retry.in_progress || retry.next_attempt > Instant::now() {
+                    continue;
+                }
+                retry.in_progress = true;
+            }
+            let manager = Arc::clone(self);
+            tasks.spawn(async move {
+                let result = manager.connect_uplink(&uplink, &public).await;
+                if manager.closing.load(Ordering::Acquire)
+                    || manager.lifecycle.load(Ordering::Acquire) != lifecycle
+                {
+                    return;
+                }
+                let success = result.is_ok();
+                if let Err(error) = result {
+                    uplink.set_connection_state(ConnectionState::Failed);
+                    uplink.record_failure(&error.to_string());
+                    tracing::debug!(uplink = %uplink.id(), %error, "Path re-establishment failed");
+                } else {
+                    tracing::info!(uplink = %uplink.id(), "Path re-established");
+                }
+                let mut retries = manager.reconnect.lock();
+                if let Some(retry) = retries.get_mut(&id) {
+                    retry.in_progress = false;
+                    retry.failures = if success {
+                        0
+                    } else {
+                        retry.failures.saturating_add(1)
+                    };
+                    retry.next_attempt = Instant::now()
+                        + reconnect_delay(
+                            &manager.config,
+                            retry.failures,
+                            0.8 + rand::random::<f64>() * 0.4,
+                        );
+                }
+            });
+        }
+    }
+
     /// Start the maintenance loop in a background task.
     /// This handles retries, keepalives, uplink health monitoring, and throughput optimization.
     pub fn start_maintenance_loop(self: &Arc<Self>) {
+        let lifecycle = self.lifecycle.load(Ordering::Acquire);
+        if self
+            .maintenance_generation
+            .swap(lifecycle, Ordering::AcqRel)
+            == lifecycle
+        {
+            return;
+        }
         let manager = Arc::clone(self);
 
         tokio::spawn(async move {
+            let mut reconnect_tasks = tokio::task::JoinSet::new();
             let mut retry_interval = tokio::time::interval(Duration::from_millis(100));
-            let mut maintenance_interval =
-                tokio::time::interval(manager.config.health_check_interval);
+            let mut maintenance_interval = tokio::time::interval(
+                manager
+                    .config
+                    .health_check_interval
+                    .max(Duration::from_millis(20)),
+            );
             let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
 
             // Path discovery interval (Dublin Traceroute: periodic ECMP probing)
@@ -2069,16 +2365,21 @@ impl MultipathManager {
             });
 
             loop {
-                if *manager.state.read() != ConnectionState::Connected {
+                if *manager.state.read() != ConnectionState::Connected
+                    || manager.closing.load(Ordering::Acquire)
+                    || manager.lifecycle.load(Ordering::Acquire) != lifecycle
+                {
                     break;
                 }
 
                 tokio::select! {
+                    _ = reconnect_tasks.join_next(), if !reconnect_tasks.is_empty() => {}
                     _ = retry_interval.tick() => {
                         manager.retry_pending().await;
                     }
                     _ = maintenance_interval.tick() => {
                         manager.periodic_maintenance();
+                        manager.start_due_reconnects(&mut reconnect_tasks);
                     }
                     _ = ping_interval.tick() => {
                         // Send ping on all uplinks for quality measurement
@@ -2114,6 +2415,12 @@ impl MultipathManager {
                     }
                 }
             }
+            let _ = manager.maintenance_generation.compare_exchange(
+                lifecycle,
+                u64::MAX,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         });
     }
 
@@ -2269,6 +2576,7 @@ impl MultipathManager {
 
     /// Notify the production exit on every path before stopping local tasks.
     pub async fn disconnect(&self) -> Result<()> {
+        self.closing.store(true, Ordering::Release);
         if self.assigned_ipv4().is_some() {
             for uplink in self.uplinks() {
                 if let Some(transport) = uplink.get_transport() {
@@ -2305,7 +2613,10 @@ impl MultipathManager {
 
     /// Close the connection.
     pub fn close(&self) -> Result<()> {
-        *self.state.write() = ConnectionState::Disconnecting;
+        self.closing.store(true, Ordering::Release);
+        self.lifecycle.fetch_add(1, Ordering::AcqRel);
+        let mut state = self.state.write();
+        *state = ConnectionState::Disconnecting;
 
         // Close all uplinks
         for entry in &self.uplinks {
@@ -2319,7 +2630,7 @@ impl MultipathManager {
             self.cancel_pending(seq);
         }
         self.ready_packets.lock().clear();
-        *self.state.write() = ConnectionState::Disconnected;
+        *state = ConnectionState::Disconnected;
         let _ = self.event_tx.send(MultipathEvent::Disconnected);
 
         Ok(())

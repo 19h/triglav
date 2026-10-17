@@ -9,17 +9,6 @@ mkdir -p "$OUT"
 if [[ -e "$OUT/server.log" ]]; then echo "Evidence directory must be fresh" >&2; exit 1; fi
 export TRIGLAV_ACCESS_TOKEN
 TRIGLAV_ACCESS_TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
-# Build the active admission probe outside the deliberately isolated client network.
-cargo test --locked --test exit_records --no-run --message-format=json >"$OUT/probe-build.jsonl" 2>"$OUT/probe-build.log"
-probe=$(python3 - "$OUT/probe-build.jsonl" <<'PYPROBE'
-import json, sys
-for line in open(sys.argv[1]):
-    item = json.loads(line)
-    if item.get('reason') == 'compiler-artifact' and item.get('target', {}).get('name') == 'exit_records' and item.get('executable'):
-        print(item['executable'])
-PYPROBE
-)
-[[ -x "$probe" ]]
 names=(tgproof-client tgproof-r1 tgproof-r2 tgproof-exit tgproof-target)
 pids=()
 captures=()
@@ -34,6 +23,17 @@ trap 'exit 124' TERM
 for ns in "${names[@]}"; do
   if ip netns list | cut -d' ' -f1 | grep -qx "$ns"; then echo "Namespace already exists: $ns" >&2; exit 1; fi
 done
+# Build the active admission probe outside the deliberately isolated client network.
+cargo test --locked --release --test exit_records --no-run --message-format=json >"$OUT/probe-build.jsonl" 2>"$OUT/probe-build.log"
+probe=$(python3 - "$OUT/probe-build.jsonl" <<'PYPROBE'
+import json, sys
+for line in open(sys.argv[1]):
+    item = json.loads(line)
+    if item.get('reason') == 'compiler-artifact' and item.get('target', {}).get('name') == 'exit_records' and item.get('executable'):
+        print(item['executable'])
+PYPROBE
+)
+[[ -x "$probe" ]]
 for ns in "${names[@]}"; do ip netns add "$ns"; created_names+=("$ns"); ip -n "$ns" link set lo up; done
 link() {
   local a=$1 an=$2 ai=$3 b=$4 bn=$5 bi=$6

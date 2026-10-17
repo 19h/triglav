@@ -25,7 +25,7 @@ proxies, with a separate encrypted TCP stream for each application connection.
 - **Packet aggregation:** stripe one connection across multiple paths with
   `--aggregate`.
 - **Path management:** concurrent connection establishment, interface monitoring,
-  health-based scheduling and recovery probes.
+  bounded reconnect backoff, authenticated NAT rebinding and confirmed rekeying.
 - **Independent encryption:** separate cipher state for each uplink, authenticated
   packet sequencing and replay rejection.
 - **Shared exit:** per-client tunnel addresses, session isolation and optional
@@ -195,6 +195,18 @@ Ctrl-C and SIGTERM stop the processes and remove owned client routes. Restoring
 an interface also requires restoring its underlying network configuration;
 Linux may remove static routes when an interface is administratively taken down.
 
+Clients wait for an unavailable exit and retry stale paths automatically. Recovery
+negotiation preserves the tunnel addresses and receive-sequence position across
+an exit restart when the same key and tunnel prefix remain configured and the
+previous address is available. A conflicting lease is rejected. Restart recovery
+uses the `TG3` handshake; deploy matching client and exit versions. The exit also
+accepts existing `TG2` clients.
+
+The client status response includes pending-packet count, retained payload bytes
+and their configured limits. Defaults cap retransmission storage at 4096 logical
+packets, 8 MiB of payload and 10 s of age; these limits do not bound all process
+memory. See the [resilience acceptance contract](docs/resilience.md).
+
 The default inner MTU is 1340 bytes. Including Triglav framing, encryption, UDP
 and ordinary IP headers, a full-sized packet occupies 1461 bytes over IPv4 or
 1481 bytes over IPv6. Additional encapsulation and smaller path MTUs require
@@ -218,11 +230,16 @@ It checks destination-observed exit identity, exact bidirectional payloads,
 concurrent clients, proxies, loss and reordering, path failure and recovery,
 admission rejection, replay rejection and routing cleanup.
 
-The recorded run from **2026-10-17** passed 330 Rust tests on each of Linux and
+A separate recovery lane keeps one TCP connection open through a 20 s total
+outage, an exit restart, changed NAT addresses and twenty local path replacements.
+It checks process/session continuity and samples pending-buffer bounds under load.
+
+The [R1 baseline from **2026-10-17**](docs/resilience.md#r1-validation-2026-10-17)
+passed 337 Rust tests on each of Linux and
 macOS, with 10 tests ignored by default on each platform and a separate live
 admission test. It verified 220 destination exchanges containing 17,817,030
 application bytes in each direction. In three trials per mode, with each link
-capped at 2 Mbit/s, aggregation achieved 1.68 times the single-uplink control's
+capped at 2 Mbit/s, aggregation achieved 1.52 times the single-uplink control's
 median request goodput. These measurements describe that workload and topology.
 
 Each run retains source and binary hashes, source and executable copies, packet
@@ -242,7 +259,8 @@ workflow runs the same command.
 | macOS | Client implementation and native app available; build and nonprivileged tests pass; privileged TUN operation remains unverified |
 | Windows TUN | Not implemented |
 | Physical NIC, modem and ISP behavior | Outside the namespace validation results |
-| NAT rebinding, changing uplink addresses, arbitrary MTUs and long-duration load | Outside the recorded acceptance profile |
+| NAT rebinding, changing uplink addresses and exit restart | Covered by the controlled recovery lab; restart continuity requires the same key/prefix and an available lease |
+| Arbitrary MTUs and long-duration load | Outside the recorded acceptance profile |
 
 The protocol uses a Noise NK handshake with X25519 and ChaCha20-Poly1305. Its
 custom resolver maps the BLAKE2s pattern name to BLAKE3; standard Noise BLAKE2s

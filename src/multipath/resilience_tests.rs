@@ -253,3 +253,148 @@ fn malformed_ack_count_is_rejected_before_allocation() {
         .handle_packet(&packet.encode().unwrap(), uplink.numeric_id())
         .is_err());
 }
+
+async fn delayed_handshake_server(
+    delay: Duration,
+) -> (std::net::SocketAddr, PublicKey, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let keys = KeyPair::generate();
+    let public = keys.public;
+    let task = tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let mut buffer = vec![0; 65536];
+        loop {
+            let (len, peer) = socket.recv_from(&mut buffer).await.unwrap();
+            let packet = Packet::decode(&buffer[..len]).unwrap();
+            if packet.header.packet_type != PacketType::Handshake {
+                continue;
+            }
+            let mut noise = NoiseSession::new_responder(&keys.secret).unwrap();
+            noise.read_handshake(&packet.payload).unwrap();
+            let reply = Packet::new(
+                PacketType::Handshake,
+                SequenceNumber(1),
+                packet.header.session_id,
+                packet.header.uplink_id,
+                noise.write_handshake(b"legacy fixture").unwrap(),
+            )
+            .unwrap();
+            socket
+                .send_to(&reply.encode().unwrap(), peer)
+                .await
+                .unwrap();
+        }
+    });
+    (address, public, task)
+}
+
+#[tokio::test]
+async fn startup_retries_until_an_exit_becomes_available() {
+    let (address, public, server) = delayed_handshake_server(Duration::from_millis(150)).await;
+    let mut config = MultipathConfig::default();
+    config.transport.connect_timeout = Duration::from_millis(30);
+    config.reconnect_initial_delay = Duration::from_millis(20);
+    config.reconnect_max_delay = Duration::from_millis(40);
+    let manager = manager(config);
+    manager
+        .add_uplink(UplinkConfig {
+            remote_addr: address,
+            ..Default::default()
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), manager.connect_until_ready(public))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(manager.state(), ConnectionState::Connected);
+    manager.close().unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_secondary_path_is_retried_without_an_interface_event() {
+    let (good, public, good_server) = delayed_handshake_server(Duration::ZERO).await;
+    // An established path remains usable while the absent endpoint is retried.
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let bad = socket.local_addr().unwrap();
+    drop(socket);
+    let mut config = MultipathConfig::default();
+    config.transport.connect_timeout = Duration::from_millis(30);
+    config.health_check_interval = Duration::from_millis(20);
+    config.reconnect_initial_delay = Duration::from_millis(20);
+    config.reconnect_max_delay = Duration::from_millis(40);
+    let manager = manager(config);
+    manager
+        .add_uplink(UplinkConfig {
+            id: UplinkId::new("good"),
+            remote_addr: good,
+            ..Default::default()
+        })
+        .unwrap();
+    let bad_id = manager
+        .add_uplink(UplinkConfig {
+            id: UplinkId::new("bad"),
+            remote_addr: bad,
+            ..Default::default()
+        })
+        .unwrap();
+    manager.connect(public).await.unwrap();
+    manager.start_maintenance_loop();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if manager
+                .reconnect
+                .lock()
+                .get(&bad_id)
+                .is_some_and(|r| r.failures >= 2)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        manager.get_uplink(0).unwrap().state().connection_state,
+        ConnectionState::Connected
+    );
+    manager.close().unwrap();
+    good_server.abort();
+}
+
+#[tokio::test]
+async fn shutdown_rejects_a_late_handshake_response() {
+    let (address, public, server) = delayed_handshake_server(Duration::from_millis(100)).await;
+    let manager = manager(MultipathConfig::default());
+    let id = manager
+        .add_uplink(UplinkConfig {
+            remote_addr: address,
+            ..Default::default()
+        })
+        .unwrap();
+    let connecting = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.connect(public).await })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    manager.close().unwrap();
+    assert!(connecting.await.unwrap().is_err());
+    assert_eq!(manager.state(), ConnectionState::Disconnected);
+    assert!(!manager.get_uplink(id).unwrap().is_noise_ready());
+    server.abort();
+}
+
+#[test]
+fn recovery_backoff_is_bounded_under_extreme_retry_counts() {
+    let config = MultipathConfig::default();
+    assert!(reconnect_delay(&config, 1, 1.0) > reconnect_delay(&config, 0, 1.0));
+    for failures in [0, 1, 10, 31, u32::MAX] {
+        for jitter in [0.8, 1.0, 1.2] {
+            let delay = reconnect_delay(&config, failures, jitter);
+            assert!(delay >= Duration::from_millis(20));
+            assert!(delay <= config.reconnect_max_delay);
+        }
+    }
+}

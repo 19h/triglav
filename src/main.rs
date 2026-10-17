@@ -159,7 +159,7 @@ async fn run_server(args: ServerArgs, _config: Config) -> Result<()> {
     Ok(())
 }
 
-fn discover_client_interfaces(auto_discover: bool, configured: &[String]) -> Vec<String> {
+fn discover_client_interfaces(_auto_discover: bool, configured: &[String]) -> Vec<String> {
     if !configured.is_empty() {
         return configured.to_vec();
     }
@@ -213,13 +213,26 @@ fn build_uplink_configs(interfaces: &[String], server_addrs: &[SocketAddr]) -> V
         .collect()
 }
 
+struct NetworkAdaptation {
+    watcher: Arc<NetworkWatcher>,
+    events: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for NetworkAdaptation {
+    fn drop(&mut self) {
+        self.watcher.stop();
+        self.events.abort();
+    }
+}
+
 fn start_network_adaptation(
     manager: Arc<MultipathManager>,
     server_addrs: Vec<SocketAddr>,
     remote_public: PublicKey,
     auto_discover: bool,
     configured_interfaces: Vec<String>,
-) -> Arc<NetworkWatcher> {
+    tunnel_interface: Option<String>,
+) -> NetworkAdaptation {
     let watcher = Arc::new(NetworkWatcher::new(NetworkWatcherConfig::default()));
     let mut event_rx = watcher.subscribe();
 
@@ -230,7 +243,7 @@ fn start_network_adaptation(
         });
     }
 
-    tokio::spawn(async move {
+    let events = tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
             handle_network_event(
                 Arc::clone(&manager),
@@ -238,13 +251,14 @@ fn start_network_adaptation(
                 remote_public.clone(),
                 auto_discover,
                 &configured_interfaces,
+                tunnel_interface.as_deref(),
                 event,
             )
             .await;
         }
     });
 
-    watcher
+    NetworkAdaptation { watcher, events }
 }
 
 async fn handle_network_event(
@@ -253,11 +267,25 @@ async fn handle_network_event(
     remote_public: PublicKey,
     auto_discover: bool,
     configured_interfaces: &[String],
+    tunnel_interface: Option<&str>,
     event: NetworkEvent,
 ) {
+    let event_interface = match &event {
+        NetworkEvent::InterfaceAdded(interface) => Some(interface.name.as_str()),
+        NetworkEvent::InterfaceStateChanged { name, .. } => Some(name.as_str()),
+        NetworkEvent::AddressAdded { interface, .. }
+        | NetworkEvent::AddressRemoved { interface, .. }
+        | NetworkEvent::InterfaceRemoved(interface)
+        | NetworkEvent::ConnectivityChanged { interface, .. } => Some(interface.as_str()),
+        NetworkEvent::GatewayChanged { interface, .. } => interface.as_deref(),
+    };
+    if event_interface.is_some() && event_interface == tunnel_interface {
+        return;
+    }
     match event {
         NetworkEvent::InterfaceAdded(interface) => {
             if interface.is_up
+                && !interface.is_loopback
                 && interface_is_allowed(auto_discover, configured_interfaces, &interface.name)
             {
                 reconcile_interface(manager, server_addrs, remote_public, &interface.name).await;
@@ -279,8 +307,20 @@ async fn handle_network_event(
                 reconcile_interface(manager, server_addrs, remote_public, &interface).await;
             }
         }
-        NetworkEvent::AddressRemoved { interface, .. }
-        | NetworkEvent::InterfaceRemoved(interface) => {
+        NetworkEvent::AddressRemoved { interface, .. } => {
+            if !interface_is_allowed(auto_discover, configured_interfaces, &interface) {
+                return;
+            }
+            if util::get_network_interfaces()
+                .iter()
+                .any(|i| i.name == interface && i.is_up)
+            {
+                reconcile_interface(manager, server_addrs, remote_public, &interface).await;
+            } else {
+                remove_interface_uplinks(manager, &interface);
+            }
+        }
+        NetworkEvent::InterfaceRemoved(interface) => {
             remove_interface_uplinks(manager, &interface);
         }
         NetworkEvent::GatewayChanged { interface, .. } => {
@@ -308,13 +348,49 @@ async fn handle_network_event(
 }
 
 fn interface_is_allowed(
-    auto_discover: bool,
+    _auto_discover: bool,
     configured_interfaces: &[String],
     interface: &str,
 ) -> bool {
-    auto_discover
-        || configured_interfaces.is_empty()
-        || configured_interfaces.iter().any(|i| i == interface)
+    if !configured_interfaces.is_empty() {
+        return configured_interfaces.iter().any(|i| i == interface);
+    }
+    !matches!(interface, "lo" | "lo0")
+}
+
+#[cfg(test)]
+mod network_adaptation_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_interfaces_remain_binding_when_auto_discovery_is_enabled() {
+        let configured = vec!["en0".to_string()];
+        assert!(interface_is_allowed(true, &configured, "en0"));
+        assert!(!interface_is_allowed(true, &configured, "en1"));
+        assert!(!interface_is_allowed(true, &[], "lo"));
+    }
+
+    #[tokio::test]
+    async fn client_tunnel_is_never_discovered_as_an_underlay() {
+        let manager = Arc::new(MultipathManager::new(
+            MultipathConfig::default(),
+            KeyPair::generate(),
+        ));
+        handle_network_event(
+            Arc::clone(&manager),
+            &["127.0.0.1:7443".parse().unwrap()],
+            KeyPair::generate().public,
+            true,
+            &[],
+            Some("custom-tunnel"),
+            NetworkEvent::AddressAdded {
+                interface: "custom-tunnel".into(),
+                address: "10.0.85.1".parse().unwrap(),
+            },
+        )
+        .await;
+        assert_eq!(manager.uplink_count(), 0);
+    }
 }
 
 async fn reconcile_interface(
@@ -391,10 +467,6 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
 
     // Discover interfaces
     let interfaces = discover_client_interfaces(args.auto_discover, &args.interface);
-
-    if interfaces.is_empty() {
-        return Err(triglav::Error::NoAvailableUplinks);
-    }
 
     println!("{} Interfaces:", "→".cyan());
     for iface in &interfaces {
@@ -481,7 +553,22 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
     // Connect
     println!("{} Connecting...", "→".cyan());
     let remote_public = triglav::crypto::PublicKey::from_bytes(auth_key.server_pubkey());
-    match runner.connect(remote_public).await {
+    let _network_watcher = start_network_adaptation(
+        Arc::clone(runner.manager()),
+        server_addrs.to_vec(),
+        remote_public,
+        args.auto_discover,
+        args.interface.clone(),
+        Some(runner.tun_name().to_string()),
+    );
+    let connected = tokio::select! {
+        result = runner.connect(remote_public) => result,
+        _ = triglav::server::shutdown_signal() => {
+            runner.manager().close()?;
+            return Ok(());
+        }
+    };
+    match connected {
         Ok(_) => {
             println!("{} Connected!", "✓".green());
             if let Some(ip) = runner.manager().assigned_ipv4() {
@@ -496,14 +583,6 @@ async fn run_tun(args: TunArgs, _config: Config) -> Result<()> {
             return Err(e);
         }
     }
-
-    let _network_watcher = start_network_adaptation(
-        Arc::clone(runner.manager()),
-        server_addrs.to_vec(),
-        remote_public,
-        args.auto_discover,
-        args.interface.clone(),
-    );
 
     #[cfg(feature = "metrics")]
     let _client_status_server = start_client_status_server(
@@ -592,10 +671,6 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
     // Discover or use specified interfaces
     let interfaces = discover_client_interfaces(args.auto_discover, &args.interface);
 
-    if interfaces.is_empty() {
-        return Err(triglav::Error::NoAvailableUplinks);
-    }
-
     println!("{} Using interfaces:", "→".cyan());
     for iface in &interfaces {
         println!("  {} {}", "●".green(), iface);
@@ -633,7 +708,22 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
 
     // Connect
     let remote_public = triglav::crypto::PublicKey::from_bytes(auth_key.server_pubkey());
-    match manager.connect(remote_public).await {
+    let _network_watcher = start_network_adaptation(
+        Arc::clone(&manager),
+        server_addrs.to_vec(),
+        remote_public,
+        args.auto_discover,
+        args.interface.clone(),
+        None,
+    );
+    let connected = tokio::select! {
+        result = manager.connect_until_ready(remote_public) => result,
+        _ = triglav::server::shutdown_signal() => {
+            manager.close()?;
+            return Ok(());
+        }
+    };
+    match connected {
         Ok(_) => {
             conn_bar.finish_with_message(format!("{} Connected!", "✓".green()));
         }
@@ -642,14 +732,6 @@ async fn run_connect(args: ConnectArgs, _config: Config) -> Result<()> {
             return Err(e);
         }
     }
-
-    let _network_watcher = start_network_adaptation(
-        Arc::clone(&manager),
-        server_addrs.to_vec(),
-        remote_public,
-        args.auto_discover,
-        args.interface.clone(),
-    );
 
     #[cfg(feature = "metrics")]
     let _client_status_server = start_client_status_server(

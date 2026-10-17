@@ -472,6 +472,9 @@ pub struct Uplink {
     /// Authenticated liveness probes let a recovered path leave quarantine
     /// while historical loss measurements age out.
     last_probe_success: RwLock<Option<Instant>>,
+    pub(crate) handshake_lock: tokio::sync::Mutex<()>,
+    generation: AtomicU64,
+    authenticated_at: RwLock<Instant>,
 }
 
 impl Uplink {
@@ -492,7 +495,18 @@ impl Uplink {
             cwnd: AtomicU32::new(10), // Initial cwnd
             nat_state: RwLock::new(UplinkNatState::default()),
             last_probe_success: RwLock::new(None),
+            handshake_lock: tokio::sync::Mutex::new(()),
+            generation: AtomicU64::new(0),
+            authenticated_at: RwLock::new(Instant::now()),
         }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn silence(&self) -> Duration {
+        self.authenticated_at.read().elapsed()
     }
 
     /// Get the uplink ID.
@@ -591,6 +605,8 @@ impl Uplink {
 
     /// Set the noise session.
     pub fn set_noise_session(&self, session: NoiseSession) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self.authenticated_at.write() = Instant::now();
         *self.noise_session.lock() = Some(session);
     }
 
@@ -814,6 +830,7 @@ impl Uplink {
 
     /// Record a successful receive.
     pub fn record_recv(&self, bytes: usize) {
+        *self.authenticated_at.write() = Instant::now();
         {
             let mut uplink_state = self.state.write();
             uplink_state.last_recv = Some(Instant::now());

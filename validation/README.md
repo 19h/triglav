@@ -97,11 +97,27 @@ different assertions and must not be substituted for each other.
 
 ## Wire and resource invariants
 
-Production UDP peers negotiate `TG2` inside the encrypted handshake. A logical
+Production UDP peers negotiate `TG3` inside the encrypted handshake; the exit also
+accepts the earlier `TG2` format. New clients require a `TG3`-capable exit. A logical
 client shares an unguessable join token across its uplinks, and the handshake
 binds that token to the complete session identifier and numeric uplink ID.
 A configured deployment access token is independently checked before allocating
 session state. Each uplink has separate encryption keys and nonce state.
+
+`TG3` additionally carries the preferred tunnel IPv4 address, next return-sequence
+position and a monotonically increasing handshake epoch. A replacement handshake
+only prepares keys; a fresh encrypted confirmation commits them. Old epochs and
+recorded hellos cannot replace a newer path. Authenticated fresh packets can
+update a NAT endpoint. A client-side address replacement retains the numeric path
+ID, avoiding accumulation of obsolete paths on the exit.
+
+`recovery.sh` exercises delayed exit startup, a 20 s all-path outage with pending
+buffer sampling, restart with the same static key, changed NAT source addresses,
+and ten rounds replacing both client source addresses. One existing TCP socket
+must survive every phase. Client process/session/path IDs and destination hashes
+are checked independently. The requested lease must remain available for restart
+continuity; a collision is rejected by the handshake rather than silently
+changing the address.
 
 A data record carries an explicit 8-byte nonce. The encrypted plaintext binds
 the packet type (1 byte), logical sequence (8 bytes), and payload. The AEAD tag

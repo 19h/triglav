@@ -63,6 +63,12 @@ outer6 = load('outer-ipv6/summary.json')
 assert outer6['result'] == 'PASS' and outer6['full_tunnel_and_restoration']
 assert len(load('outer-ipv6/packet-proof.json')) == 2
 assert all(p['encrypted_data_packets'] > 0 for p in load('outer-ipv6/packet-proof.json'))
+recovery = load('recovery/summary.json')
+assert recovery['result'] == 'PASS'
+assert recovery['same_client_process'] and recovery['same_session'] and recovery['one_tcp_connection']
+assert recovery['outage_seconds'] == 20 and recovery['exit_restarted']
+assert recovery['address_replacement_rounds'] == 10 and recovery['nat_addresses_rebound'] == 2
+assert len(recovery['final_paths']) == 2
 summary = {
     'result': 'PASS',
     'binary_profile': 'release',
@@ -86,6 +92,7 @@ summary = {
     'rate_capped_aggregation_gain': benchmark['relative_goodput'],
     'concurrent_proxy_transfers': len(proxies['transfers']),
     'source_manifest_sha256': hashlib.sha256((out/'source-sha256.txt').read_bytes()).hexdigest(),
+    'recovery': recovery,
     'unproven': ['physical NIC/ISP deployment', 'macOS TUN runtime', 'arbitrary MTUs and long-duration workloads'],
 }
 (out/'summary.json').write_text(json.dumps(summary, indent=2) + '\n')

@@ -17,6 +17,7 @@
 mod codec;
 mod message;
 mod packet;
+pub(crate) mod recovery;
 
 pub use codec::{decode_packet, encode_packet, PacketCodec};
 pub use message::{ControlMessage, DataMessage, Message, MessageType};

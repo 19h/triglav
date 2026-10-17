@@ -1,160 +1,255 @@
 # Triglav
 
-Triglav carries IP traffic from multiple client uplinks through one Linux exit
-node. Each uplink has an independently encrypted UDP session. With aggregation
-enabled, packets from one inner connection can use multiple uplinks; the exit
-forwards them through its TUN interface and the host kernel's routing/NAT.
+Encrypted multipath networking through a single exit.
+
+Triglav connects several client network interfaces to one exit server. In TUN
+mode, it carries IPv4 and IPv6 packets through independently encrypted UDP
+paths. Applications use the client's virtual interface; the exit forwards their
+traffic through its own network connection.
 
 ```text
-client applications
-       |
-    client TUN
-       +---- uplink 1 ----+
-       +---- uplink 2 ----+---- exit TUN ---- kernel routing/NAT ---- destination
+                         encrypted UDP paths
+                       +------ uplink 1 ------+
+applications -- TUN ---+------ uplink 2 ------+--- exit -- destinations
+                       +------ uplink N ------+
 ```
 
-SOCKS5 and HTTP CONNECT are also available. Each proxy connection uses a separate
-authenticated TCP stream through the exit, bound to a selected uplink. An
-established proxy stream does not migrate when its outer TCP connection fails.
+Enable packet aggregation to distribute a single flow across multiple uplinks,
+or use flow-based scheduling. Triglav also provides local SOCKS5 and HTTP CONNECT
+proxies, with a separate encrypted TCP stream for each application connection.
 
-## Reproducible production validation
+## Capabilities
+
+- **Dual-stack tunneling:** full-tunnel and selected-network routing for IPv4 and
+  IPv6, over IPv4 or IPv6 uplinks.
+- **Packet aggregation:** stripe one connection across multiple paths with
+  `--aggregate`.
+- **Path management:** concurrent connection establishment, interface monitoring,
+  health-based scheduling and recovery probes.
+- **Independent encryption:** separate cipher state for each uplink, authenticated
+  packet sequencing and replay rejection.
+- **Shared exit:** per-client tunnel addresses, session isolation and optional
+  deployment access tokens.
+- **Local proxies and monitoring:** SOCKS5, HTTP CONNECT, JSON status and
+  Prometheus-compatible metrics.
+
+The exit uses Linux TUN, kernel routing and conntrack/NAT. The repository also
+contains a [native macOS control app](apps/macos/README.md).
+
+## Build
+
+From a checkout, with Rust, Cargo and a C compiler installed:
+
+```sh
+cargo build --locked --release --bin triglav --bin triglav-server
+```
+
+On Linux, install the two executables:
+
+```sh
+sudo install -m 0755 target/release/triglav target/release/triglav-server /usr/local/bin/
+```
+
+The examples below use Linux, `iproute2`, `iptables`/`ip6tables`, OpenSSL and
+`sudo`. TUN creation and route changes need network administration privileges;
+interface-bound sockets also need appropriate privileges. The examples run
+Triglav with `sudo`.
+
+## Start an exit
+
+The exit needs working IPv4 and IPv6 egress. Its firewall must allow inbound
+UDP port 7443 for tunnels, TCP port 7443 for proxies, and forwarding between the
+`tg-exit` interface and its egress interface.
+
+Choose an address assigned to the exit host that clients can reach, and replace
+the example interface with its egress interface. `203.0.113.10` is a documentation
+address, not a public service.
+
+```sh
+SERVER_IP=203.0.113.10
+EGRESS_IF=eth0
+export TRIGLAV_ACCESS_TOKEN="$(openssl rand -hex 32)"
+
+sudo install -d -m 0700 /etc/triglav
+sudo sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
+sudo iptables -t nat -A POSTROUTING -s 10.0.85.0/24 -o "$EGRESS_IF" -j MASQUERADE
+sudo ip6tables -t nat -A POSTROUTING -s fd00:7472:6967::/64 -o "$EGRESS_IF" -j MASQUERADE
+
+sudo --preserve-env=TRIGLAV_ACCESS_TOKEN triglav-server \
+  --listen "${SERVER_IP}:7443" \
+  --key /etc/triglav/server.key --generate-key
+```
+
+This example assumes the firewall already permits forwarding. Persist the
+forwarding settings, firewall rules and token through the host's normal network
+and service configuration if the service must survive a reboot.
+
+The server prints a client connection key. Supply that key and the access token
+to each client through your chosen provisioning mechanism.
+
+| Credential | Purpose |
+| --- | --- |
+| Server key file | Persistent private identity of the exit; created with Unix mode `0600` and loaded on subsequent starts |
+| Connection key, `tg1...` | Base58-encoded server public key and endpoints; legacy `tg1_...` keys remain readable |
+| `TRIGLAV_ACCESS_TOKEN` | Separate 256-bit bearer capability, encoded as 64 hexadecimal digits; checked during client admission |
+
+Keep the private key and token stable across restarts. Omitting the access token
+on the exit permits public client admission; the connection key alone identifies
+the server.
+
+`triglav server` runs the same TUN exit implementation. For an IPv6 listen address,
+use bracket notation, for example `--listen '[2001:db8::10]:7443'`. Processes run
+in the foreground and can be supervised by the host's service manager.
+
+## Connect a client
+
+Each selected interface must already have an address and a route to the exit.
+Triglav binds its sockets to those interfaces; it does not provision the
+underlying Ethernet, Wi-Fi or cellular connections.
+
+On the client, substitute the values received from the exit and the actual
+interface names:
+
+```sh
+CONNECTION_KEY='tg1...'
+export TRIGLAV_ACCESS_TOKEN='COPY_THE_64_HEX_DIGIT_TOKEN_FROM_THE_EXIT'
+UPLINK1=enp3s0
+UPLINK2=wlan0
+```
+
+### Full tunnel
+
+Route IPv4 and IPv6 traffic through the exit, with packet aggregation:
+
+```sh
+sudo --preserve-env=TRIGLAV_ACCESS_TOKEN triglav tun "$CONNECTION_KEY" \
+  --interface "$UPLINK1" --interface "$UPLINK2" \
+  --aggregate --full-tunnel
+```
+
+The exit assigns tunnel addresses shared by the client's uplinks. Full-tunnel
+startup requires an IPv6-capable exit. For an IPv4-only deployment, start the
+exit with `--ipv4-only` and use explicit IPv4 routes on clients.
+
+### Selected networks
+
+Replace these example private networks with destinations reachable from the exit:
+
+```sh
+sudo --preserve-env=TRIGLAV_ACCESS_TOKEN triglav tun "$CONNECTION_KEY" \
+  --interface "$UPLINK1" --interface "$UPLINK2" \
+  --aggregate --strategy wrr \
+  --route 10.20.0.0/16 --route fd20:1234::/48
+```
+
+Repeat `--route` for additional networks. Use `--exclude CIDR` for a network that
+must bypass the tunnel. `--auto-discover` selects available interfaces when no
+explicit interface list is supplied.
+
+### Application proxies
+
+Run local SOCKS5 and HTTP CONNECT listeners through the exit:
+
+```sh
+sudo --preserve-env=TRIGLAV_ACCESS_TOKEN triglav connect "$CONNECTION_KEY" \
+  --interface "$UPLINK1" --interface "$UPLINK2" --strategy wrr \
+  --socks 1080 --http-proxy 8080
+```
+
+In another terminal:
+
+```sh
+curl --socks5-hostname 127.0.0.1:1080 https://example.com/
+curl --proxy http://127.0.0.1:8080 https://example.com/
+```
+
+Both listeners bind to loopback. Proxy mode carries application connections
+without installing TUN routes.
+
+| Mode | Distribution across uplinks |
+| --- | --- |
+| TUN with `--aggregate` | Packets from one flow can use multiple uplinks |
+| TUN without `--aggregate` | Flow-based scheduling, with selective redundant sends for small or connection-control packets |
+| SOCKS5 / HTTP CONNECT | Each connection uses one outer TCP stream; separate connections can use different uplinks |
+
+An established proxy stream stays on its selected TCP connection. It does not
+migrate to another uplink after that connection fails.
+
+## Operate and inspect
+
+| Service | Default status URL | Metrics URL |
+| --- | --- | --- |
+| Exit | `http://127.0.0.1:9090/status` | `http://127.0.0.1:9090/metrics` |
+| Client | `http://127.0.0.1:9091/status` | `http://127.0.0.1:9091/metrics` |
+
+```sh
+curl --fail http://127.0.0.1:9090/status
+curl --fail http://127.0.0.1:9091/status
+```
+
+Use `triglav-server --metrics ADDRESS` to change the exit's HTTP bind address,
+and `--metrics-addr ADDRESS` on client commands. Use `--log-level debug` on
+`triglav` for connection and routing diagnostics.
+
+Ctrl-C and SIGTERM stop the processes and remove owned client routes. Restoring
+an interface also requires restoring its underlying network configuration;
+Linux may remove static routes when an interface is administratively taken down.
+
+The default inner MTU is 1340 bytes. Including Triglav framing, encryption, UDP
+and ordinary IP headers, a full-sized packet occupies 1461 bytes over IPv4 or
+1481 bytes over IPv6. Additional encapsulation and smaller path MTUs require
+separate validation. Full-tunnel routing does not configure the system DNS
+resolver.
+
+Further command options are available through `triglav tun --help`,
+`triglav connect --help` and `triglav-server --help`.
+
+## Validation
+
+Run the production acceptance suite with Docker:
 
 ```sh
 bash validation/run.sh
 ```
 
-This builds and tests the actual release binaries in a disposable Linux Docker
-container, then connects them through independent network namespaces to a
-separate destination. It requires a working Docker daemon; privileged operations
-affect the container's network namespaces, not the host's routing configuration.
+The harness builds release binaries and runs them through isolated Linux network
+namespaces, including two separately NATed IPv4 paths and two IPv6-only paths.
+It checks destination-observed exit identity, exact bidirectional payloads,
+concurrent clients, proxies, loss and reordering, path failure and recovery,
+admission rejection, replay rejection and routing cleanup.
 
-The mandatory acceptance checks cover:
+The recorded run from **2026-10-17** passed 330 Rust tests on each of Linux and
+macOS, with 10 tests ignored by default on each platform and a separate live
+admission test. It verified 220 destination exchanges containing 17,817,030
+application bytes in each direction. In three trials per mode, with each link
+capped at 2 Mbit/s, aggregation achieved 1.68 times the single-uplink control's
+median request goodput. These measurements describe that workload and topology.
 
-- Two source-NATed IPv4 uplinks and, separately, two IPv6-only outer paths.
-- Full and split IPv4/IPv6 forwarding, destination-observed exit addresses, exact
-  binary payload comparisons, and matching independent SHA-256 observations.
-- Single-flow striping, concurrent TCP/UDP traffic, IPv4 fragmentation, packet
-  loss/reordering, path blackholes, interface-down operation and path recovery.
-- A rate-capped single-uplink control versus aggregation.
-- Concurrent SOCKS5 and HTTP CONNECT streams, half-close and failed destinations.
-- Separate clients, access-token rejection, session isolation, packet mutation,
-  replay rejection, and successful traffic after invalid records.
-- Graceful shutdown, route rollback, preservation of pre-existing namespaces and
-  tables, and refusal of full-tunnel mode when the exit provides only IPv4.
+Each run retains source and binary hashes, source and executable copies, packet
+captures, destination observations and machine-readable results under
+`validation/artifacts/`. Failed checks return a nonzero status. The GitHub
+workflow runs the same command.
 
-Artifacts include the tested source archive, executed binaries, SHA-256 manifests,
-compiler/image identity, packet captures, application observations and JSON
-results. Failures return nonzero. The older Rust end-to-end fixtures use a test
-server and are not substitutes for this production-binary acceptance suite.
+- [Validation contract, assumptions and falsification probes](validation/README.md)
+- [Recorded results and evidence](validation/REPORT.md)
+- [Physical-interface diagnostics](physical_tests/README.md)
 
-See the [validation contract](validation/README.md) for exact workload, assumptions,
-falsification probes and resource bounds, and the [observed report](validation/REPORT.md)
-for the identified completed run. Finite test results establish behavior in the
-recorded configurations; they are not formal verification of arbitrary networks.
+## Compatibility and limits
 
-## Build
-
-```sh
-cargo build --locked --release --bins
-cargo test --locked --all-targets -- --test-threads=1
-```
-
-The client executable is `target/release/triglav`; the standalone exit executable
-is `target/release/triglav-server`. `triglav server` uses the same exit implementation.
-
-## Linux exit configuration
-
-The exit host needs a TUN device, kernel forwarding and egress NAT or equivalent
-routing. Replace `SERVER_IP` with the server's reachable local address and `eth0`
-with its actual egress interface. The example uses the default address pools.
-
-```sh
-export TRIGLAV_ACCESS_TOKEN=$(openssl rand -hex 32)
-sudo sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
-sudo iptables -t nat -A POSTROUTING -s 10.0.85.0/24 -o eth0 -j MASQUERADE
-sudo ip6tables -t nat -A POSTROUTING -s fd00:7472:6967::/64 -o eth0 -j MASQUERADE
-sudo --preserve-env=TRIGLAV_ACCESS_TOKEN target/release/triglav-server \
-  --listen SERVER_IP:7443 --key /etc/triglav/server.key --generate-key
-```
-
-The server prints a base58 `tg1...` connection key (legacy `tg1_...` keys are also accepted) containing its public key and listen
-address. Distribute that connection key and the deployment access token to the
-client. The access token is a separate 256-bit bearer capability. A public key
-identifies the exit; it does not authorize a client. Omitting the server's access
-token allows public client admission.
-
-The server key file is created with mode `0600` on Unix. An existing key file is
-loaded on subsequent starts. Both UDP and TCP port 7443 must be reachable for
-TUN and proxy modes respectively. The status service defaults to loopback port
-9090. Full-tunnel clients require an IPv6-capable exit; an exit started with
-`--ipv4-only` supports explicit IPv4 split routing.
-
-The service runs in the foreground. Use the host's service manager for process
-supervision; daemon mode and UDP-to-TCP fallback are not implemented by this exit.
-The commands below show the directly tested CLI configuration path. Configuration
-file and GUI workflows are outside the production acceptance contract.
-
-## Client configuration
-
-Set the same `TRIGLAV_ACCESS_TOKEN` in the client environment. Replace
-`CONNECTION_KEY`, `IFACE1` and `IFACE2` with the actual values.
-
-```sh
-# Split routing, with single-flow packet aggregation.
-sudo --preserve-env=TRIGLAV_ACCESS_TOKEN target/release/triglav tun CONNECTION_KEY \
-  --interface IFACE1 --interface IFACE2 --aggregate --strategy wrr \
-  --route 198.18.0.0/24 --route 2001:db8:85::/64
-
-# Full dual-stack routing.
-sudo --preserve-env=TRIGLAV_ACCESS_TOKEN target/release/triglav tun CONNECTION_KEY \
-  --interface IFACE1 --interface IFACE2 --aggregate --full-tunnel
-
-# SOCKS5 and HTTP CONNECT. The client ports listen on loopback.
-target/release/triglav connect CONNECTION_KEY \
-  --interface IFACE1 --interface IFACE2 --strategy wrr \
-  --socks 1080 --http-proxy 8080
-```
-
-The example destination prefixes are reserved for tests/documentation; substitute
-actual destination networks. Explicit interface selection binds the underlying
-sockets. On Linux this uses source-address binding and `SO_BINDTODEVICE`; the
-latter requires appropriate privileges. Source-only binding without that
-capability requires suitable host policy routing. The acceptance suite runs with
-the privileges needed for interface binding.
-
-The exit assigns each logical client an IPv4 address and, when enabled, an IPv6
-address shared by its uplinks. The default inner MTU is 1340 bytes. Its protected
-UDP packet needs 1461 bytes over outer IPv4 or 1481 bytes over outer IPv6, assuming
-no additional outer encapsulation. Smaller path MTUs require separate validation.
-
-Ctrl-C and SIGTERM stop the service and remove owned client routes. Underlay
-configuration is external: for example, Linux can remove static routes when an
-interface is administratively brought down. Those routes must be restored before
-the path can carry traffic again.
-
-## Protocol and operational boundaries
-
-The record layer explicitly authenticates packet type and logical sequence,
-uses an explicit nonce for reordered UDP delivery, and rejects replayed records.
-The implementation inherits a custom Noise hash resolver mapping the BLAKE2s
-pattern name to BLAKE3. It is not wire-compatible with standard Noise
-implementations using BLAKE2s. The [protocol notes](validation/README.md#wire-and-resource-invariants)
-describe the handshake, size budget and bounded state.
-
-| Environment or behavior | Evidence boundary |
+| Area | Current status |
 | --- | --- |
-| Linux TUN, IPv4/IPv6 underlay, IPv4/IPv6 payloads | Production namespace acceptance suite |
-| macOS | Build and nonprivileged tests; privileged TUN operation remains unverified |
+| Linux TUN exit and client | Validated with dual-stack payloads over IPv4 and IPv6 paths |
+| macOS | Client implementation and native app available; build and nonprivileged tests pass; privileged TUN operation remains unverified |
 | Windows TUN | Not implemented |
-| Physical NICs, radios and independent ISPs | Not established by virtual network tests |
-| NAT rebinding or changing interface addresses | Outside the validated contract |
-| Failure latency | Measured per run; no sub-millisecond or interruption-free guarantee |
-| Long-duration load, DNS resolver policy, arbitrary MTUs | Separate validation required |
-| Proxy connection migration | Not provided; each stream remains on its selected outer TCP connection |
+| Physical NIC, modem and ISP behavior | Outside the namespace validation results |
+| NAT rebinding, changing uplink addresses, arbitrary MTUs and long-duration load | Outside the recorded acceptance profile |
 
-Legacy diagnostic scripts are described in [physical_tests](physical_tests/README.md).
-They do not silently extend the production claims above.
+The protocol uses a Noise NK handshake with X25519 and ChaCha20-Poly1305. Its
+custom resolver maps the BLAKE2s pattern name to BLAKE3; standard Noise BLAKE2s
+implementations are not wire-compatible. See the
+[wire and resource invariants](validation/README.md#wire-and-resource-invariants)
+for record framing, replay handling and size limits.
 
 ## License
 
-MIT
+MIT.
